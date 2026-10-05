@@ -1,0 +1,95 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pykicak"
+dynamic = ["version"]
+description = "A Python library for building RabbitMQ-connected agent nodes with idempotent message processing."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Przemysław Barczak" },
+]
+keywords = [
+    "rabbitmq",
+    "pika",
+    "messaging",
+    "message-queue",
+    "idempotent",
+    "at-least-once",
+    "dead-letter",
+    "agents",
+    "pipeline",
+    "distributed-systems",
+]
+# No license classifier: with an SPDX `license` expression, PEP 639 forbids one.
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Distributed Computing",
+    "Typing :: Typed",
+]
+requires-python = ">=3.12"
+dependencies = [
+    "pika>=1.4,<2",
+]
+
+[dependency-groups]
+# Development tools, not published as package metadata: `pip install -e . --group dev` (pip 25.1+)
+test = ["pytest>=8"]
+dev = [
+    { include-group = "test" },
+    "build",
+    "mypy",
+    "ruff",
+    "twine",
+]
+
+[project.urls]
+Homepage = "https://github.com/przemek-barczak/pykicak"
+Repository = "https://github.com/przemek-barczak/pykicak"
+Issues = "https://github.com/przemek-barczak/pykicak/issues"
+
+[tool.setuptools.dynamic]
+version = { attr = "pykicak.__version__" }
+
+[tool.setuptools.packages.find]
+# Only the library is published (wheel and sdist); tests/ and examples/ stay in the repository,
+# and MANIFEST.in prunes them from the sdist.
+include = ["pykicak*"]
+
+[tool.setuptools.package-data]
+# PEP 561 marker: type checkers use pykicak's annotations only if it is installed.
+pykicak = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "integration: requires a live RabbitMQ broker (excluded by default)",
+]
+addopts = "--strict-markers -m 'not integration'"
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "W", "I", "B", "UP"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["pykicak"]
+
+[[tool.mypy.overrides]]
+# pika ships no type information, and the types-pika stubs are an outdated beta
+module = ["pika", "pika.*"]
+ignore_missing_imports = true

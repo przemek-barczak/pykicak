@@ -1,0 +1,8 @@
+# The sdist, like the wheel, contains only the `pykicak` package; setuptools adds README.md,
+# LICENSE, and pyproject.toml itself. Tests, examples, and the config template stay in the
+# repository. The rules below also drop them when a file finder (a stale *.egg-info/SOURCES.txt,
+# or a VCS plugin such as setuptools-scm) would otherwise add them.
+prune tests
+prune examples
+exclude .kicak.example
+global-exclude *.py[cod]

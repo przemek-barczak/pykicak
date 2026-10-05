@@ -1,0 +1,45 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Packaging and build output
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+
+# Test, coverage, and tool caches
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+
+# Editors and operating systems
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Local tool state
+nimbalyst-local/
+
+# Claude Code
+.claude/
+CLAUDE.md
+
+# Credentials: .kicak connection files and .env files; keep only the template
+.kicak
+.kicak.*
+!.kicak.example
+.env
+.env.*
