@@ -37,11 +37,16 @@ class KicakAbstract(abc.ABC):
 
     Opens a pika BlockingConnection using credentials from a KicakConfig,
     and provides the declare/close lifecycle shared by all agent kinds.
-    Every channel is put into publisher-confirm mode.
+    The channel it opens is put into publisher-confirm mode; the Executor publishes its results
+    on a separate, transactional channel.
 
     Not exported by `pykicak`: subclasses must implement private hooks and rely on private
     helpers, so applications subclass the Injector or the Executor instead.
     """
+
+    _blocked_connection_timeout_seconds: float | None = None
+    """How long a connection may stay blocked by a RabbitMQ resource alarm before pika closes it
+    with the retryable `ConnectionBlockedTimeout`; None waits until RabbitMQ unblocks it."""
 
     def __init__(self, config: KicakConfig, *, heartbeat_seconds: int | None = None) -> None:
         """Store the config for later use. Does not open any connection.
@@ -83,6 +88,7 @@ class KicakAbstract(abc.ABC):
             virtual_host=self._config.rabbitmq_virtual_host,
             credentials=credentials,
             heartbeat=self._heartbeat_seconds,
+            blocked_connection_timeout=self._blocked_connection_timeout_seconds,
         )
         return pika.BlockingConnection(parameters)
 
@@ -173,28 +179,43 @@ class KicakAbstract(abc.ABC):
         `pika.exceptions.NackError` if RabbitMQ refuses the message, and connection errors if the
         connection is lost. Nothing is retried or reconnected here.
         """
-        message_id = message.message_id
-        message_type = type(message).__name__
+        self._basic_publish(self.channel, exchange_name, message, body)
+        self._log_published(exchange_name, message)
+
+    @staticmethod
+    def _basic_publish(
+        channel: BlockingChannel, exchange_name: str, message: KicakMessage, body: bytes
+    ) -> None:
+        """Send `message`, serialized as `body`, as a persistent, mandatory JSON message.
+
+        The message's `message_id` is also sent as the AMQP `message_id` property. What this
+        waits for depends on the channel: in confirm mode, RabbitMQ's confirmation; on a
+        transactional channel, nothing, because RabbitMQ delivers nothing before `tx_commit()`.
+        """
         logger.debug(
             "Publishing message type=%s id=%s exchange=%s routing_key='' body_bytes=%d",
-            message_type,
-            message_id,
+            type(message).__name__,
+            message.message_id,
             exchange_name,
             len(body),
         )
-        self.channel.basic_publish(
+        channel.basic_publish(
             exchange=exchange_name,
             routing_key="",
             body=body,
             properties=pika.BasicProperties(
-                content_type="application/json", delivery_mode=2, message_id=message_id
+                content_type="application/json", delivery_mode=2, message_id=message.message_id
             ),
             mandatory=True,
         )
+
+    @staticmethod
+    def _log_published(exchange_name: str, message: KicakMessage) -> None:
+        """Log that RabbitMQ has taken responsibility for `message`."""
         logger.info(
             "Message published type=%s id=%s exchange=%s",
-            message_type,
-            message_id,
+            type(message).__name__,
+            message.message_id,
             exchange_name,
         )
 

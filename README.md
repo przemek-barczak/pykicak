@@ -28,18 +28,23 @@ A message is processed more than once when:
   supervisor's forced kill) while it processes a message, so RabbitMQ redelivers the message, which
   is executed again, and its results are published again if they had already been published;
   a graceful [`stop()`](#graceful-stop) finishes the message first and avoids this;
-- the connection is lost while an Executor publishes its results, so the input is executed again;
+- the connection is lost while an Executor commits its results, after RabbitMQ committed them but
+  before the Executor learned of it, so the input is executed again and all its results are
+  published again;
 - `execute()` runs longer than `heartbeat_seconds`, so the input is redelivered while it is still
   being executed, and with several instances it runs concurrently on another instance;
 - `execute()` raises `TransientProcessingError`, so it is called again, and requeued after
   `max_processing_attempts` failed calls, so it is executed again later;
-- RabbitMQ refuses an Executor's results (`UnroutableError` or `NackError`), so the input is
-  requeued and executed again, and results confirmed before the refusal are published again;
+- RabbitMQ returns an Executor's results as unroutable or refuses their commit, so the input is
+  requeued and executed again;
 - the acknowledgement fails, for example because the connection was lost right after the results
   were published, so RabbitMQ redelivers the input, which is executed again and its results
   published again;
 - an Injector loses its connection before RabbitMQ confirms a message, so it publishes the message
-  again.
+  again;
+- a RabbitMQ memory or disk alarm blocks an Injector's connection for more than 60 seconds, so the
+  Injector gives up on that attempt and publishes the message again. RabbitMQ may still enqueue the
+  earlier publish once the alarm clears, even when the injection ends with `InjectionError`.
 
 What this requires from an application:
 
@@ -116,7 +121,7 @@ for a worked example.
 | `destination_exchange` | `KicakExecutorAbstract` (optional) | Exchange that the results returned by `execute()` are published to |
 | `queue_type` | `KicakExecutorAbstract` (optional, default `QueueType.CLASSIC`) | RabbitMQ type of both `source_queue` and `dead_letter_queue`: `QueueType.CLASSIC` or `QueueType.QUORUM` (see [Queue type](#queue-type)) |
 | `max_processing_attempts` | `KicakExecutorAbstract` (optional, default 3) | How many times `execute()` is called for one delivery while it raises `TransientProcessingError`, before the delivery is requeued (see [Error handling and dead-lettering](#error-handling-and-dead-lettering)) |
-| `heartbeat_seconds` | `KicakExecutorAbstract` (optional, default 600) | Heartbeat timeout of the Executor's connections; must exceed the longest `execute()` (see [Long-running `execute()`](#long-running-execute)) |
+| `heartbeat_seconds` | `KicakExecutorAbstract` (optional, default 600) | AMQP heartbeat timeout of the Executor's connections, from 1 to 65535; set it above the longest `execute()` (see [Long-running `execute()`](#long-running-execute)) |
 
 Constructor arguments after `config` are keyword-only, for both the Injector and the Executor
 (`exchange_name="..."`, `source_queue="..."`, and so on). An Executor declares its own durable input
@@ -290,7 +295,9 @@ Each injection is short-lived. `run()` calls `generate()` and, if it returns a m
 connection, publishes the message, waits for RabbitMQ's confirmation, and closes the connection. If
 `generate()` returns `None`, no connection is opened. Connecting and publishing are attempted up to
 three times: immediately, after 1 second, and after 2 more seconds, each time on a new connection
-and with the same message.
+and with the same message. An attempt waits at most 60 seconds on a connection that a RabbitMQ
+memory or disk alarm blocks; it then fails with `pika.exceptions.ConnectionBlockedTimeout` and is
+retried, so an Injector started by a scheduler never hangs during an alarm.
 
 `run()` returns normally only if the message was injected. Otherwise it closes the connection and
 raises `InjectionError`. Its `__cause__` is the error that ended the last attempt, for example
@@ -355,7 +362,9 @@ executor.run()
 ```
 
 `execute()` returns a message, a sequence of messages, or `None`. The Executor publishes the results
-itself, only after `execute()` succeeds, so a failed message never produces partial output.
+itself, only after `execute()` succeeds, so a failed message never produces partial output. It
+publishes all results of one input in a single RabbitMQ transaction and acknowledges the input only
+after the transaction is committed (see [Results are published in a transaction](#results-are-published-in-a-transaction)).
 
 Subclassing `KicakExecutorAbstract[CrawledItem]` tells type checkers that `execute()` receives a
 `CrawledItem`. A subclass of the plain `KicakExecutorAbstract` works too; its `execute()` then
@@ -369,12 +378,14 @@ The Executor decides the outcome of every delivery from how `execute()` ends:
 
 | Outcome | Cause | Delivery is… | Executor |
 | --- | --- | --- | --- |
-| Success | `execute()` returns | results published, then acknowledged | continues |
+| Success | `execute()` returns | results published in one transaction, then acknowledged | continues |
 | Deterministic failure | missing body, undecodable body (not a JSON object, missing or unexpected fields, no valid `message_id`), or `MalformedMessageError` raised by `execute()` | rejected with `basic_nack(requeue=False)`, so RabbitMQ routes it to the dead-letter exchange | continues |
 | Transient failure | `TransientProcessingError` raised by `execute()` | retried in-process; if every attempt fails, requeued with `basic_nack(requeue=True)` | continues |
 | Unexpected failure | any other exception from `execute()`, or results that are not `KicakMessage`s, cannot be serialized, or are returned by a terminator | dead-lettered as above | logs the error and raises it, stopping |
-| Results refused by RabbitMQ | `UnroutableError` (no queue bound to the destination exchange) or `NackError` while publishing results | requeued with `basic_nack(requeue=True)`; the message is not at fault | logs the error and raises it, stopping |
-| Connection lost while publishing results | a transient connection error from a result publish | already requeued by RabbitMQ when the connection dropped; the results are discarded, not re-sent | reconnects and receives the message again |
+| Results returned as unroutable | `UnroutableError`: no queue bound to the destination exchange when the results are committed | requeued with `basic_nack(requeue=True)`; the message is not at fault | logs the error and raises it, stopping |
+| Results not committed | another error while publishing or committing the results, e.g. RabbitMQ refusing the commit | requeued by RabbitMQ when the connection closes | logs the error and raises it, stopping |
+| Connection lost while publishing results | a transient connection error before or during the commit | already requeued by RabbitMQ when the connection dropped; uncommitted results are discarded by RabbitMQ, not re-sent | reconnects and receives the message again |
+| Connection lost while settling | a transient connection error from the acknowledgement or rejection | requeued by RabbitMQ when the connection dropped, instead of being acknowledged, requeued, or dead-lettered | reconnects and receives the message again; after an unexpected failure or unroutable results, still raises that error and stops |
 
 `execute()` is called up to `max_processing_attempts` times (default 3) while it raises
 `TransientProcessingError`, with 0.5- and 1.0-second delays that double up to a 30-second cap. A
@@ -386,17 +397,38 @@ Dead-lettered messages keep their original body. RabbitMQ adds an `x-death` head
 source queue and the reason: `rejected` when the Executor rejected the message, which it logs at
 `ERROR` level, or `delivery_limit` when a quorum queue's delivery limit was reached.
 
-Results are published before the delivery is acknowledged, so no result is lost. If the process stops
-between the two, RabbitMQ redelivers the message and its results are published again; this is one of
-the reasons agents must be idempotent (see
-[Requirement: idempotent processing](#requirement-idempotent-processing)).
+### Results are published in a transaction
 
-The Executor never re-sends a result on a new connection. An acknowledgement can only be sent on the
-channel that delivered the message, and RabbitMQ requeues the delivery as soon as that connection is
-lost. Re-sending the results would therefore always duplicate them once the message is executed
-again. Instead, the Executor discards the results, reconnects, and executes the redelivered message,
-publishing its results once. Results that RabbitMQ had already confirmed before the connection was
-lost are published again with the rest.
+All results of one input are published in a single RabbitMQ transaction, so RabbitMQ delivers all
+of them or none. The input is acknowledged only after the transaction is committed, so it is
+acknowledged only once every result has been delivered to the destination exchange. For example, a
+chunker that splits a document into chunks never leaves its downstream agents with only some of the
+chunks while its input is acknowledged or dead-lettered.
+
+- **Before the commit, nothing is delivered.** If the connection is lost while the results are being
+  published, RabbitMQ discards them and requeues the input, and the Executor executes it again.
+- **The acknowledgement is not part of the transaction.** RabbitMQ routes the messages of a
+  transaction only when it is committed, so a result that no queue is bound to is detected only after
+  the commit. An acknowledgement committed together with it would remove the input while the result
+  is dropped. The Executor therefore acknowledges after the commit; if RabbitMQ returned a result as
+  unroutable, it requeues the input instead and stops.
+- **A result can still be published twice.** If the process stops between the commit and the
+  acknowledgement, or the connection drops after RabbitMQ committed the results but before the
+  Executor learned of it, the input is executed again and all its results are published again; this
+  is one of the reasons agents must be idempotent (see
+  [Requirement: idempotent processing](#requirement-idempotent-processing)).
+- **Two RabbitMQ cases can leave part of a transaction.** RabbitMQ does not guarantee atomicity if
+  the broker itself fails during the commit. And a destination queue with a length limit and
+  `overflow: reject-publish` can refuse some of the results while other queues accept them; the
+  commit then fails and the Executor stops. Do not use `reject-publish` on queues that receive
+  results of several messages per input.
+- **Results are never re-sent on a new connection.** An acknowledgement can only be sent on the
+  channel that delivered the message, and RabbitMQ requeues the delivery as soon as that connection
+  is lost, so re-sending would duplicate the results. The redelivered input is executed again
+  instead.
+
+The results use a channel of their own, because a RabbitMQ channel in transaction mode cannot also be
+in confirm mode; the Executor opens it, once per connection, the first time it publishes results.
 
 ## Running and stopping an Executor
 
@@ -487,8 +519,9 @@ RabbitMQ uses heartbeats to detect dead connections, and pika can answer them on
 never while `execute()` runs. If one `execute()` call lasts longer than the connection's heartbeat
 timeout, RabbitMQ closes the connection and requeues the message while it is still being processed.
 The work is wasted and the message is executed again, so an `execute()` that always takes that long
-never completes. An Executor that publishes results discards them and reconnects; a terminator's
-acknowledgement fails on the closed connection, which stops it.
+never completes. An Executor that publishes results discards them, and a terminator's
+acknowledgement fails on the closed connection; either way it reconnects and receives the message
+again.
 
 Only the application knows how long its processing takes, so each Executor type sets its own
 timeout with `heartbeat_seconds`, in seconds. It defaults to 600 (10 minutes), sized for LLM calls
@@ -563,16 +596,19 @@ Things to plan for when running several instances:
 
 ## Delivery guarantees
 
-Every channel is in publisher-confirm mode, and every message is published as mandatory and
-persistent (`delivery_mode=2`), with the content type `application/json` and its `message_id`
-as the AMQP `message_id` property. A publish
-returns only after RabbitMQ has taken responsibility for the message: for persistent messages in
-durable queues, after writing it to disk. RabbitMQ refusing a message raises one of these errors,
-which are not retried:
+Every message is published as mandatory and persistent (`delivery_mode=2`), with the content type
+`application/json` and its `message_id` as the AMQP `message_id` property. The Injector publishes
+in publisher-confirm mode: a publish returns only after RabbitMQ has taken responsibility for the
+message, for persistent messages in durable queues after writing it to disk. The Executor publishes
+its results in a transaction (see
+[Results are published in a transaction](#results-are-published-in-a-transaction)): the commit
+returns only after RabbitMQ has taken responsibility for all of them. RabbitMQ refusing a message
+raises one of these errors, which are not retried:
 
 - `pika.exceptions.UnroutableError`: no queue is bound to the exchange, so RabbitMQ would have
   discarded the message. For an Injector this means the first Executor's topology is not installed.
-- `pika.exceptions.NackError`: RabbitMQ could not take responsibility for the message.
+- `pika.exceptions.NackError` (Injector): RabbitMQ could not take responsibility for the message.
+  For an Executor's results, RabbitMQ refuses the commit instead, which closes the results channel.
 
 An Injector raises `InjectionError` to its caller, with one of these errors as its `__cause__`. An
 Executor requeues the input message and stops (see
@@ -592,12 +628,18 @@ with a 0.5-second initial delay and a 30-second maximum, but never retry a resul
 access-denied failures are not retried.
 Application processing is retried only for `TransientProcessingError` (see
 [Error handling and dead-lettering](#error-handling-and-dead-lettering)). Message acknowledgements
-are not retried; a failed connection can cause an unacknowledged message to be delivered again by
-RabbitMQ.
+are not retried: an acknowledgement is valid only on the connection that delivered the message, so
+when the connection is lost while settling a message, RabbitMQ requeues it and the Executor
+reconnects and receives it again.
 
-Publishing is at-least-once: if the connection is lost before RabbitMQ's confirmation arrives,
-RabbitMQ may already have accepted the message. The Injector then publishes it again, and the
-Executor executes the redelivered input again. pykicak does not provide exactly-once delivery, which
+An Injector's connection fails with `ConnectionBlockedTimeout` after RabbitMQ has blocked it for 60
+seconds because of a memory or disk alarm, and the attempt is retried like other connection errors.
+An Executor's connection stays blocked until the alarm clears, so it does not execute its message
+again in the meantime.
+
+Publishing is at-least-once: if the connection is lost before RabbitMQ's confirmation or the reply
+to a commit arrives, RabbitMQ may already have accepted the messages. The Injector then publishes
+its message again, and the Executor executes the redelivered input again. pykicak does not provide exactly-once delivery, which
 is why it requires idempotent agents (see
 [Requirement: idempotent processing](#requirement-idempotent-processing)).
 

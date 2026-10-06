@@ -85,6 +85,19 @@ class RecordingExecutor(KicakExecutorAbstract):
         return method
 
 
+class ChunkingExecutor(RecordingExecutor):
+    """Splits each message into three chunks with IDs derived from the input's, like a chunker."""
+
+    def execute(self, message: KicakMessage) -> list[KicakMessage]:  # type: ignore[override]
+        self.received.append(message)
+        return [
+            IntegrationMessage(
+                message_id=f"{message.message_id}.chunk-{index}", payload=f"chunk {index}"
+            )
+            for index in range(1, 4)
+        ]
+
+
 class TemporaryTopology:
     """Unique queue and exchange names for one test."""
 
@@ -336,13 +349,44 @@ def test_executor_requeues_input_when_result_is_unroutable(config, topology):
         )
         method, _properties, body = next(deliveries)
         assert method is not None
-        with pytest.raises(UnroutableError):
+        with pytest.raises(UnroutableError) as raised:
             executor._handle_delivery(method.delivery_tag, body)
         redelivered, _properties, redelivered_body = next(deliveries)
+
+    # RabbitMQ routes the transaction's results at the commit and returns the unroutable one
+    assert [IntegrationMessage.from_bytes(m.body) for m in raised.value.messages] == [message]
 
     assert redelivered is not None
     assert redelivered.redelivered is True
     assert IntegrationMessage.from_bytes(redelivered_body) == message
+
+
+@pytest.mark.parametrize("queue_type", list(QueueType))
+def test_executor_publishes_every_chunk_before_acknowledging_the_input(
+    config, topology, queue_type
+):
+    inject_exchange = topology.exchange("inject")
+    chunks_exchange = topology.exchange("chunks")
+    chunker = topology.executor_topology("chunker", inject_exchange)
+    analyser = topology.executor_topology("analyser", chunks_exchange)
+    document = IntegrationMessage(message_id="doc-1", payload="a large document")
+
+    with RecordingExecutor(config, queue_type=queue_type, **analyser) as analyser_executor:
+        with ChunkingExecutor(
+            config, destination_exchange=chunks_exchange, queue_type=queue_type, **chunker
+        ) as chunker_executor:
+            with OneShotInjector(config, inject_exchange, document) as injector:
+                injector.publish(document)
+            chunker_executor.handle_next_delivery(chunker["source_queue"])
+        for _ in range(3):
+            analyser_executor.handle_next_delivery(analyser["source_queue"])
+
+    assert [chunk.message_id for chunk in analyser_executor.received] == [
+        "doc-1.chunk-1",
+        "doc-1.chunk-2",
+        "doc-1.chunk-3",
+    ]
+    assert _ready_message_count(config, chunker["source_queue"]) == (0, 0)  # input acknowledged
 
 
 @pytest.mark.parametrize("queue_type", list(QueueType))
@@ -414,6 +458,37 @@ def test_executor_connection_uses_requested_heartbeat(config, topology, heartbea
     assert negotiated == (heartbeat_seconds or 600)
 
 
+class OutlastingTerminator(RecordingExecutor):
+    """Outlasts its heartbeat timeout on the first execute(), then stops after the next one."""
+
+    def execute(self, message: KicakMessage) -> KicakMessage | None:
+        if not self.received:
+            time.sleep(5)  # RabbitMQ closes the connection meanwhile (heartbeat_seconds=1)
+        else:
+            self.stop()
+        return super().execute(message)
+
+
+def test_terminator_reconnects_when_execute_outlasts_the_heartbeat(config, topology):
+    inject_exchange = topology.exchange("inject")
+    names = topology.executor_topology("source", inject_exchange)
+    executor = OutlastingTerminator(config, heartbeat_seconds=1, **names)
+    thread, errors = _start_in_thread(executor)
+    _wait_until_consuming(config, names["source_queue"])
+    message = IntegrationMessage(message_id="slow", payload="slow")
+    with OneShotInjector(config, inject_exchange, message) as injector:
+        injector.publish(message)
+
+    thread.join(timeout=30)
+
+    assert not thread.is_alive()
+    assert errors == []
+    # The acknowledgement failed on the closed connection; the redelivery was executed again
+    assert executor.received == [message, message]
+    assert executor.get_status() == "STOPPED"
+    assert _ready_message_count(config, names["source_queue"]) == (0, 0)
+
+
 class SlowExecutor(RecordingExecutor):
     """Takes `EXECUTE_SECONDS` per message and signals when processing has started."""
 
@@ -458,8 +533,12 @@ def _wait_until_consuming(config: KicakConfig, queue: str) -> None:
 
 def test_stop_finishes_message_in_progress_and_leaves_the_rest_queued(config, topology):
     inject_exchange = topology.exchange("inject")
+    results_exchange = topology.exchange("results")
     names = topology.executor_topology("source", inject_exchange)
-    executor = SlowExecutor(config, **names)
+    downstream = topology.executor_topology("downstream", results_exchange)
+    with RecordingExecutor(config, **downstream):  # declares and binds the downstream queue
+        pass
+    executor = SlowExecutor(config, destination_exchange=results_exchange, **names)
     thread, errors = _start_in_thread(executor)
     _wait_until_consuming(config, names["source_queue"])
     first = IntegrationMessage(message_id="first", payload="first")
@@ -469,14 +548,16 @@ def test_stop_finishes_message_in_progress_and_leaves_the_rest_queued(config, to
         injector.publish(second)
 
     assert executor.started.wait(_DELIVERY_TIMEOUT_SECONDS)
-    executor.stop()
+    executor.stop()  # while execute() is still running
     thread.join(timeout=_DELIVERY_TIMEOUT_SECONDS)
 
     assert not thread.is_alive()
     assert errors == []
     assert executor.received == [first]
     assert executor.get_status() == "STOPPED"
-    assert _ready_message_count(config, names["source_queue"]) == (1, 0)
+    # The message in progress was finished: its result was published and it was acknowledged
+    assert _ready_message_count(config, downstream["source_queue"]) == (1, 0)
+    assert _ready_message_count(config, names["source_queue"]) == (1, 0)  # only `second` is left
 
 
 def test_stop_while_waiting_returns_promptly(config, topology):

@@ -9,7 +9,6 @@ import pytest
 from pika.exceptions import (
     AMQPConnectionError,
     ChannelClosedByBroker,
-    NackError,
     StreamLostError,
     UnroutableError,
 )
@@ -56,14 +55,22 @@ TOPOLOGY = {
 class ProcessingExecutor(KicakExecutorAbstract):
     """Records executed messages; `handler`, if given, computes execute()'s return value."""
 
-    def __init__(self, config: KicakConfig, channel: FakeChannel, handler=None, **topology) -> None:
+    def __init__(
+        self,
+        config: KicakConfig,
+        channel: FakeChannel,
+        handler=None,
+        results_channel: FakeChannel | None = None,
+        **topology,
+    ) -> None:
         super().__init__(config, **topology)
         self._fake_channel = channel
+        self._fake_results_channel = results_channel
         self._handler = handler
         self.processed_messages: list[KicakMessage] = []
 
     def _create_connection(self):
-        return FakeConnection(self._fake_channel)
+        return FakeConnection(self._fake_channel, self._fake_results_channel)
 
     def message_type(self) -> type[KicakMessage]:
         return SampleMessage
@@ -75,8 +82,11 @@ class ProcessingExecutor(KicakExecutorAbstract):
         return self._handler(message)
 
 
-def make_executor(config, channel, handler=None, **overrides) -> ProcessingExecutor:
-    return ProcessingExecutor(config, channel, handler, **{**TOPOLOGY, **overrides})
+def make_executor(
+    config, channel, handler=None, results_channel=None, **overrides
+) -> ProcessingExecutor:
+    topology = {**TOPOLOGY, **overrides}
+    return ProcessingExecutor(config, channel, handler, results_channel, **topology)
 
 
 def run_until_stopped(executor: KicakExecutorAbstract) -> None:
@@ -264,6 +274,14 @@ def test_connection_uses_configured_heartbeat(monkeypatch):
     assert captured_connection_parameters(executor, monkeypatch).heartbeat == 1800
 
 
+def test_connection_waits_while_rabbitmq_blocks_it(monkeypatch):
+    executor = make_executor(KicakConfig(values=CONNECTION_VALUES), FakeChannel())
+
+    parameters = captured_connection_parameters(executor, monkeypatch)
+
+    assert parameters.blocked_connection_timeout is None
+
+
 @pytest.mark.parametrize("heartbeat_seconds", [1, 65535])
 def test_init_accepts_heartbeat_within_amqp_limits(config, heartbeat_seconds):
     executor = make_executor(config, FakeChannel(), heartbeat_seconds=heartbeat_seconds)
@@ -434,7 +452,7 @@ def test_run_publishes_returned_result_before_acknowledging(config):
     run_until_stopped(executor)
 
     assert [published.body for published in channel.published_messages] == [result.to_bytes()]
-    assert channel.operations == ["publish output-exchange", "ack 1"]
+    assert channel.operations == ["publish output-exchange", "commit", "ack 1"]
 
 
 def test_run_publishes_every_returned_result(config):
@@ -569,7 +587,7 @@ def test_run_retries_transient_failure_then_publishes_and_acknowledges(config, s
 
     assert attempts == 2
     assert sleeps == [0.5]
-    assert channel.operations == ["publish output-exchange", "ack 1"]
+    assert channel.operations == ["publish output-exchange", "commit", "ack 1"]
     assert "Transient processing failure id=input, retrying attempt 2/3" in caplog.text
 
 
@@ -718,7 +736,7 @@ def test_run_consumes_one_message_at_a_time(config):
     assert channel.prefetch_count_when_consuming == 1
 
 
-def test_run_publishes_results_as_mandatory_in_confirm_mode(config):
+def test_run_publishes_results_as_mandatory(config):
     channel = FakeChannel()
     executor = make_executor(
         config, channel, handler=lambda message: message, destination_exchange="output-exchange"
@@ -727,8 +745,75 @@ def test_run_publishes_results_as_mandatory_in_confirm_mode(config):
 
     run_until_stopped(executor)
 
-    assert channel.confirm_delivery_enabled is True
     assert channel.published_messages[0].mandatory is True
+
+
+def test_run_publishes_all_results_in_one_transaction_on_their_own_channel(config):
+    results = [
+        SampleMessage(message_id="chunk-1", text="first"),
+        SampleMessage(message_id="chunk-2", text="second"),
+    ]
+    channel = FakeChannel()
+    executor = make_executor(
+        config, channel, handler=lambda _message: results, destination_exchange="output-exchange"
+    )
+    channel.queue_deliveries(SampleMessage(message_id="input", text="input").to_bytes())
+
+    run_until_stopped(executor)
+
+    results_channel = channel.results_channel
+    assert results_channel is not None and results_channel is not channel
+    assert results_channel.transactional is True
+    assert channel.confirm_delivery_enabled is True and channel.transactional is False
+    # Both results are committed together, and the input is acknowledged only afterwards, on
+    # the consuming channel, outside the transaction
+    assert channel.operations == [
+        "publish output-exchange",
+        "publish output-exchange",
+        "commit",
+        "ack 1",
+    ]
+    assert [p.body for p in channel.published_messages] == [r.to_bytes() for r in results]
+    assert channel.acked_delivery_tags == [1]
+    assert results_channel.acked_delivery_tags == []
+    assert results_channel.nacked_deliveries == []
+
+
+def test_run_opens_one_results_channel_per_connection(config):
+    channel = FakeChannel()
+    executor = make_executor(
+        config, channel, handler=lambda message: message, destination_exchange="output-exchange"
+    )
+    channel.queue_deliveries(
+        SampleMessage(message_id="first", text="first").to_bytes(),
+        SampleMessage(message_id="second", text="second").to_bytes(),
+    )
+
+    run_until_stopped(executor)
+
+    assert channel.results_channel.tx_select_calls == 1
+    assert channel.operations == [
+        "publish output-exchange",
+        "commit",
+        "ack 1",
+        "publish output-exchange",
+        "commit",
+        "ack 2",
+    ]
+
+
+@pytest.mark.parametrize("handler", [None, lambda _message: []], ids=["none", "empty"])
+def test_run_opens_no_results_channel_without_results(config, handler):
+    channel = FakeChannel()
+    executor = make_executor(
+        config, channel, handler=handler, destination_exchange="output-exchange"
+    )
+    channel.queue_deliveries(SampleMessage(message_id="input", text="input").to_bytes())
+
+    run_until_stopped(executor)
+
+    assert channel.results_channel is None
+    assert channel.operations == ["ack 1"]
 
 
 def test_run_publishes_each_result_with_its_message_id_property(config):
@@ -749,26 +834,30 @@ def test_run_publishes_each_result_with_its_message_id_property(config):
     assert all(message.properties.content_type == "application/json" for message in published)
 
 
-@pytest.mark.parametrize(
-    "refusal", [UnroutableError([]), NackError([])], ids=["unroutable", "nacked"]
-)
-def test_run_requeues_input_and_raises_when_rabbitmq_refuses_result(config, refusal, caplog):
-    class RefusingChannel(FakeChannel):
-        def basic_publish(self, exchange, routing_key, body, properties=None, mandatory=False):
-            raise refusal
-
-    channel = RefusingChannel()
+def test_run_requeues_input_and_raises_when_results_are_returned_as_unroutable(config, caplog):
+    results_channel = FakeChannel()
+    results_channel.unroutable = True  # RabbitMQ routes at the commit and returns the results
+    channel = FakeChannel()
     executor = make_executor(
-        config, channel, handler=lambda message: message, destination_exchange="output-exchange"
+        config,
+        channel,
+        handler=lambda message: message,
+        results_channel=results_channel,
+        destination_exchange="output-exchange",
     )
     channel.queue_deliveries(
         SampleMessage(message_id="input", text="input").to_bytes(),
         SampleMessage(message_id="never-processed", text="never processed").to_bytes(),
     )
 
-    with pytest.raises(type(refusal)):
+    with pytest.raises(UnroutableError) as raised:
         executor.run()
 
+    assert [returned.body for returned in raised.value.messages] == [
+        SampleMessage(message_id="input", text="input").to_bytes()
+    ]
+    assert channel.published_messages == []
+    assert channel.operations == ["publish output-exchange", "commit", "nack 1 requeue=True"]
     assert channel.nacked_deliveries == [NackedDelivery(delivery_tag=1, requeue=True)]
     assert channel.acked_delivery_tags == []
     assert len(executor.processed_messages) == 1
@@ -833,7 +922,7 @@ def test_stop_during_processing_finishes_the_message_then_returns(config, caplog
     executor.run()  # returns normally instead of raising StopConsuming
 
     assert executor.processed_messages == [first]
-    assert channel.operations == ["publish output-exchange", "ack 1"]
+    assert channel.operations == ["publish output-exchange", "commit", "ack 1"]
     assert channel.is_open is False
     assert "stopped on request" in caplog.text
 
@@ -1200,108 +1289,267 @@ def test_run_reconnects_after_consumer_connection_loss(config, monkeypatch, capl
     assert "Connection lost, reconnecting" in caplog.text
 
 
-class ConnectionLostOnPublishChannel(FakeChannel):
-    """Loses the connection on publish number `fail_at` (1-based); earlier publishes succeed."""
+class FailingResultsChannel(FakeChannel):
+    """Results channel that raises `error` at `step`: "publish 1", "publish 2", ..., or "commit".
 
-    def __init__(self, fail_at: int = 1) -> None:
+    A connection error also marks the channel closed, as pika does.
+    """
+
+    def __init__(self, step: str, error: Exception) -> None:
         super().__init__()
-        self._fail_at = fail_at
+        self._step = step
+        self._error = error
         self.publish_attempts = 0
+
+    def _fail_at(self, step: str) -> None:
+        if step == self._step:
+            if isinstance(self._error, StreamLostError):
+                self.is_open = False
+            raise self._error
 
     def basic_publish(self, exchange, routing_key, body, properties=None, mandatory=False):
         self.publish_attempts += 1
-        if self.publish_attempts >= self._fail_at:
-            self.is_open = False
-            raise StreamLostError("connection lost")
+        self._fail_at(f"publish {self.publish_attempts}")
         super().basic_publish(exchange, routing_key, body, properties, mandatory)
 
+    def tx_commit(self) -> None:
+        self._fail_at("commit")
+        super().tx_commit()
 
-def reconnecting_executor(config, monkeypatch, channels: list[FakeChannel], handler):
-    """Executor that opens `channels` in order, one per (re)connection."""
+
+def reconnecting_executor(config, monkeypatch, connections, handler):
+    """Executor whose (re)connections open `connections` in order.
+
+    Each item is a (consuming channel, results channel or None) pair.
+    """
     executor = make_executor(
-        config, channels[0], handler=handler, destination_exchange="output-exchange"
+        config, connections[0][0], handler=handler, destination_exchange="output-exchange"
     )
-    remaining = list(channels)
-    monkeypatch.setattr(executor, "_create_connection", lambda: FakeConnection(remaining.pop(0)))
+    remaining = list(connections)
+    monkeypatch.setattr(executor, "_create_connection", lambda: FakeConnection(*remaining.pop(0)))
     return executor
 
 
-def test_run_discards_results_and_reconnects_when_connection_is_lost_while_publishing(
-    config, monkeypatch, sleeps, caplog
+@pytest.mark.parametrize("step", ["publish 1", "publish 2", "commit"])
+def test_run_discards_uncommitted_results_and_reconnects_when_connection_is_lost(
+    config, monkeypatch, sleeps, caplog, step
 ):
-    message = SampleMessage(
-        message_id="connection-lost-during-publish", text="connection lost during publish"
-    )
-    original_channel = ConnectionLostOnPublishChannel()
+    results = [
+        SampleMessage(message_id="chunk-1", text="first"),
+        SampleMessage(message_id="chunk-2", text="second"),
+    ]
+    message = SampleMessage(message_id="input", text="input")
+    original_channel = FakeChannel()
     replacement_channel = FakeChannel()
     original_channel.queue_deliveries(message.to_bytes())
     replacement_channel.queue_deliveries(message.to_bytes())  # RabbitMQ's redelivery
     executor = reconnecting_executor(
-        config, monkeypatch, [original_channel, replacement_channel], lambda received: received
+        config,
+        monkeypatch,
+        [
+            (original_channel, FailingResultsChannel(step, StreamLostError("connection lost"))),
+            (replacement_channel, None),
+        ],
+        lambda _message: results,
     )
 
     run_until_stopped(executor)
 
-    assert original_channel.publish_attempts == 1
+    # No result of the interrupted transaction is delivered, so none is published twice
     assert original_channel.published_messages == []
     assert original_channel.acked_delivery_tags == []
     assert original_channel.nacked_deliveries == []
     assert executor.processed_messages == [message, message]
-    assert [published.body for published in replacement_channel.published_messages] == [
-        message.to_bytes()
-    ]
-    assert replacement_channel.acked_delivery_tags == [1]
-    assert replacement_channel.prefetch_count_when_consuming == 1
-    assert sleeps == []
-    warnings = [r for r in caplog.records if "discarding the results" in r.message]
-    assert [record.levelname for record in warnings] == ["WARNING"]
-
-
-def test_run_republishes_all_results_after_connection_loss_mid_results(config, monkeypatch):
-    results = [
-        SampleMessage(message_id="first", text="first"),
-        SampleMessage(message_id="second", text="second"),
-    ]
-    original_channel = ConnectionLostOnPublishChannel(fail_at=2)
-    replacement_channel = FakeChannel()
-    original_channel.queue_deliveries(SampleMessage(message_id="input", text="input").to_bytes())
-    replacement_channel.queue_deliveries(SampleMessage(message_id="input", text="input").to_bytes())
-    executor = reconnecting_executor(
-        config, monkeypatch, [original_channel, replacement_channel], lambda _message: results
-    )
-
-    run_until_stopped(executor)
-
-    # The result confirmed before the connection was lost is published again with the rest
-    assert [p.body for p in original_channel.published_messages] == [results[0].to_bytes()]
     assert [p.body for p in replacement_channel.published_messages] == [
         result.to_bytes() for result in results
     ]
     assert replacement_channel.acked_delivery_tags == [1]
+    assert replacement_channel.prefetch_count_when_consuming == 1
+    assert sleeps == []
+    warnings = [r for r in caplog.records if "discarding the uncommitted results" in r.message]
+    assert [record.levelname for record in warnings] == ["WARNING"]
 
 
-def test_run_raises_without_reconnecting_when_result_publish_fails_permanently(
-    config, monkeypatch, caplog
+@pytest.mark.parametrize(
+    ("step", "error"),
+    [
+        ("publish 1", ChannelClosedByBroker(403, "ACCESS_REFUSED")),
+        ("commit", ChannelClosedByBroker(406, "PRECONDITION_FAILED")),
+    ],
+    ids=["publish-refused", "commit-refused"],
+)
+def test_run_raises_without_reconnecting_when_results_cannot_be_published(
+    config, monkeypatch, caplog, step, error
 ):
-    class ClosingChannel(FakeChannel):
-        publish_attempts = 0
-
-        def basic_publish(self, exchange, routing_key, body, properties=None, mandatory=False):
-            self.publish_attempts += 1
-            raise ChannelClosedByBroker(403, "ACCESS_REFUSED")
-
-    channel = ClosingChannel()
+    channel = FakeChannel()
     channel.queue_deliveries(SampleMessage(message_id="input", text="input").to_bytes())
-    executor = reconnecting_executor(config, monkeypatch, [channel], lambda received: received)
+    executor = reconnecting_executor(
+        config,
+        monkeypatch,
+        [(channel, FailingResultsChannel(step, error))],
+        lambda received: received,
+    )
 
     with pytest.raises(ChannelClosedByBroker):
         executor.run()
 
-    assert channel.publish_attempts == 1
+    assert channel.published_messages == []
     assert channel.acked_delivery_tags == []
-    assert channel.nacked_deliveries == []
+    assert channel.nacked_deliveries == []  # closing the connection requeues the input
     errors = [r for r in caplog.records if "could not be published" in r.message]
     assert [record.levelname for record in errors] == ["ERROR"]
+
+
+def test_run_opens_a_new_results_channel_after_reconnecting(config, monkeypatch, sleeps):
+    class DeliverThenDisconnectChannel(FakeChannel):
+        def consume(self, queue, inactivity_timeout=None):
+            deliveries = super().consume(queue, inactivity_timeout)
+            yield next(deliveries)
+            raise StreamLostError("connection lost")
+
+    first_channel = DeliverThenDisconnectChannel()
+    first_results_channel = FakeChannel()  # stays "open": only the connection was lost
+    second_channel = FakeChannel()
+    first_channel.queue_deliveries(SampleMessage(message_id="first", text="first").to_bytes())
+    second_channel.queue_deliveries(SampleMessage(message_id="second", text="second").to_bytes())
+    executor = reconnecting_executor(
+        config,
+        monkeypatch,
+        [(first_channel, first_results_channel), (second_channel, None)],
+        lambda message: message,
+    )
+
+    run_until_stopped(executor)
+
+    assert [p.body for p in first_channel.published_messages] == [
+        SampleMessage(message_id="first", text="first").to_bytes()
+    ]
+    assert second_channel.results_channel is not first_results_channel
+    assert [p.body for p in second_channel.published_messages] == [
+        SampleMessage(message_id="second", text="second").to_bytes()
+    ]
+    assert first_results_channel.tx_select_calls == 1
+
+
+class SettleFailingChannel(FakeChannel):
+    """Consuming channel whose first basic_ack or basic_nack raises `error`.
+
+    A connection error also marks the channel closed, as pika does.
+    """
+
+    def __init__(self, error: Exception) -> None:
+        super().__init__()
+        self._error: Exception | None = error
+
+    def _fail_once(self) -> None:
+        error, self._error = self._error, None
+        if error is not None:
+            if isinstance(error, StreamLostError):
+                self.is_open = False
+            raise error
+
+    def basic_ack(self, delivery_tag: int) -> None:
+        self._fail_once()
+        super().basic_ack(delivery_tag)
+
+    def basic_nack(self, delivery_tag: int, multiple: bool = False, requeue: bool = True) -> None:
+        self._fail_once()
+        super().basic_nack(delivery_tag, multiple, requeue)
+
+
+def always_transient(_message):
+    raise TransientProcessingError("service unavailable")
+
+
+@pytest.mark.parametrize(
+    ("body", "handler", "action", "settled"),
+    [
+        (SampleMessage(message_id="input", text="input").to_bytes(), None, "acknowledging", "ack"),
+        (b"not json", None, "dead-lettering", NackedDelivery(1, requeue=False)),
+        (
+            SampleMessage(message_id="input", text="input").to_bytes(),
+            always_transient,
+            "requeueing",
+            NackedDelivery(1, requeue=True),
+        ),
+    ],
+    ids=["ack", "dead-letter", "requeue"],
+)
+def test_run_reconnects_when_connection_is_lost_while_settling(
+    config, monkeypatch, sleeps, caplog, body, handler, action, settled
+):
+    original_channel = SettleFailingChannel(StreamLostError("connection lost"))
+    replacement_channel = FakeChannel()
+    original_channel.queue_deliveries(body)
+    replacement_channel.queue_deliveries(body)  # RabbitMQ's redelivery
+    executor = make_executor(config, original_channel, handler=handler)
+    channels = [original_channel, replacement_channel]
+    monkeypatch.setattr(executor, "_create_connection", lambda: FakeConnection(channels.pop(0)))
+
+    run_until_stopped(executor)
+
+    assert original_channel.acked_delivery_tags == []
+    assert original_channel.nacked_deliveries == []
+    if settled == "ack":
+        assert replacement_channel.acked_delivery_tags == [1]
+    else:
+        assert replacement_channel.nacked_deliveries == [settled]
+    assert replacement_channel.prefetch_count_when_consuming == 1
+    warnings = [r for r in caplog.records if f"Connection lost while {action}" in r.message]
+    assert [record.levelname for record in warnings] == ["WARNING"]
+
+
+def test_run_raises_the_processing_error_when_connection_is_lost_while_dead_lettering(
+    config, monkeypatch
+):
+    def broken(_message):
+        raise ZeroDivisionError("bug in application code")
+
+    channel = SettleFailingChannel(StreamLostError("connection lost"))
+    channel.queue_deliveries(SampleMessage(message_id="input", text="input").to_bytes())
+    executor = make_executor(config, channel, handler=broken)
+    connections = [FakeConnection(channel)]
+    monkeypatch.setattr(executor, "_create_connection", lambda: connections.pop(0))
+
+    with pytest.raises(ZeroDivisionError):
+        executor.run()
+
+    assert channel.nacked_deliveries == []  # RabbitMQ requeues it with the lost connection
+    assert executor.get_status() == ExecutorStatus.CRASHED
+
+
+def test_run_raises_unroutable_error_when_connection_is_lost_while_requeueing(
+    config, monkeypatch
+):
+    results_channel = FakeChannel()
+    results_channel.unroutable = True
+    channel = SettleFailingChannel(StreamLostError("connection lost"))
+    channel.queue_deliveries(SampleMessage(message_id="input", text="input").to_bytes())
+    executor = make_executor(
+        config,
+        channel,
+        handler=lambda message: message,
+        results_channel=results_channel,
+        destination_exchange="output-exchange",
+    )
+
+    with pytest.raises(UnroutableError):
+        executor.run()
+
+    assert channel.nacked_deliveries == []
+    assert executor.get_status() == ExecutorStatus.CRASHED
+
+
+def test_run_raises_when_acknowledgement_fails_without_losing_the_connection(config, caplog):
+    channel = SettleFailingChannel(ChannelClosedByBroker(406, "PRECONDITION_FAILED"))
+    channel.queue_deliveries(SampleMessage(message_id="input", text="input").to_bytes())
+    executor = make_executor(config, channel)
+
+    with pytest.raises(ChannelClosedByBroker):
+        executor.run()
+
+    assert channel.acked_delivery_tags == []
+    assert "Connection lost" not in caplog.text
 
 
 def test_retry_policy_is_infinite_with_capped_jittered_backoff(config, monkeypatch):

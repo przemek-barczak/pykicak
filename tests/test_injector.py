@@ -4,6 +4,7 @@ import pickle
 import pytest
 from pika.exceptions import (
     AMQPConnectionError,
+    ConnectionBlockedTimeout,
     NackError,
     ProbableAuthenticationError,
     StreamLostError,
@@ -69,6 +70,16 @@ def test_connection_accepts_broker_heartbeat(monkeypatch):
     )
 
     assert captured_connection_parameters(injector, monkeypatch).heartbeat is None
+
+
+def test_connection_times_out_when_rabbitmq_blocks_it(monkeypatch):
+    injector = CountingInjector(
+        KicakConfig(values=CONNECTION_VALUES), FakeChannel(), exchange_name="my-exchange"
+    )
+
+    parameters = captured_connection_parameters(injector, monkeypatch)
+
+    assert parameters.blocked_connection_timeout == 60.0
 
 
 def test_declare_topology_declares_durable_fanout_exchange(config):
@@ -341,6 +352,24 @@ def test_run_retries_on_a_new_connection_with_the_same_message(config, monkeypat
     assert delays == [1.0]
     assert [connection.is_open for connection in opened] == [False, False]
     assert "Injection of message id=message-1 failed, retrying attempt 2/3" in caplog.text
+
+
+def test_run_retries_when_a_blocked_connection_times_out(config, monkeypatch, caplog):
+    class BlockedChannel(FakeChannel):
+        def basic_publish(self, exchange, routing_key, body, properties=None, mandatory=False):
+            raise ConnectionBlockedTimeout("Blocked connection timeout expired.")
+
+    retry_channel = FakeChannel()
+    injector = CountingInjector(config, retry_channel, exchange_name="my-exchange")
+    scripted_connections(injector, monkeypatch, BlockedChannel(), retry_channel)
+    monkeypatch.setattr(injector_module.time, "sleep", lambda _seconds: None)
+
+    injector.run()
+
+    assert [published.body for published in retry_channel.published_messages] == [
+        SampleMessage(message_id="message-1", text="message-1").to_bytes()
+    ]
+    assert "Blocked connection timeout expired" in caplog.text
 
 
 def test_run_raises_after_three_failed_attempts_with_no_connection_left_open(

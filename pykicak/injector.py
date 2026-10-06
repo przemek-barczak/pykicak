@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 _MAX_RABBITMQ_ATTEMPTS = 3
 _INITIAL_RETRY_DELAY_SECONDS = 1.0  # attempts: immediately, after 1 second, after 2 more seconds
+_BLOCKED_CONNECTION_TIMEOUT_SECONDS = 60.0
 _T = TypeVar("_T")
 
 
@@ -64,6 +65,10 @@ class KicakInjectorAbstract(KicakAbstract, abc.ABC):
     so it is passed in by the caller (typically sourced from an application's
     messaging/exchanges.py) rather than read from the `.kicak` file.
     """
+
+    # A memory or disk alarm blocks publishing connections; without a timeout, a publish would
+    # wait for its confirmation until the alarm clears. The Executor keeps waiting instead.
+    _blocked_connection_timeout_seconds = _BLOCKED_CONNECTION_TIMEOUT_SECONDS
 
     def __init__(self, config: KicakConfig, *, exchange_name: str) -> None:
         """Store the exchange this injector publishes to.
@@ -136,7 +141,8 @@ class KicakInjectorAbstract(KicakAbstract, abc.ABC):
         if the message was not injected, with the original error as `__cause__`:
         `UnroutableError` if no queue is bound to the exchange (the consuming Executor's topology
         is not installed), `NackError` if RabbitMQ refuses the message, or a connection error
-        after three attempts.
+        after three attempts. A connection that a RabbitMQ memory or disk alarm blocks for more
+        than 60 seconds fails with `ConnectionBlockedTimeout`, a connection error.
 
         A connection lost before RabbitMQ confirms the message is retried by publishing it again,
         so RabbitMQ may receive it twice; the consuming agents must be idempotent.
@@ -179,7 +185,9 @@ class KicakInjectorAbstract(KicakAbstract, abc.ABC):
         no message is silently skipped. Its `__cause__` is the error that ended the last attempt
         (for example a pika connection error, `UnroutableError`, or `NackError`), and its
         `message` is the message that was not injected. Errors raised by `generate()` or by
-        serializing the message propagate unchanged.
+        serializing the message propagate unchanged. An attempt never waits more than 60
+        seconds on a connection that a RabbitMQ memory or disk alarm blocks: it then fails with
+        `ConnectionBlockedTimeout` and is retried, so an injection cannot hang during an alarm.
 
         A retried attempt publishes the message again, and RabbitMQ may already have accepted
         the earlier one, so it can arrive twice; the consuming agents must be idempotent.

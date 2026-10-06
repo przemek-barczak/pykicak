@@ -58,6 +58,7 @@ dev = [
 Homepage = "https://github.com/przemek-barczak/pykicak"
 Repository = "https://github.com/przemek-barczak/pykicak"
 Issues = "https://github.com/przemek-barczak/pykicak/issues"
+Changelog = "https://github.com/przemek-barczak/pykicak/blob/main/CHANGELOG.md"
 
 [tool.setuptools.dynamic]
 version = { attr = "pykicak.__version__" }

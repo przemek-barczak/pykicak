@@ -12,7 +12,8 @@ from enum import StrEnum
 from typing import TypeVar, cast
 
 import pika
-from pika.exceptions import NackError, UnroutableError
+from pika.adapters.blocking_connection import BlockingChannel, ReturnedMessage
+from pika.exceptions import UnroutableError
 from pika.exchange_type import ExchangeType
 from pika.spec import Basic
 
@@ -130,20 +131,27 @@ class KicakExecutorAbstract[M: KicakMessage](KicakAbstract, abc.ABC):
 
     Each delivery ends in exactly one outcome:
 
-    - Success: the results returned by `execute()` are published to the destination exchange,
-      then the delivery is acknowledged.
+    - Success: the results returned by `execute()` are published to the destination exchange
+      in one RabbitMQ transaction, so RabbitMQ delivers all of them or none, and the delivery is
+      acknowledged only after the transaction is committed.
     - Deterministic failure (`MalformedMessageError`): the delivery is rejected with
       `basic_nack(requeue=False)`, so RabbitMQ routes it to the dead-letter exchange.
     - Transient failure (`TransientProcessingError`): `execute()` is retried, and if the failure
       persists the delivery is requeued with `basic_nack(requeue=True)`.
     - Any other error is unexpected: the delivery is dead-lettered as above, then the error is
       raised, stopping the executor.
-    - Results that RabbitMQ does not accept (`UnroutableError` because no queue is bound to the
-      destination exchange, or `NackError`): the delivery is requeued with
-      `basic_nack(requeue=True)`, then the error is raised, stopping the executor.
-    - Connection lost while publishing results: the results are discarded, never re-sent on a
-      new connection. RabbitMQ has already requeued the delivery, so the executor reconnects,
-      receives it again, and executes it again, publishing its results once.
+    - Results returned by RabbitMQ as unroutable (`UnroutableError`: no queue is bound to the
+      destination exchange): the delivery is requeued with `basic_nack(requeue=True)`, then the
+      error is raised, stopping the executor.
+    - Connection lost while publishing results: RabbitMQ discards the uncommitted results and
+      requeues the delivery, and the executor never re-sends them on a new connection. It
+      reconnects, receives the delivery again, and executes it again, publishing its results
+      once.
+    - Any other failure to publish the results, e.g. RabbitMQ refusing the commit: the error is
+      raised, stopping the executor, and closing the connection requeues the delivery.
+    - Connection lost while acknowledging or rejecting the delivery: RabbitMQ requeues it, so the
+      executor reconnects and receives it again, unless it was stopping anyway because of an
+      unexpected error or unroutable results, which it then still raises.
 
     Without a destination exchange the executor is a terminator, and `execute()` must return
     None.
@@ -246,6 +254,10 @@ class KicakExecutorAbstract[M: KicakMessage](KicakAbstract, abc.ABC):
         self._destination_exchange = destination_exchange
         self._queue_type = queue_type
         self._max_processing_attempts = max_processing_attempts
+        # Transactional channel for results, opened on first use for each connection
+        self._results_channel: BlockingChannel | None = None
+        self._results_connection: pika.BlockingConnection | None = None
+        self._returned_results: list[ReturnedMessage] = []
 
     def _declare_topology(self) -> None:
         """Declare the source queue and binding, the dead-letter route, and the destination."""
@@ -351,14 +363,17 @@ class KicakExecutorAbstract[M: KicakMessage](KicakAbstract, abc.ABC):
         """Process one decoded message and return the results to publish.
 
         Return a message, a sequence of messages, or None. Results are published to the
-        destination exchange only after `execute()` succeeds; a terminator must return None.
+        destination exchange only after `execute()` succeeds, all in one RabbitMQ transaction,
+        and the input is acknowledged only after that transaction is committed. A terminator
+        must return None.
 
         Raise `TransientProcessingError` for failures that may clear on retry, and
         `MalformedMessageError` to reject the message deterministically (dead-letter it).
 
         Must be idempotent: the same message can be executed more than once, also concurrently
-        by two instances, and after a call that raised `TransientProcessingError` part-way. Make
-        side effects idempotent in the database, and derive result IDs from the input's ID.
+        by two instances, and after a call that raised `TransientProcessingError` part-way, and
+        its results can be published more than once. Make side effects idempotent in the
+        database, and derive result IDs from the input's ID.
         """
 
     def stop(self) -> None:
@@ -516,10 +531,10 @@ class KicakExecutorAbstract[M: KicakMessage](KicakAbstract, abc.ABC):
     def _handle_delivery(self, delivery_tag: int, body: bytes | None) -> bool:
         """Execute one delivery, then acknowledge, requeue, or dead-letter it.
 
-        Returns False if the connection was lost while publishing the results. The results are
-        then discarded instead of being re-sent on a new connection: RabbitMQ has already
-        requeued the delivery, and executing it again publishes its results once. The caller
-        must reconnect and resume consuming.
+        Returns False if the connection was lost while publishing the results or settling the
+        delivery. RabbitMQ then discards the uncommitted results and requeues the delivery, and
+        the results are not re-sent on a new connection: executing the delivery again publishes
+        them once. The caller must reconnect and resume consuming.
         """
         message_id = "unknown"  # until the body is decoded
         try:
@@ -545,8 +560,7 @@ class KicakExecutorAbstract[M: KicakMessage](KicakAbstract, abc.ABC):
                 delivery_tag,
                 self._dead_letter_exchange,
             )
-            self.channel.basic_nack(delivery_tag=delivery_tag, requeue=False)
-            return True
+            return self._settle(delivery_tag, message_id, "dead-lettering", requeue=False)
         except TransientProcessingError as error:
             logger.warning(
                 "Message requeued after %d failed processing attempts id=%s queue=%s "
@@ -557,8 +571,7 @@ class KicakExecutorAbstract[M: KicakMessage](KicakAbstract, abc.ABC):
                 delivery_tag,
                 error,
             )
-            self.channel.basic_nack(delivery_tag=delivery_tag, requeue=True)
-            return True
+            return self._settle(delivery_tag, message_id, "requeueing", requeue=True)
         except Exception:
             logger.exception(
                 "Message processing failed unexpectedly id=%s queue=%s delivery_tag=%i; "
@@ -568,19 +581,19 @@ class KicakExecutorAbstract[M: KicakMessage](KicakAbstract, abc.ABC):
                 delivery_tag,
                 self._dead_letter_exchange,
             )
-            self.channel.basic_nack(delivery_tag=delivery_tag, requeue=False)
+            self._settle(delivery_tag, message_id, "dead-lettering", requeue=False)
             raise
         else:
             try:
-                for exchange_name, result, result_body in publications:
-                    self._publish_serialized(exchange_name, result, result_body)
-            except (UnroutableError, NackError):
+                if publications:
+                    self._publish_results(publications)
+            except UnroutableError:
                 logger.exception(
-                    "RabbitMQ did not accept the results of message id=%s; requeueing it and "
-                    "stopping the executor",
+                    "RabbitMQ returned the results of message id=%s as unroutable; requeueing it "
+                    "and stopping the executor",
                     message_id,
                 )
-                self.channel.basic_nack(delivery_tag=delivery_tag, requeue=True)
+                self._settle(delivery_tag, message_id, "requeueing", requeue=True)
                 raise
             except Exception as error:
                 if not self._is_retryable_rabbitmq_error(error):
@@ -591,7 +604,7 @@ class KicakExecutorAbstract[M: KicakMessage](KicakAbstract, abc.ABC):
                     raise
                 logger.warning(
                     "Connection lost while publishing results of message id=%s; discarding the "
-                    "results, RabbitMQ will redeliver the message: %s",
+                    "uncommitted results, RabbitMQ will redeliver the message: %s",
                     message_id,
                     error,
                 )
@@ -600,9 +613,38 @@ class KicakExecutorAbstract[M: KicakMessage](KicakAbstract, abc.ABC):
             logger.debug(
                 "Acknowledging message id=%s delivery_tag=%i", message_id, delivery_tag
             )
-            self.channel.basic_ack(delivery_tag)
+            if not self._settle(delivery_tag, message_id, "acknowledging"):
+                return False
             logger.debug("Message acknowledged id=%s", message_id)
             return True
+
+    def _settle(
+        self, delivery_tag: int, message_id: str, action: str, *, requeue: bool | None = None
+    ) -> bool:
+        """Acknowledge the delivery, or with `requeue` given, reject it with `basic_nack()`.
+
+        Returns False if the connection was lost: RabbitMQ then requeues the delivery itself, so
+        the settlement is not retried, and the caller must reconnect. Other errors are raised.
+        """
+        try:
+            if requeue is None:
+                self.channel.basic_ack(delivery_tag)
+            else:
+                self.channel.basic_nack(delivery_tag=delivery_tag, requeue=requeue)
+        except Exception as error:
+            if not self._is_retryable_rabbitmq_error(error):
+                raise
+            logger.warning(
+                "Connection lost while %s message id=%s delivery_tag=%i; RabbitMQ will "
+                "redeliver it: %s",
+                action,
+                message_id,
+                delivery_tag,
+                error,
+            )
+            self._discard_connection()
+            return False
+        return True
 
     def _decode(self, body: bytes) -> M:
         """Decode `body` into the expected message type, classifying failures as malformed."""
@@ -657,6 +699,68 @@ class KicakExecutorAbstract[M: KicakMessage](KicakAbstract, abc.ABC):
         return [
             (self._destination_exchange, message, message.to_bytes()) for message in messages
         ]
+
+    def _publish_results(self, publications: list[tuple[str, KicakMessage, bytes]]) -> None:
+        """Publish all results in one transaction, so RabbitMQ delivers all of them or none.
+
+        Returns once RabbitMQ has committed the transaction and taken responsibility for every
+        result. RabbitMQ routes the results only at the commit, so a result that no queue is bound
+        to is reported only after it: this raises `UnroutableError` with the returned results.
+        Connection and channel errors, including RabbitMQ refusing the commit, are raised as they
+        are; RabbitMQ discards an uncommitted transaction when its channel closes. Nothing is
+        retried or reconnected here.
+        """
+        channel = self._transactional_results_channel()
+        self._returned_results.clear()
+        for exchange_name, result, body in publications:
+            self._basic_publish(channel, exchange_name, result, body)
+        logger.debug("Committing the transaction of %d results", len(publications))
+        channel.tx_commit()
+        # RabbitMQ sends returned messages before the commit's reply, but pika hands them to the
+        # return callback only while it processes connection events
+        cast(pika.BlockingConnection, self._results_connection).process_data_events(time_limit=0)
+        if self._returned_results:
+            raise UnroutableError(list(self._returned_results))
+        for exchange_name, result, _body in publications:
+            self._log_published(exchange_name, result)
+
+    def _transactional_results_channel(self) -> BlockingChannel:
+        """Return this connection's transactional channel for results, opening it on first use.
+
+        Results need a channel of their own: a channel in transaction mode cannot also be in
+        confirm mode, and the input's acknowledgement must stay outside the transaction. RabbitMQ
+        routes transactional messages only at the commit, so an acknowledgement committed with
+        results that turn out to be unroutable would remove the input while its results are
+        dropped, losing the message.
+        """
+        channel = self._results_channel
+        if (
+            channel is not None
+            and channel.is_open
+            and self._results_connection is not None
+            and self._results_connection is self._connection
+        ):
+            return channel
+        connection = self._connection
+        if connection is None:
+            raise RuntimeError("Not connected. Call connect() first.")
+        logger.debug("Opening the transactional channel for results")
+        channel = connection.channel()
+        channel.tx_select()
+        channel.add_on_return_callback(self._on_result_returned)
+        self._results_channel = channel
+        self._results_connection = connection
+        return channel
+
+    def _on_result_returned(
+        self,
+        _channel: BlockingChannel,
+        method: Basic.Return,
+        properties: pika.BasicProperties,
+        body: bytes,
+    ) -> None:
+        """Collect a result that RabbitMQ returned because no queue is bound to its exchange."""
+        self._returned_results.append(ReturnedMessage(method, properties, body))
 
     def _start_consuming(
         self,
