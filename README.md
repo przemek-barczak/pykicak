@@ -1363,18 +1363,21 @@ KICAK_CONFIG_PATH=.kicak.terminator2 POC_EXECUTOR_ROLE=terminator2 python -m exa
 
 ## Development
 
-Install the package in editable mode with the development tools (pytest, trustme, ruff, mypy,
-build, and twine), then run the test suite and the checks:
+Install the package in editable mode with the development tools (pytest, pytest-cov, trustme,
+ruff, mypy, build, and twine), then run the test suite and the checks that CI runs:
 
 ```bash
 pip install -e . --group dev   # pip 25.1 or newer
-pytest
+pytest --cov                   # fails below 85% statement coverage
 ruff check .
+ruff format --check .
 mypy
 ```
 
-`mypy` checks `pykicak` and `examples` in strict mode, and the code in `tests` too, without
-requiring annotations on test functions and fixtures.
+The tools are pinned to exact versions in `[dependency-groups]` of `pyproject.toml`, so that every
+run checks with the same ones; Dependabot proposes updates. `mypy` checks `pykicak` and `examples`
+in strict mode, and the code in `tests` and `.github/scripts` too, without requiring annotations on
+test functions and fixtures.
 
 `pytest` excludes integration tests, which require a live RabbitMQ broker (e.g.
 `docker run -p 5672:5672 rabbitmq`). They connect with the `.kicak` file in the working directory,
@@ -1398,6 +1401,13 @@ environment variable; without it they are skipped. `python -m tests.integration.
 configuration; the integration job in `.github/workflows/ci.yml` shows how to start RabbitMQ with
 them.
 
+### CI and releases
+
+GitHub Actions runs these checks, the unit tests on every supported Python version and with the
+oldest supported pika, and the integration tests against RabbitMQ, on every push and pull request.
+Releases are published to PyPI from GitHub Actions alone, when a version tag is pushed and a
+maintainer approves it. [`RELEASING.md`](https://github.com/przemek-barczak/pykicak/blob/main/RELEASING.md)
+describes the workflows, how to release a version, and how to recover from a failed release.
 
 ## License
 

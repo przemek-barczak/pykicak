@@ -44,15 +44,25 @@ dependencies = [
 ]
 
 [dependency-groups]
-# Development tools, not published as package metadata: `pip install -e . --group dev` (pip 25.1+)
+# Development tools, not published as package metadata: `pip install -e . --group dev` (pip 25.1+).
+# Pinned, so that CI checks with the same tools every time; Dependabot proposes updates weekly.
 # trustme issues the test certificates of the TLS tests; cryptography builds nonconforming ones
-test = ["pytest>=8", "trustme>=1.2", "cryptography"]
+test = [
+    "cryptography==50.0.2",
+    "pytest==9.1.1",
+    "pytest-cov==7.1.0",
+    "trustme==1.2.1",
+]
+# What the release workflow needs to build and check the distributions
+release = [
+    "build==1.6.1",
+    "twine==7.0.0",
+]
 dev = [
     { include-group = "test" },
-    "build",
-    "mypy",
-    "ruff",
-    "twine",
+    { include-group = "release" },
+    "mypy==2.4.0",
+    "ruff==0.17.1",
 ]
 
 [project.urls]
@@ -80,6 +90,14 @@ markers = [
 ]
 addopts = "--strict-markers -m 'not integration'"
 
+[tool.coverage.run]
+source = ["pykicak"]
+
+[tool.coverage.report]
+# Statement coverage of the unit tests, enforced by `pytest --cov` in CI
+fail_under = 85
+show_missing = true
+
 [tool.ruff]
 line-length = 100
 
@@ -89,7 +107,7 @@ select = ["E4", "E7", "E9", "F", "W", "I", "B", "UP"]
 [tool.mypy]
 python_version = "3.12"
 strict = true
-files = ["pykicak", "examples", "tests"]
+files = ["pykicak", "examples", "tests", ".github/scripts"]
 
 [[tool.mypy.overrides]]
 # Test bodies are checked, but pytest functions and fixtures need no annotations

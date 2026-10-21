@@ -4,51 +4,124 @@ on:
   push:
     branches: [main]
   pull_request:
+  # The release workflow runs this whole workflow before it builds and publishes a release
+  workflow_call:
 
-permissions:
-  contents: read
+# No permissions by default; each job asks for only what it needs
+permissions: {}
 
+concurrency:
+  # One run per pull request or ref; a newer push to a pull request cancels the older run
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Actions are pinned to full commit SHAs, with the release in a comment; Dependabot updates both.
+# pip is pinned through setup-python's pip-version, which Dependabot cannot update.
 jobs:
-  test:
+  lint:
+    name: Lint, format, and type checks
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          pip-version: "26.2.2"
+      - run: python -m pip install -e . --group dev
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: mypy
+
+  test:
+    name: Unit tests (Python ${{ matrix.python-version }}, pika ${{ matrix.pika }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.12", "3.13", "3.14"]
+        python-version: ["3.12", "3.13", "3.14", "3.15"]
+        pika: ["latest"]
+        include:
+          # The oldest pika that pyproject.toml allows
+          - python-version: "3.12"
+            pika: "1.4.0"
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ matrix.python-version }}
-      - run: python -m pip install --upgrade pip
-      - run: python -m pip install -e . --group test
-      - run: pytest
-
-  checks:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-      - run: python -m pip install --upgrade pip
-      - run: python -m pip install -e . --group dev
-      - run: ruff check .
-      - run: mypy
-      - name: Build and check the distributions
+          pip-version: "26.2.2"
+      - name: Install the package and the test tools
+        env:
+          PIKA_VERSION: ${{ matrix.pika }}
         run: |
-          python -m build
-          twine check --strict dist/*
+          if [ "$PIKA_VERSION" = latest ]; then
+            python -m pip install -e . --group test
+          else
+            python -m pip install -e . --group test "pika==$PIKA_VERSION"
+          fi
+      - name: Check the pika version under test
+        env:
+          PIKA_VERSION: ${{ matrix.pika }}
+        run: |
+          python - "$PIKA_VERSION" <<'EOF'
+          import importlib.metadata, sys
+          installed = importlib.metadata.version("pika")
+          print(f"pika {installed}")
+          if sys.argv[1] not in ("latest", installed):
+              sys.exit(f"expected pika {sys.argv[1]}, but pika {installed} is installed")
+          EOF
+      - name: Run the unit tests, enforcing the coverage threshold
+        # The threshold is fail_under in [tool.coverage.report] of pyproject.toml
+        run: pytest --cov --cov-report=term-missing
 
   integration:
+    name: Integration tests with RabbitMQ (pika ${{ matrix.pika }})
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        pika: ["latest", "1.4.0"]
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
-      - run: python -m pip install --upgrade pip
-      - run: python -m pip install -e . --group test
+          pip-version: "26.2.2"
+      - name: Install the package and the test tools
+        env:
+          PIKA_VERSION: ${{ matrix.pika }}
+        run: |
+          if [ "$PIKA_VERSION" = latest ]; then
+            python -m pip install -e . --group test
+          else
+            python -m pip install -e . --group test "pika==$PIKA_VERSION"
+          fi
+      - name: Check the pika version under test
+        env:
+          PIKA_VERSION: ${{ matrix.pika }}
+        run: |
+          python - "$PIKA_VERSION" <<'EOF'
+          import importlib.metadata, sys
+          installed = importlib.metadata.version("pika")
+          print(f"pika {installed}")
+          if sys.argv[1] not in ("latest", installed):
+              sys.exit(f"expected pika {sys.argv[1]}, but pika {installed} is installed")
+          EOF
       - name: Write a test CA and the broker's TLS certificate and configuration
         run: python -m tests.integration.tls_broker_files "$RUNNER_TEMP/rabbitmq-tls"
       - name: Write the broker's advanced configuration
@@ -61,6 +134,9 @@ jobs:
         # Started here, not as a service container, because it needs the files written above.
         # Readiness is read from its log: running rabbitmq-diagnostics during the boot, as root,
         # can create the Erlang cookie before the broker does, which it then cannot read.
+        # RabbitMQ 4.2, which the tests were verified on: 4.3 stopped evaluating consumer timeouts
+        # for classic queues, and refuses the x-consumer-timeout argument the consumer_timeout test
+        # declares, so that test still has to be adapted before CI moves to a newer broker.
         run: |
           docker run -d --name rabbitmq \
             -e RABBITMQ_DEFAULT_USER=pykicak -e RABBITMQ_DEFAULT_PASS=pykicak \
@@ -68,8 +144,8 @@ jobs:
             -v "$RUNNER_TEMP/rabbitmq-tls:/etc/rabbitmq/tls:ro" \
             -v "$RUNNER_TEMP/rabbitmq-tls/20-tls.conf:/etc/rabbitmq/conf.d/20-tls.conf:ro" \
             -v "$RUNNER_TEMP/rabbitmq-advanced.config:/etc/rabbitmq/advanced.config:ro" \
-            rabbitmq:4
-          for attempt in $(seq 60); do
+            rabbitmq:4.2
+          for _ in $(seq 60); do
             if docker logs rabbitmq 2>&1 | grep -q "Server startup complete"; then exit 0; fi
             sleep 2
           done
@@ -96,3 +172,33 @@ jobs:
       - run: pytest -m integration -rs
         env:
           KICAK_TLS_CONFIG_PATH: .kicak.tls
+
+  build:
+    name: Build and check the distributions
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          pip-version: "26.2.2"
+      - run: python -m pip install --group release
+      - name: Build the sdist, and the wheel from the sdist
+        run: python -m build
+      - run: twine check --strict dist/*
+      - name: Check the distributions' names, versions, and contents
+        run: python .github/scripts/release_checks.py dist dist
+      - name: Install the wheel into a fresh environment and import it
+        run: |
+          version="$(python .github/scripts/release_checks.py version)"
+          python -m venv "$RUNNER_TEMP/smoke"
+          "$RUNNER_TEMP/smoke/bin/python" -m pip install dist/*.whl
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/smoke/bin/python" -c \
+            'import sys, pykicak; assert pykicak.__version__ == sys.argv[1], pykicak.__version__' \
+            "$version"

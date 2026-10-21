@@ -1,0 +1,140 @@
+name: Release
+
+# Publishes pykicak to PyPI when a version tag (v*) is pushed, and never otherwise: pushes to
+# branches and pull requests run only CI, and the publish job waits for a reviewer's approval in
+# the "pypi" environment. How to release, and how to recover from a failed release: RELEASING.md.
+on:
+  push:
+    tags: ["v*"]
+
+# No permissions by default; each job asks for only what it needs
+permissions: {}
+
+concurrency:
+  # Never two runs for the same tag, and never cancel a release halfway
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Check the tag, the version, and the changelog
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0 # the history of main, to check that the tagged commit is on it
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Check that the tag names the package version, which CHANGELOG.md describes
+        id: version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          python .github/scripts/release_checks.py tag "$TAG"
+          echo "version=$(python .github/scripts/release_checks.py version)" >> "$GITHUB_OUTPUT"
+      - name: Check that the tagged commit is on main
+        run: |
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "::error::The tagged commit $GITHUB_SHA is not on main; release only from main"
+            exit 1
+          fi
+
+  ci:
+    name: CI
+    needs: validate
+    # A reusable workflow called with ./ comes from the commit this run releases, like $/, which
+    # actionlint does not accept yet
+    uses: ./.github/workflows/ci.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+
+  build:
+    name: Build and check the distributions
+    needs: [validate, ci]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      sha256: ${{ steps.hashes.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          pip-version: "26.2.2"
+      - run: python -m pip install --group release
+      - name: Build the sdist, and the wheel from the sdist
+        run: python -m build
+      - run: twine check --strict dist/*
+      - name: Check the distributions' names, versions, and contents
+        run: python .github/scripts/release_checks.py dist dist
+      - name: Install the wheel into a fresh environment and import it
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          python -m venv "$RUNNER_TEMP/smoke"
+          "$RUNNER_TEMP/smoke/bin/python" -m pip install dist/*.whl
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/smoke/bin/python" -c \
+            'import sys, pykicak; assert pykicak.__version__ == sys.argv[1], pykicak.__version__' \
+            "$VERSION"
+      - name: Record the SHA-256 of each distribution
+        id: hashes
+        working-directory: dist
+        run: |
+          sha256sum -- *
+          {
+            echo "sha256<<EOF"
+            sha256sum -- *
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: Publish to PyPI
+    needs: [validate, ci, build]
+    # A fork's tags never reach PyPI: its trusted publisher is this repository alone
+    if: github.repository == 'przemek-barczak/pykicak'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: pypi
+      url: https://pypi.org/project/pykicak/${{ needs.validate.outputs.version }}/
+    # Trusted Publishing: PyPI exchanges this job's OIDC token for a short-lived upload token, and
+    # the attestations are signed with it. The job checks nothing out, so no contents permission.
+    permissions:
+      id-token: write # the OIDC token for Trusted Publishing and the attestations
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist/
+      - name: Check that these are exactly the files the build job checked
+        working-directory: dist
+        env:
+          SHA256: ${{ needs.build.outputs.sha256 }}
+        run: |
+          printf '%s\n' "$SHA256" | sha256sum --check --strict
+          if [ "$(find . -type f | wc -l)" -ne "$(printf '%s\n' "$SHA256" | wc -l)" ]; then
+            echo "::error::dist/ holds files the build job did not record"
+            exit 1
+          fi
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          # PEP 740 attestations of each file, signed with this job's identity (the default)
+          attestations: true

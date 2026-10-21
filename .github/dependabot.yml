@@ -1,0 +1,32 @@
+# Weekly update pull requests. Each runs CI like any pull request; nothing merges or releases by
+# itself. A cooldown leaves a new release a week to be found broken or compromised before it is
+# proposed; security updates skip the cooldown.
+version: 2
+updates:
+  # The commit SHAs, and the release comments beside them, of the actions in .github/workflows
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      github-actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: ci
+
+  # pyproject.toml: the pinned tools of [dependency-groups], and the pika range of the package
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      # One pull request for the development tools; pika, a dependency of every user, stays apart
+      development-tools:
+        patterns: ["*"]
+        exclude-patterns: ["pika"]
+    commit-message:
+      prefix: build
