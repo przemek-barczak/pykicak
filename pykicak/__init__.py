@@ -18,7 +18,7 @@ from pykicak.executor import (
 from pykicak.injector import InjectionError, KicakInjectorAbstract
 from pykicak.messages import KicakMessage
 
-__version__ = "0.2.0"  # the only place the version is set; pyproject.toml reads it from here
+__version__ = "0.3.0"  # the only place the version is set; pyproject.toml reads it from here
 
 logging.getLogger(__name__).addHandler(logging.NullHandler())
 

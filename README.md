@@ -166,8 +166,8 @@ config = KicakConfig(values={**file_config.values, **KicakConfig.from_env().valu
 Without TLS, the connection to RabbitMQ is not encrypted: the username, the password, and every
 message cross the network in clear text, and anyone on the path can read or change them. Use
 `RABBIT_MQ_TLS=false` only for a broker on the same host or on a network you fully trust. Managed
-brokers such as CloudAMQP and Amazon MQ require TLS. `RABBIT_MQ_TLS` is required, so an unencrypted
-connection is always an explicit choice:
+brokers offer TLS, and some, such as Amazon MQ, accept nothing else. `RABBIT_MQ_TLS` is required,
+so an unencrypted connection is always an explicit choice:
 
 ```text
 RABBIT_MQ_HOST=broker.example.com
@@ -1181,8 +1181,8 @@ Things to plan for when running several instances:
   (see [Requirement: idempotent processing](#requirement-idempotent-processing)).
 - **Processing longer than `heartbeat_seconds` or `consumer_timeout` causes such redeliveries.**
   RabbitMQ closes the connection or channel, or cancels the consumer, and redelivers the message
-  while it is still being processed (see [Long-running `execute()`](#long-running-execute)). With several instances, another
-  instance picks it up immediately.
+  while it is still being processed (see [Long-running `execute()`](#long-running-execute)).
+  With several instances, another instance picks it up immediately.
 - **An unexpected error stops only the instance that hit it.** Each instance dead-letters the
   message and stops on its own, so a bug that fails every message dead-letters one message per
   instance before all have stopped.
@@ -1260,8 +1260,9 @@ header otherwise.
 
 Injectors retry transient RabbitMQ connection and publish failures up to three attempts, with
 1- and 2-second delays between attempts; each retry publishes the message again on a new
-connection, and after the third failed attempt the error is raised. Executors reconnect indefinitely after transient failures, using exponential full jitter
-with a 0.5-second initial delay and a 30-second maximum, but never retry a result publish (see
+connection, and after the third failed attempt the error is raised. Executors reconnect
+indefinitely after transient failures, using exponential full jitter with a 0.5-second initial
+delay and a 30-second maximum, but never retry a result publish (see
 [Error handling and dead-lettering](#error-handling-and-dead-lettering)). Authentication and
 access-denied failures, and a broker certificate that fails verification (see [TLS](#tls)), are not
 retried.
@@ -1287,8 +1288,8 @@ again in the meantime.
 
 Publishing is at-least-once: if the connection is lost before RabbitMQ's confirmation or the reply
 to a commit arrives, RabbitMQ may already have accepted the messages. The Injector then publishes
-its message again, and the Executor executes the redelivered input again. pykicak does not provide exactly-once delivery, which
-is why it requires idempotent agents (see
+its message again, and the Executor executes the redelivered input again. pykicak does not provide
+exactly-once delivery, which is why it requires idempotent agents (see
 [Requirement: idempotent processing](#requirement-idempotent-processing)).
 
 The library emits standard Python logging records through module loggers. Applications configure
@@ -1325,18 +1326,18 @@ subclassing `KicakInjectorAbstract` or `KicakExecutorAbstract`; their shared bas
 
 ## Proof of concept
 
-[`examples/poc/`](https://github.com/przemek-barczak/pykicak/blob/main/examples/poc) in the repository contains a runnable example (examples are not part of the
-installed package): an injector that publishes a heartbeat message, an executor that publishes it
-to a fan-out exchange, and two terminator executors that each declare their own queue and bind it
-to that exchange. The fan-out executor names both terminator queues in its `destination_queues`, so
-it declares and binds them too before publishing. Each executor also declares the dead-letter
-exchange and queue of its input queue (for example `poc.heartbeat.source.dlx` →
-`poc.heartbeat.source.dlq`) and its retry queue (`poc.heartbeat.source.retry`). Start the fan-out
-executor before running the injector: until it has declared its queue, the injector fails with
-`UnroutableError`. The terminators can start at any time; their queues collect the messages
-meanwhile. The queue/exchange topology is defined once in `examples/poc/messaging/`
-(`queues.py`, `exchanges.py`, `bindings.py`) and imported by every agent — none of it lives in
-`.kicak`.
+[`examples/poc/`](https://github.com/przemek-barczak/pykicak/blob/main/examples/poc) in the
+repository contains a runnable example (examples are not part of the installed package): an injector
+that publishes a heartbeat message, an executor that publishes it to a fan-out exchange, and two
+terminator executors that each declare their own queue and bind it to that exchange. The fan-out
+executor names both terminator queues in its `destination_queues`, so it declares and binds them too
+before publishing. Each executor also declares the dead-letter exchange and queue of its input queue
+(for example `poc.heartbeat.source.dlx` → `poc.heartbeat.source.dlq`) and its retry queue
+(`poc.heartbeat.source.retry`). Start the fan-out executor before running the injector: until it has
+declared its queue, the injector fails with `UnroutableError`. The terminators can start at any
+time; their queues collect the messages meanwhile. The queue/exchange topology is defined once in
+`examples/poc/messaging/` (`queues.py`, `exchanges.py`, `bindings.py`) and imported by every agent —
+none of it lives in `.kicak`.
 
 The PoC also shows [a new version of a message](#a-new-version-of-a-message) being introduced
 while the flow keeps running. `examples/poc/messages.py` defines two versions of the heartbeat,
@@ -1346,7 +1347,7 @@ and each agent's class header declares which ones it publishes and accepts:
 | --- | --- | --- |
 | `HeartbeatInjector` | `KicakInjectorAbstract[HeartbeatMessageV2]` | the upgraded producer: publishes version 2 |
 | `HeartbeatInjectorV1` | `KicakInjectorAbstract[HeartbeatMessageV1]` | the producer before the upgrade: publishes version 1 |
-| `HeartbeatForwarder` | `KicakExecutorAbstract[HeartbeatMessageV1 \ | HeartbeatMessageV2, HeartbeatMessageV2]` | the consumer, upgraded first: accepts both versions, converts version 1 to version 2 with the sender `"unknown"` |
+| `HeartbeatForwarder` | `KicakExecutorAbstract[HeartbeatMessageV1 \| HeartbeatMessageV2, HeartbeatMessageV2]` | the consumer, upgraded first: accepts both versions, converts version 1 to version 2 with the sender `"unknown"` |
 | `HeartbeatTerminator` | `KicakExecutorAbstract[HeartbeatMessageV2, None]` | downstream: receives version 2 only |
 
 Run the injector with `POC_HEARTBEAT_VERSION=1` and without it: the fan-out executor processes both
@@ -1372,7 +1373,7 @@ KICAK_CONFIG_PATH=.kicak.terminator2 POC_EXECUTOR_ROLE=terminator2 python -m exa
 ## Development
 
 Install the package in editable mode with the development tools (pytest, pytest-cov, trustme,
-ruff, mypy, build, and twine), then run the test suite and the checks that CI runs:
+cryptography, ruff, mypy, build, and twine), then run the test suite and the checks that CI runs:
 
 ```bash
 pip install -e . --group dev   # pip 25.1 or newer
@@ -1415,7 +1416,8 @@ them.
 ### CI and releases
 
 GitHub Actions runs these checks, the unit tests on every supported Python version and with the
-oldest supported pika, and the integration tests against RabbitMQ, on every push and pull request.
+oldest supported pika, and the integration tests against RabbitMQ, on every push to `main` and
+every pull request.
 Releases are published to PyPI from GitHub Actions alone, when a version tag is pushed and a
 maintainer approves it. [`RELEASING.md`](https://github.com/przemek-barczak/pykicak/blob/main/RELEASING.md)
 describes the workflows, how to release a version, and how to recover from a failed release.

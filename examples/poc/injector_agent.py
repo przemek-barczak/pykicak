@@ -7,6 +7,7 @@ during a rolling upgrade; the fan-out executor accepts both (see examples.poc.me
 
 from __future__ import annotations
 
+import logging
 import os
 import socket
 import sys
@@ -72,6 +73,12 @@ def _build_injector(config: KicakConfig, version: str) -> HeartbeatInjector | He
 
 
 if __name__ == "__main__":
+    # pykicak only emits log records; the application decides where they go and from which level.
+    # Warnings from every library, and pykicak's own INFO records (messages received and published).
+    logging.basicConfig(
+        level=logging.WARNING, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
+    logging.getLogger("pykicak").setLevel(logging.INFO)
     config = KicakConfig.from_file(os.environ.get("KICAK_CONFIG_PATH", ".kicak"))
     injector = _build_injector(config, os.environ.get("POC_HEARTBEAT_VERSION", "2"))
     try:

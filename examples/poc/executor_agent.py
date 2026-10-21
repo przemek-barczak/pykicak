@@ -25,6 +25,7 @@ Ctrl+C or SIGTERM stops an executor gracefully, after the message in progress.
 
 from __future__ import annotations
 
+import logging
 import os
 import signal
 from typing import assert_never
@@ -115,6 +116,12 @@ def _build_executor(config: KicakConfig, role: str) -> HeartbeatForwarder | Hear
 
 
 if __name__ == "__main__":
+    # pykicak only emits log records; the application decides where they go and from which level.
+    # Warnings from every library, and pykicak's own INFO records (messages received and published).
+    logging.basicConfig(
+        level=logging.WARNING, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
+    logging.getLogger("pykicak").setLevel(logging.INFO)
     config = KicakConfig.from_file(os.environ.get("KICAK_CONFIG_PATH", ".kicak"))
     executor = _build_executor(config, os.environ.get("POC_EXECUTOR_ROLE", "fanout"))
     # Ctrl+C or SIGTERM: finish the message in progress, then stop before taking another one

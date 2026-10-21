@@ -1,8 +1,8 @@
 # CI/CD and releasing pykicak
 
-pykicak is tested by GitHub Actions on every push and pull request, and published to PyPI by
-GitHub Actions only, when a version tag is pushed and a maintainer approves it. Nobody uploads from
-a laptop, and no PyPI password or API token is stored anywhere.
+pykicak is tested by GitHub Actions on every push to `main` and every pull request, and published
+to PyPI by GitHub Actions only, when a version tag is pushed and a maintainer approves it. Nobody
+uploads from a laptop, and no PyPI password or API token is stored anywhere.
 
 ## How it fits together
 

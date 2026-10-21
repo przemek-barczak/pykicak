@@ -523,18 +523,19 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
       wait (0.5 seconds, doubling up to 30, with jitter) during which the connection keeps
       answering heartbeats. `execute()` is not called again. A `stop()` during the hold
       requeues the delivery, so the message is executed again later.
-    - Connection lost while publishing results, or RabbitMQ already closed the channel of the
-      delivery (its `consumer_timeout` expired), also while holding them: RabbitMQ discards the
-      uncommitted results and requeues the delivery, and the executor never re-sends them on a
-      new connection. It reconnects, receives the delivery again, and executes it again,
-      publishing its results once.
+    - Connection lost while publishing results, or RabbitMQ already took the delivery back
+      because it outlasted `consumer_timeout` (closing its channel, or cancelling the consumer on
+      RabbitMQ 4.3 and newer), also while holding them: RabbitMQ discards the uncommitted results
+      and requeues the delivery, and the executor never re-sends them on a new connection. It
+      reconnects, receives the delivery again, and executes it again, publishing its results
+      once.
     - A result larger than RabbitMQ's `max_message_size`: RabbitMQ discards the transaction, so
       nothing is published, and the delivery is dead-lettered as above; the executor continues.
     - Any other failure to verify the output side or to publish the results, e.g. RabbitMQ
       refusing a declaration or the commit: the error is raised, stopping the executor, and
       closing the connection requeues the delivery.
     - Connection lost while acknowledging or rejecting the delivery, or moving it to the retry
-      queue, or RabbitMQ closed its channel because the delivery outlasted `consumer_timeout`:
+      queue, or RabbitMQ took the delivery back because it outlasted `consumer_timeout`:
       RabbitMQ requeues it, so the executor reconnects and receives it again, unless it was
       stopping anyway because of an unexpected error, which it then still raises.
 
@@ -1197,13 +1198,13 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
     ) -> bool:
         """Execute one delivery, then acknowledge, dead-letter, or move it to the retry queue.
 
-        Returns False if the connection was lost while publishing the results or settling the
-        delivery, or RabbitMQ closed the delivery's channel because it outlasted
-        `consumer_timeout`, also while the results were held. RabbitMQ then discards the
-        uncommitted results and requeues the delivery, and the results are not re-sent on a new
-        connection: executing the delivery again publishes them once. The caller must reconnect
-        and resume consuming. A stop request while the results are held requeues the delivery.
-        So does a connection lost while moving a message to the retry queue.
+        Returns False if the connection was lost while publishing the results, settling the
+        delivery, or moving it to the retry queue, or RabbitMQ took the delivery back because it
+        outlasted `consumer_timeout` (closing its channel, or cancelling the consumer), also
+        while the results were held. RabbitMQ then discards the uncommitted results and requeues
+        the delivery, and the results are not re-sent on a new connection: executing the
+        delivery again publishes them once. The caller must reconnect and resume consuming. A
+        stop request while the results are held requeues the delivery.
         """
         # The sender's message_id property until the body is decoded, then the body's own
         message_id = _sent_message_id(properties)
@@ -1601,7 +1602,8 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
         are held; the caller then requeues the input. Between attempts the connection keeps
         answering heartbeats, and `execute()` is not called again. Errors of `_publish_results()`
         other than `UnroutableError` are raised, as is `ChannelWrongStateError` if RabbitMQ
-        closes the input's channel during the hold, e.g. on `consumer_timeout`.
+        takes the input back during the hold, closing its channel or cancelling the consumer,
+        e.g. on `consumer_timeout`.
         """
         attempt = 0
         while True:
