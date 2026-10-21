@@ -87,9 +87,7 @@ class KicakInjectorAbstract(KicakAbstract, abc.ABC):
             exchange=self._exchange_name, exchange_type=ExchangeType.fanout, durable=True
         )
 
-    def _retry_rabbitmq_operation(
-        self, operation: Callable[[], _T], operation_name: str
-    ) -> _T:
+    def _retry_rabbitmq_operation(self, operation: Callable[[], _T], operation_name: str) -> _T:
         """Try a RabbitMQ operation up to three times: now, after 1 second, after 2 more seconds.
 
         Only transient errors are retried; the last error is raised once the attempts run out.

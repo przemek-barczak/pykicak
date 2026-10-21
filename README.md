@@ -205,10 +205,12 @@ and the consuming side (executor):
 import dataclasses
 from pykicak import KicakMessage
 
+
 @dataclasses.dataclass(frozen=True, slots=True)
 class CrawledItem(KicakMessage):
     url: str
     content: str
+
 
 item = CrawledItem(url="https://example.com", content="...", message_id="5f0c7b1e-...")
 ```
@@ -250,6 +252,7 @@ from pykicak import (
     TransientProcessingError,
 )
 
+
 class SaveToDbExecutor(KicakExecutorAbstract[CrawledItem]):
     def message_type(self) -> type[CrawledItem]:
         return CrawledItem
@@ -262,6 +265,7 @@ class SaveToDbExecutor(KicakExecutorAbstract[CrawledItem]):
         except ConnectionError as error:
             raise TransientProcessingError("database unavailable") from error  # retried
         return None  # a terminator publishes nothing
+
 
 config = KicakConfig.from_file(".kicak")
 executor = SaveToDbExecutor(
@@ -281,10 +285,12 @@ import uuid
 
 from pykicak import KicakConfig, KicakInjectorAbstract
 
+
 class StartProcessingInjector(KicakInjectorAbstract):
     def generate(self) -> CrawledItem:
         # A new ID where the message is first created; it never changes afterwards
         return CrawledItem(message_id=str(uuid.uuid4()), url="https://example.com", content="...")
+
 
 config = KicakConfig.from_file(".kicak")
 injector = StartProcessingInjector(config, exchange_name="items.inbox")
@@ -334,10 +340,12 @@ import uuid
 
 from pykicak import KicakConfig, KicakExecutorAbstract, KicakMessage
 
+
 @dataclasses.dataclass(frozen=True, slots=True)
 class ClassifiedItem(KicakMessage):
     url: str
     category: str
+
 
 class ClassifyingExecutor(KicakExecutorAbstract[CrawledItem]):
     def message_type(self) -> type[CrawledItem]:
@@ -348,6 +356,7 @@ class ClassifyingExecutor(KicakExecutorAbstract[CrawledItem]):
         # publishes a result with the same ID, which downstream agents can deduplicate
         result_id = uuid.uuid5(uuid.NAMESPACE_URL, f"classified:{message.message_id}")
         return ClassifiedItem(message_id=str(result_id), url=message.url, category="news")
+
 
 config = KicakConfig.from_file(".kicak")
 executor = ClassifyingExecutor(
@@ -506,8 +515,8 @@ ISO 8601 string in UTC, for example `"2026-10-01T17:05:42.123456+00:00"`. Callin
 does not update it, so a monitor that calls `get_status()` regularly can tell when it last checked.
 
 ```python
-status = executor.get_status()        # "RUNNING"; also updates the timestamp
-checked_at = executor.get_timestamp() # e.g. "2026-10-01T17:05:42.123456+00:00"
+status = executor.get_status()  # "RUNNING"; also updates the timestamp
+checked_at = executor.get_timestamp()  # e.g. "2026-10-01T17:05:42.123456+00:00"
 ```
 
 Both methods are safe to call from any thread while `run()` is running, and neither uses the

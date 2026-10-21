@@ -302,9 +302,7 @@ class KicakExecutorAbstract[M: KicakMessage](KicakAbstract, abc.ABC):
         logger.debug("Binding queue %s -> exchange %s", queue_name, exchange_name)
         self.channel.queue_bind(queue=queue_name, exchange=exchange_name)
 
-    def _retry_rabbitmq_operation(
-        self, operation: Callable[[], _T], operation_name: str
-    ) -> _T:
+    def _retry_rabbitmq_operation(self, operation: Callable[[], _T], operation_name: str) -> _T:
         """Retry transient RabbitMQ failures forever with capped exponential full jitter."""
         attempt = 0
         while True:
@@ -610,9 +608,7 @@ class KicakExecutorAbstract[M: KicakMessage](KicakAbstract, abc.ABC):
                 )
                 self._discard_connection()
                 return False
-            logger.debug(
-                "Acknowledging message id=%s delivery_tag=%i", message_id, delivery_tag
-            )
+            logger.debug("Acknowledging message id=%s delivery_tag=%i", message_id, delivery_tag)
             if not self._settle(delivery_tag, message_id, "acknowledging"):
                 return False
             logger.debug("Message acknowledged id=%s", message_id)
@@ -696,9 +692,7 @@ class KicakExecutorAbstract[M: KicakMessage](KicakAbstract, abc.ABC):
             raise RuntimeError(
                 "execute() returned results, but the executor has no destination_exchange"
             )
-        return [
-            (self._destination_exchange, message, message.to_bytes()) for message in messages
-        ]
+        return [(self._destination_exchange, message, message.to_bytes()) for message in messages]
 
     def _publish_results(self, publications: list[tuple[str, KicakMessage, bytes]]) -> None:
         """Publish all results in one transaction, so RabbitMQ delivers all of them or none.
@@ -770,6 +764,4 @@ class KicakExecutorAbstract[M: KicakMessage](KicakAbstract, abc.ABC):
         logger.debug("Setting RabbitMQ prefetch count to %d", _PREFETCH_COUNT)
         self.channel.basic_qos(prefetch_count=_PREFETCH_COUNT)
         logger.debug("Consuming from RabbitMQ queue=%s", self._source_queue)
-        return iter(
-            self.channel.consume(self._source_queue, inactivity_timeout=_STOP_POLL_SECONDS)
-        )
+        return iter(self.channel.consume(self._source_queue, inactivity_timeout=_STOP_POLL_SECONDS))

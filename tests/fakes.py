@@ -124,9 +124,7 @@ class FakeChannel:
             DeclaredQueue(queue, durable, exclusive, auto_delete, arguments)
         )
 
-    def exchange_declare(
-        self, exchange: str, exchange_type: str, durable: bool = False
-    ) -> None:
+    def exchange_declare(self, exchange: str, exchange_type: str, durable: bool = False) -> None:
         self.declared_exchanges.append(DeclaredExchange(exchange, exchange_type, durable))
 
     def queue_bind(self, queue: str, exchange: str) -> None:

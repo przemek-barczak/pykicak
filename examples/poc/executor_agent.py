@@ -59,9 +59,7 @@ class HeartbeatTerminator(KicakExecutorAbstract[HeartbeatMessage]):
         print(f"received: {message}")
 
 
-def _build_executor(
-    config: KicakConfig, role: str
-) -> HeartbeatForwarder | HeartbeatTerminator:
+def _build_executor(config: KicakConfig, role: str) -> HeartbeatForwarder | HeartbeatTerminator:
     """Build the executor for `role`, wiring its topology from examples.poc.messaging."""
     if role == "fanout":
         return HeartbeatForwarder(

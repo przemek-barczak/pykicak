@@ -132,16 +132,12 @@ def _open_connection(config: KicakConfig) -> pika.BlockingConnection:
             host=config.rabbitmq_host,
             port=config.rabbitmq_port,
             virtual_host=config.rabbitmq_virtual_host,
-            credentials=pika.PlainCredentials(
-                config.rabbitmq_username, config.rabbitmq_password
-            ),
+            credentials=pika.PlainCredentials(config.rabbitmq_username, config.rabbitmq_password),
         )
     )
 
 
-def _get_dead_letter(
-    channel, queue: str
-) -> tuple[pika.BasicProperties, bytes]:
+def _get_dead_letter(channel, queue: str) -> tuple[pika.BasicProperties, bytes]:
     """Poll `queue` until the broker has routed a dead-lettered message into it."""
     deadline = time.monotonic() + _DELIVERY_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
@@ -199,11 +195,13 @@ def test_injector_executor_fanout_round_trip(config, topology):
     fanout = topology.executor_topology("source", inject_exchange)
     message = IntegrationMessage(message_id="hello", payload="hello")
 
-    with RecordingExecutor(config, **terminator_1) as executor_1, RecordingExecutor(
-        config, **terminator_2
-    ) as executor_2, RecordingExecutor(
-        config, destination_exchange=fanout_exchange, **fanout
-    ) as fanout_executor:
+    with (
+        RecordingExecutor(config, **terminator_1) as executor_1,
+        RecordingExecutor(config, **terminator_2) as executor_2,
+        RecordingExecutor(
+            config, destination_exchange=fanout_exchange, **fanout
+        ) as fanout_executor,
+    ):
         with OneShotInjector(config, inject_exchange, message) as injector:
             injector.publish(message)
 
@@ -504,7 +502,9 @@ class SlowExecutor(RecordingExecutor):
         return super().execute(message)
 
 
-def _start_in_thread(executor: KicakExecutorAbstract) -> tuple[threading.Thread, list[BaseException]]:
+def _start_in_thread(
+    executor: KicakExecutorAbstract,
+) -> tuple[threading.Thread, list[BaseException]]:
     """Run `executor.run()` in a thread; the list collects anything it raises."""
     errors: list[BaseException] = []
 

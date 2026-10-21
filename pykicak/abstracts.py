@@ -59,9 +59,7 @@ class KicakAbstract(abc.ABC):
             if isinstance(heartbeat_seconds, bool) or not isinstance(heartbeat_seconds, int):
                 raise TypeError("heartbeat_seconds must be an int or None")
             if not 1 <= heartbeat_seconds <= _MAX_HEARTBEAT_SECONDS:
-                raise ValueError(
-                    f"heartbeat_seconds must be from 1 to {_MAX_HEARTBEAT_SECONDS}"
-                )
+                raise ValueError(f"heartbeat_seconds must be from 1 to {_MAX_HEARTBEAT_SECONDS}")
         self._config = config
         self._heartbeat_seconds = heartbeat_seconds
         self._connection: pika.BlockingConnection | None = None
@@ -133,9 +131,7 @@ class KicakAbstract(abc.ABC):
             self._establish_connection()
 
     @abc.abstractmethod
-    def _retry_rabbitmq_operation(
-        self, operation: Callable[[], _T], operation_name: str
-    ) -> _T:
+    def _retry_rabbitmq_operation(self, operation: Callable[[], _T], operation_name: str) -> _T:
         """Apply this agent's retry policy to a RabbitMQ operation."""
 
     @staticmethod
@@ -166,9 +162,7 @@ class KicakAbstract(abc.ABC):
                 except Exception:
                     logger.debug("Error while discarding a RabbitMQ resource", exc_info=True)
 
-    def _publish_serialized(
-        self, exchange_name: str, message: KicakMessage, body: bytes
-    ) -> None:
+    def _publish_serialized(self, exchange_name: str, message: KicakMessage, body: bytes) -> None:
         """Publish `message`, already serialized as `body`, once on the current channel.
 
         The message's `message_id` is also sent as the AMQP `message_id` property.

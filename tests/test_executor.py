@@ -1518,9 +1518,7 @@ def test_run_raises_the_processing_error_when_connection_is_lost_while_dead_lett
     assert executor.get_status() == ExecutorStatus.CRASHED
 
 
-def test_run_raises_unroutable_error_when_connection_is_lost_while_requeueing(
-    config, monkeypatch
-):
+def test_run_raises_unroutable_error_when_connection_is_lost_while_requeueing(config, monkeypatch):
     results_channel = FakeChannel()
     results_channel.unroutable = True
     channel = SettleFailingChannel(StreamLostError("connection lost"))
