@@ -1,4 +1,4 @@
-"""Binding definitions: which consuming executor binds each queue to which exchange.
+"""Binding definitions: which queue each exchange delivers to.
 
 ```text
 injector ──► poc.heartbeat.inject ──► poc.heartbeat.source ──► executor ──► poc.heartbeat.fanout
@@ -6,8 +6,13 @@ injector ──► poc.heartbeat.inject ──► poc.heartbeat.source ──►
                                                                             └──► poc.heartbeat.terminator2
 ```
 
+Each executor binds its own input queue to its source exchange, and the fan-out executor also
+binds both terminator queues to its destination exchange before publishing, so a deleted
+binding is restored from either side.
+
 Each input queue dead-letters the deliveries its executor rejects (`basic_nack(requeue=False)`)
-to its own dead-letter exchange, which is bound to a dead-letter queue that retains them:
+to its own dead-letter exchange, which is bound to a dead-letter queue that retains them. pykicak
+derives both names from the queue's, so they are not defined here:
 
 ```text
 poc.heartbeat.source      ──► poc.heartbeat.source.dlx      ──► poc.heartbeat.source.dlq
@@ -16,18 +21,9 @@ poc.heartbeat.terminator2 ──► poc.heartbeat.terminator2.dlx ──► poc.
 ```
 """
 
-from examples.poc.messaging.exchanges import (
-    HEARTBEAT_FANOUT_EXCHANGE,
-    HEARTBEAT_INJECT_EXCHANGE,
-    HEARTBEAT_SOURCE_DEAD_LETTER_EXCHANGE,
-    HEARTBEAT_TERMINATOR_DEAD_LETTER_EXCHANGE_1,
-    HEARTBEAT_TERMINATOR_DEAD_LETTER_EXCHANGE_2,
-)
+from examples.poc.messaging.exchanges import HEARTBEAT_FANOUT_EXCHANGE, HEARTBEAT_INJECT_EXCHANGE
 from examples.poc.messaging.queues import (
-    HEARTBEAT_SOURCE_DEAD_LETTER_QUEUE,
     HEARTBEAT_SOURCE_QUEUE,
-    HEARTBEAT_TERMINATOR_DEAD_LETTER_QUEUE_1,
-    HEARTBEAT_TERMINATOR_DEAD_LETTER_QUEUE_2,
     HEARTBEAT_TERMINATOR_QUEUE_1,
     HEARTBEAT_TERMINATOR_QUEUE_2,
 )
@@ -36,15 +32,11 @@ QUEUE_BINDINGS: dict[str, str] = {
     HEARTBEAT_SOURCE_QUEUE: HEARTBEAT_INJECT_EXCHANGE,
     HEARTBEAT_TERMINATOR_QUEUE_1: HEARTBEAT_FANOUT_EXCHANGE,
     HEARTBEAT_TERMINATOR_QUEUE_2: HEARTBEAT_FANOUT_EXCHANGE,
-    HEARTBEAT_SOURCE_DEAD_LETTER_QUEUE: HEARTBEAT_SOURCE_DEAD_LETTER_EXCHANGE,
-    HEARTBEAT_TERMINATOR_DEAD_LETTER_QUEUE_1: HEARTBEAT_TERMINATOR_DEAD_LETTER_EXCHANGE_1,
-    HEARTBEAT_TERMINATOR_DEAD_LETTER_QUEUE_2: HEARTBEAT_TERMINATOR_DEAD_LETTER_EXCHANGE_2,
 }
-"""Maps each consumer-owned queue, dead-letter queues included, to the exchange it is bound to."""
+"""Maps each executor's input queue to the exchange it is bound to, its source exchange."""
 
-DEAD_LETTER_EXCHANGES: dict[str, str] = {
-    HEARTBEAT_SOURCE_QUEUE: HEARTBEAT_SOURCE_DEAD_LETTER_EXCHANGE,
-    HEARTBEAT_TERMINATOR_QUEUE_1: HEARTBEAT_TERMINATOR_DEAD_LETTER_EXCHANGE_1,
-    HEARTBEAT_TERMINATOR_QUEUE_2: HEARTBEAT_TERMINATOR_DEAD_LETTER_EXCHANGE_2,
-}
-"""Maps each input queue to its dead-letter exchange (its x-dead-letter-exchange argument)."""
+
+def queues_bound_to(exchange: str) -> tuple[str, ...]:
+    """Return every queue bound to `exchange`: the destination queues of an executor publishing
+    to it."""
+    return tuple(queue for queue, bound_to in QUEUE_BINDINGS.items() if bound_to == exchange)

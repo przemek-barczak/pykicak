@@ -42,20 +42,6 @@ jobs:
 
   integration:
     runs-on: ubuntu-latest
-    services:
-      rabbitmq:
-        image: rabbitmq:4
-        env:
-          # Must match the .kicak connection file written below
-          RABBITMQ_DEFAULT_USER: pykicak
-          RABBITMQ_DEFAULT_PASS: pykicak
-        ports:
-          - 5672:5672
-        options: >-
-          --health-cmd "rabbitmq-diagnostics -q ping"
-          --health-interval 5s
-          --health-timeout 10s
-          --health-retries 20
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
@@ -63,12 +49,50 @@ jobs:
           python-version: "3.12"
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -e . --group test
-      - name: Write the broker connection file
+      - name: Write a test CA and the broker's TLS certificate and configuration
+        run: python -m tests.integration.tls_broker_files "$RUNNER_TEMP/rabbitmq-tls"
+      - name: Write the broker's advanced configuration
+        # RabbitMQ checks consumer timeouts on each channel's tick, once a minute by default, so the
+        # consumer_timeout test would wait a minute; rabbitmq.conf has no setting for the tick
+        run: |
+          printf '%s\n' '[{rabbit, [{channel_tick_interval, 1000}]}].' \
+            > "$RUNNER_TEMP/rabbitmq-advanced.config"
+      - name: Start RabbitMQ with a plain listener on 5672 and a TLS listener on 5671
+        # Started here, not as a service container, because it needs the files written above.
+        # Readiness is read from its log: running rabbitmq-diagnostics during the boot, as root,
+        # can create the Erlang cookie before the broker does, which it then cannot read.
+        run: |
+          docker run -d --name rabbitmq \
+            -e RABBITMQ_DEFAULT_USER=pykicak -e RABBITMQ_DEFAULT_PASS=pykicak \
+            -p 5672:5672 -p 5671:5671 \
+            -v "$RUNNER_TEMP/rabbitmq-tls:/etc/rabbitmq/tls:ro" \
+            -v "$RUNNER_TEMP/rabbitmq-tls/20-tls.conf:/etc/rabbitmq/conf.d/20-tls.conf:ro" \
+            -v "$RUNNER_TEMP/rabbitmq-advanced.config:/etc/rabbitmq/advanced.config:ro" \
+            rabbitmq:4
+          for attempt in $(seq 60); do
+            if docker logs rabbitmq 2>&1 | grep -q "Server startup complete"; then exit 0; fi
+            sleep 2
+          done
+          docker logs rabbitmq
+          exit 1
+      - name: Write the broker connection files
+        # Must match the credentials of the broker started above
         run: |
           printf '%s\n' \
             RABBIT_MQ_USERNAME=pykicak \
             RABBIT_MQ_PASSWORD=pykicak \
             RABBIT_MQ_HOST=localhost \
             RABBIT_MQ_PORT=5672 \
-            RABBIT_MQ_VIRTUAL_HOST=/ > .kicak
-      - run: pytest -m integration
+            RABBIT_MQ_VIRTUAL_HOST=/ \
+            RABBIT_MQ_TLS=false > .kicak
+          printf '%s\n' \
+            RABBIT_MQ_USERNAME=pykicak \
+            RABBIT_MQ_PASSWORD=pykicak \
+            RABBIT_MQ_HOST=localhost \
+            RABBIT_MQ_PORT=5671 \
+            RABBIT_MQ_VIRTUAL_HOST=/ \
+            RABBIT_MQ_TLS=true \
+            "RABBIT_MQ_CA_FILE=$RUNNER_TEMP/rabbitmq-tls/ca.pem" > .kicak.tls
+      - run: pytest -m integration -rs
+        env:
+          KICAK_TLS_CONFIG_PATH: .kicak.tls

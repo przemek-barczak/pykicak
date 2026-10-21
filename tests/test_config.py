@@ -1,4 +1,7 @@
+import copy
+import dataclasses
 import os
+import pickle
 
 import pytest
 
@@ -92,6 +95,8 @@ def test_rabbitmq_typed_accessors():
             "RABBIT_MQ_HOST": "localhost",
             "RABBIT_MQ_PORT": "5672",
             "RABBIT_MQ_VIRTUAL_HOST": "/",
+            "RABBIT_MQ_TLS": "true",
+            "RABBIT_MQ_CA_FILE": "/etc/pykicak/ca.pem",
         }
     )
 
@@ -100,6 +105,49 @@ def test_rabbitmq_typed_accessors():
     assert config.rabbitmq_host == "localhost"
     assert config.rabbitmq_port == 5672
     assert config.rabbitmq_virtual_host == "/"
+    assert config.rabbitmq_tls is True
+    assert config.rabbitmq_ca_file == "/etc/pykicak/ca.pem"
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [("true", True), ("false", False), ("TRUE", True), ("False", False)],
+)
+def test_rabbitmq_tls_accepts_true_or_false_in_any_letter_case(value, expected):
+    config = KicakConfig(values={"RABBIT_MQ_TLS": value})
+
+    assert config.rabbitmq_tls is expected
+
+
+def test_rabbitmq_tls_is_required():
+    config = KicakConfig(values={})
+
+    with pytest.raises(KicakConfigError, match="Missing required key 'RABBIT_MQ_TLS'"):
+        _ = config.rabbitmq_tls
+
+
+@pytest.mark.parametrize("value", ["yes", "on", "1", "0", "ture", "enabled", ""])
+def test_rabbitmq_tls_rejects_other_values_without_echoing_them(value, caplog):
+    config = KicakConfig(values={"RABBIT_MQ_TLS": value})
+
+    with pytest.raises(KicakConfigError, match="RABBIT_MQ_TLS must be true or false") as exc_info:
+        _ = config.rabbitmq_tls
+
+    assert exc_info.value.__context__ is None
+    if len(value) > 2:  # shorter values occur by chance, e.g. in the line numbers of log records
+        assert value not in str(exc_info.value)
+        assert value not in caplog.text
+
+
+def test_rabbitmq_ca_file_is_optional():
+    assert KicakConfig(values={}).rabbitmq_ca_file is None
+
+
+def test_rabbitmq_ca_file_rejects_an_empty_value():
+    config = KicakConfig(values={"RABBIT_MQ_CA_FILE": ""})
+
+    with pytest.raises(KicakConfigError, match="RABBIT_MQ_CA_FILE must not be empty"):
+        _ = config.rabbitmq_ca_file
 
 
 def test_malformed_line_error_does_not_echo_the_line(tmp_path, caplog):
@@ -119,6 +167,46 @@ def test_repr_lists_keys_without_values():
 
     assert repr(config) == "KicakConfig(keys=['RABBIT_MQ_HOST', 'RABBIT_MQ_PASSWORD'])"
     assert "secret-value" not in str(config)
+
+
+def test_values_are_a_read_only_copy():
+    source = {"RABBIT_MQ_HOST": "localhost"}
+    config = KicakConfig(values=source)
+
+    source["RABBIT_MQ_HOST"] = "elsewhere"
+    with pytest.raises(TypeError):
+        config.values["RABBIT_MQ_HOST"] = "changed"  # type: ignore[index]
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        config.values = {}  # type: ignore[misc]
+
+    assert config.values == {"RABBIT_MQ_HOST": "localhost"}
+
+
+def test_config_is_hashable_and_compares_by_values():
+    config = KicakConfig(values={"RABBIT_MQ_HOST": "localhost", "RABBIT_MQ_PORT": "5672"})
+    same = KicakConfig(values={"RABBIT_MQ_PORT": "5672", "RABBIT_MQ_HOST": "localhost"})
+    other = KicakConfig(values={"RABBIT_MQ_HOST": "elsewhere", "RABBIT_MQ_PORT": "5672"})
+
+    assert config == same
+    assert hash(config) == hash(same)
+    assert config != other
+    assert {config, same, other} == {config, other}
+
+
+@pytest.mark.parametrize(
+    "duplicate",
+    [lambda config: pickle.loads(pickle.dumps(config)), copy.copy, copy.deepcopy],
+    ids=["pickle", "copy", "deepcopy"],
+)
+def test_config_survives_pickling_and_copying_and_stays_read_only(duplicate):
+    # Pickling is how a config reaches a multiprocessing worker
+    config = KicakConfig(values={"RABBIT_MQ_HOST": "localhost"})
+
+    duplicated = duplicate(config)
+
+    assert duplicated == config
+    with pytest.raises(TypeError):
+        duplicated.values["RABBIT_MQ_HOST"] = "changed"
 
 
 def test_from_file_decodes_utf8(tmp_path):
@@ -213,3 +301,115 @@ def test_rabbitmq_port_rejects_invalid_value_without_echoing_it(port, caplog):
 @pytest.mark.parametrize("port", ["1", "5672", "65535"])
 def test_rabbitmq_port_accepts_valid_tcp_ports(port):
     assert KicakConfig(values={"RABBIT_MQ_PORT": port}).rabbitmq_port == int(port)
+
+
+_CONNECTION_KEYS = (
+    "RABBIT_MQ_USERNAME",
+    "RABBIT_MQ_PASSWORD",
+    "RABBIT_MQ_HOST",
+    "RABBIT_MQ_PORT",
+    "RABBIT_MQ_VIRTUAL_HOST",
+    "RABBIT_MQ_TLS",
+    "RABBIT_MQ_CA_FILE",
+)
+
+
+@pytest.fixture
+def environment(monkeypatch):
+    """The process environment, without any connection key the test run may have set."""
+    for key in _CONNECTION_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    return monkeypatch
+
+
+def test_from_env_reads_every_connection_key(environment):
+    values = {
+        "RABBIT_MQ_USERNAME": "guest",
+        "RABBIT_MQ_PASSWORD": "secret-value",
+        "RABBIT_MQ_HOST": "localhost",
+        "RABBIT_MQ_PORT": "5671",
+        "RABBIT_MQ_VIRTUAL_HOST": "/",
+        "RABBIT_MQ_TLS": "true",
+        "RABBIT_MQ_CA_FILE": "/etc/pykicak/ca.pem",
+    }
+    for key, value in values.items():
+        environment.setenv(key, value)
+
+    config = KicakConfig.from_env()
+
+    assert config.values == values
+    assert config.rabbitmq_port == 5671
+    assert config.rabbitmq_tls is True
+
+
+def test_from_env_takes_no_other_variables(environment):
+    environment.setenv("RABBIT_MQ_HOST", "localhost")
+    environment.setenv("RABBIT_MQ_SERVICE_HOST", "10.0.0.1")  # e.g. set by Kubernetes
+    environment.setenv("APP_SECRET", "secret-value")
+
+    config = KicakConfig.from_env()
+
+    assert config.values == {"RABBIT_MQ_HOST": "localhost"}
+    assert repr(config) == "KicakConfig(keys=['RABBIT_MQ_HOST'])"
+
+
+def test_from_env_leaves_unset_keys_missing(environment):
+    config = KicakConfig.from_env()
+
+    assert config.values == {}
+    with pytest.raises(KicakConfigError, match="Missing required key 'RABBIT_MQ_HOST'"):
+        _ = config.rabbitmq_host
+    assert config.rabbitmq_ca_file is None
+
+
+def test_from_env_strips_whitespace_around_values(environment):
+    # e.g. a Kubernetes secret created from a file that ends with a newline
+    environment.setenv("RABBIT_MQ_HOST", "  localhost ")
+    environment.setenv("RABBIT_MQ_PASSWORD", "secret-value\n")
+
+    config = KicakConfig.from_env()
+
+    assert config.values == {"RABBIT_MQ_HOST": "localhost", "RABBIT_MQ_PASSWORD": "secret-value"}
+
+
+def test_from_env_keeps_an_empty_value(environment):
+    environment.setenv("RABBIT_MQ_CA_FILE", "")
+
+    config = KicakConfig.from_env()
+
+    assert config.values == {"RABBIT_MQ_CA_FILE": ""}
+    with pytest.raises(KicakConfigError, match="RABBIT_MQ_CA_FILE must not be empty"):
+        _ = config.rabbitmq_ca_file
+
+
+@pytest.mark.skipif(
+    os.name != "posix", reason="POSIX decodes invalid UTF-8 in the environment to lone surrogates"
+)
+def test_from_env_rejects_invalid_utf8_without_leaking_the_value(environment, caplog):
+    environment.setenv("RABBIT_MQ_HOST", "localhost")
+    # Stored as the bytes b"secret-value-\xe9", which Python reads back as this lone surrogate
+    environment.setenv("RABBIT_MQ_PASSWORD", "secret-value-\udce9")
+    assert os.environb[b"RABBIT_MQ_PASSWORD"] == b"secret-value-\xe9"
+
+    with pytest.raises(
+        KicakConfigError, match="Environment variable RABBIT_MQ_PASSWORD is not valid UTF-8"
+    ) as exc_info:
+        KicakConfig.from_env()
+
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+    assert "secret-value" not in str(exc_info.value)
+    assert "secret-value" not in caplog.text
+
+
+def test_from_env_debug_logs_keys_without_values(environment, caplog):
+    environment.setenv("RABBIT_MQ_PASSWORD", "secret-value")
+    caplog.set_level("DEBUG", logger="pykicak.config")
+
+    KicakConfig.from_env()
+
+    assert any(
+        "environment" in record.message and "RABBIT_MQ_PASSWORD" in record.message
+        for record in caplog.records
+    )
+    assert "secret-value" not in caplog.text

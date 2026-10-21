@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import time
 from collections.abc import Callable
 
 import pika
@@ -16,8 +17,13 @@ CONNECTION_VALUES = {
     "RABBIT_MQ_HOST": "localhost",
     "RABBIT_MQ_PORT": "5672",
     "RABBIT_MQ_VIRTUAL_HOST": "/",
+    "RABBIT_MQ_TLS": "false",
 }
 """Config values that let KicakAbstract._create_connection() build connection parameters."""
+
+SAMPLE_TYPE = "sample.v1"
+"""The `kicak_type` of the tests' SampleMessage, and the `type` property of a fake delivery queued
+without properties, so that an Executor accepting SampleMessage decodes it."""
 
 
 def captured_connection_parameters(agent: KicakAbstract, monkeypatch) -> pika.ConnectionParameters:
@@ -34,7 +40,7 @@ class DeclaredQueue:
     durable: bool
     exclusive: bool
     auto_delete: bool
-    arguments: dict[str, object] | None = None
+    arguments: dict[str, object]
 
 
 @dataclasses.dataclass
@@ -63,8 +69,8 @@ class PublishedMessage:
     exchange: str
     routing_key: str
     body: bytes
+    properties: pika.BasicProperties
     mandatory: bool = False
-    properties: pika.BasicProperties | None = None
 
 
 @dataclasses.dataclass
@@ -102,7 +108,7 @@ class FakeChannel:
         self.inactivity_timeout: float | None = None
         self.before_delivery: Callable[[int], None] | None = None
         self.on_idle: Callable[[], None] | None = None
-        self._pending_deliveries: list[bytes | None] = []
+        self._pending_deliveries: list[tuple[bytes | None, pika.BasicProperties]] = []
         self._delivered_delivery_tags: set[int] = set()
         self.transactional = False
         self.tx_select_calls = 0
@@ -120,6 +126,7 @@ class FakeChannel:
         auto_delete: bool = False,
         arguments: dict[str, object] | None = None,
     ) -> None:
+        assert arguments is not None, "pykicak declares every queue with x-queue-type"
         self.declared_queues.append(
             DeclaredQueue(queue, durable, exclusive, auto_delete, arguments)
         )
@@ -182,7 +189,8 @@ class FakeChannel:
         properties=None,
         mandatory: bool = False,
     ) -> None:
-        message = PublishedMessage(exchange, routing_key, body, mandatory, properties)
+        assert properties is not None, "pykicak publishes every message with properties"
+        message = PublishedMessage(exchange, routing_key, body, properties, mandatory)
         if self.transactional:
             self._uncommitted.append(message)
         else:
@@ -208,9 +216,15 @@ class FakeChannel:
     def close(self) -> None:
         self.is_open = False
 
-    def queue_deliveries(self, *bodies: bytes | None) -> None:
-        """Test helper: queue up message bodies for consume() to yield."""
-        self._pending_deliveries.extend(bodies)
+    def queue_deliveries(
+        self, *bodies: bytes | None, properties: pika.BasicProperties | None = None
+    ) -> None:
+        """Test helper: queue up message bodies, with `properties`, for consume() to yield.
+
+        Without `properties`, each delivery has only the `type` property SAMPLE_TYPE.
+        """
+        delivered = properties if properties is not None else pika.BasicProperties(type=SAMPLE_TYPE)
+        self._pending_deliveries.extend((body, delivered) for body in bodies)
 
     def consume(self, queue: str, inactivity_timeout: float | None = None):
         """Yield the queued deliveries, then end the test with StopConsuming.
@@ -221,11 +235,11 @@ class FakeChannel:
         """
         self.prefetch_count_when_consuming = self.prefetch_count
         self.inactivity_timeout = inactivity_timeout
-        for index, body in enumerate(self._pending_deliveries, start=1):
+        for index, (body, properties) in enumerate(self._pending_deliveries, start=1):
             if self.before_delivery is not None:
                 self.before_delivery(index)
             self._delivered_delivery_tags.add(index)
-            yield ConsumedMethod(delivery_tag=index), None, body
+            yield ConsumedMethod(delivery_tag=index), properties, body
         if self.on_idle is not None:
             for _ in range(1000):
                 self.on_idle()
@@ -262,6 +276,10 @@ class FakeConnection:
     def process_data_events(self, time_limit: float | None = 0) -> None:
         for channel in self._opened:
             channel.dispatch_returns()
+
+    def sleep(self, duration: float) -> None:
+        """Sleep with time.sleep(), which tests replace; pika's sleep() also answers heartbeats."""
+        time.sleep(duration)
 
     def close(self) -> None:
         self.is_open = False

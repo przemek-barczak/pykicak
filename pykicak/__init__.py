@@ -8,6 +8,7 @@ import logging
 
 from pykicak.config import KicakConfig, KicakConfigError
 from pykicak.executor import (
+    ExecutorInfo,
     ExecutorStatus,
     KicakExecutorAbstract,
     MalformedMessageError,
@@ -22,6 +23,7 @@ __version__ = "0.2.0"  # the only place the version is set; pyproject.toml reads
 logging.getLogger(__name__).addHandler(logging.NullHandler())
 
 __all__ = [
+    "ExecutorInfo",
     "ExecutorStatus",
     "InjectionError",
     "KicakConfig",

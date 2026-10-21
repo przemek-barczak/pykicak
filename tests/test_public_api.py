@@ -6,6 +6,7 @@ import pykicak
 from pykicak.abstracts import KicakAbstract
 
 PUBLIC_API = [
+    "ExecutorInfo",
     "ExecutorStatus",
     "InjectionError",
     "KicakConfig",

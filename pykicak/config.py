@@ -1,35 +1,64 @@
-"""Parsing of .kicak configuration files."""
+"""Connection configuration: .kicak files and environment variables."""
 
 from __future__ import annotations
 
 import dataclasses
 import logging
+import os
+from collections.abc import Mapping
 from pathlib import Path
+from types import MappingProxyType
+from typing import Self
 
 logger = logging.getLogger(__name__)
 
 _MAX_PORT = 65535
+_BOOLEAN_VALUES = {"true": True, "false": False}
+
+# The keys the library reads, and the only variables from_env() takes from the environment
+_CONNECTION_KEYS = (
+    "RABBIT_MQ_USERNAME",
+    "RABBIT_MQ_PASSWORD",
+    "RABBIT_MQ_HOST",
+    "RABBIT_MQ_PORT",
+    "RABBIT_MQ_VIRTUAL_HOST",
+    "RABBIT_MQ_TLS",
+    "RABBIT_MQ_CA_FILE",
+)
 
 
 class KicakConfigError(Exception):
-    """Raised for a missing, unreadable, or malformed .kicak file, or a missing or invalid key."""
+    """Raised for a missing, unreadable, or malformed .kicak file, an environment variable that is
+    not valid UTF-8, or a missing or invalid key."""
 
 
 @dataclasses.dataclass(frozen=True, slots=True, repr=False)
 class KicakConfig:
-    """Parsed contents of a .kicak file.
+    """RabbitMQ connection configuration, from a .kicak file, environment variables, or a mapping.
 
-    The repr lists only the keys: values such as RABBIT_MQ_PASSWORD are secret, and reprs end up
-    in logs and crash reports.
+    Immutable and hashable: `values` is a read-only copy of the mapping the config is created
+    with, so changing that mapping afterwards does not change the config. The repr lists only
+    the keys: values such as RABBIT_MQ_PASSWORD are secret, and reprs end up in logs and crash
+    reports.
     """
 
-    values: dict[str, str]
+    values: Mapping[str, str]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "values", MappingProxyType(dict(self.values)))
+
+    def __hash__(self) -> int:
+        return hash(frozenset(self.values.items()))
+
+    def __reduce__(self) -> tuple[type[Self], tuple[dict[str, str]]]:
+        # A mapping proxy cannot be pickled or deep-copied, so rebuild the config from a dict
+        return (type(self), (dict(self.values),))
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}(keys={sorted(self.values)!r})"
 
     @classmethod
-    def from_file(cls, path: str | Path) -> KicakConfig:
+    def from_file(cls, path: str | Path) -> Self:
         """Parse a .kicak file into a KicakConfig, raising KicakConfigError on any problem."""
         file_path = Path(path)
         logger.debug("Reading Kicak config from %s", file_path)
@@ -96,6 +125,30 @@ class KicakConfig:
         )
         return cls(values=values)
 
+    @classmethod
+    def from_env(cls) -> Self:
+        """Read the connection keys from the environment variables of the same names.
+
+        Only the keys the library reads, RABBIT_MQ_USERNAME to RABBIT_MQ_CA_FILE, are taken, not
+        the rest of the environment. Values are stripped of surrounding whitespace, as in a .kicak
+        file. A variable that is not set leaves its key missing, which raises KicakConfigError when
+        the key is read, as for a file. A value that is not valid UTF-8 raises KicakConfigError.
+        """
+        values: dict[str, str] = {}
+        for key in _CONNECTION_KEYS:
+            value = os.environ.get(key)
+            if value is None:
+                continue
+            # On POSIX, Python decodes invalid UTF-8 in the environment to lone surrogates, which
+            # cannot be sent to RabbitMQ; report only the key, since the value may be a secret.
+            if not _is_valid_utf8(value):
+                logger.error("Invalid UTF-8 in environment variable %s", key)
+                raise KicakConfigError(f"Environment variable {key} is not valid UTF-8")
+            values[key] = value.strip()
+
+        logger.debug("Loaded Kicak config from the environment with keys=%s", sorted(values))
+        return cls(values=values)
+
     def require(self, key: str) -> str:
         """Return the value for `key`, or raise KicakConfigError if it is not set."""
         try:
@@ -143,3 +196,41 @@ class KicakConfig:
     def rabbitmq_virtual_host(self) -> str:
         """The RABBIT_MQ_VIRTUAL_HOST value."""
         return self.require("RABBIT_MQ_VIRTUAL_HOST")
+
+    @property
+    def rabbitmq_tls(self) -> bool:
+        """The RABBIT_MQ_TLS value: True to connect with TLS, False for plain, unencrypted AMQP.
+
+        Required, so that an unencrypted connection is always an explicit choice. The value is
+        `true` or `false`, in any letter case; anything else raises `KicakConfigError`, so that a
+        typo never turns encryption off.
+        """
+        tls = _BOOLEAN_VALUES.get(self.require("RABBIT_MQ_TLS").lower())
+        if tls is None:
+            logger.error("Invalid Kicak config key RABBIT_MQ_TLS")
+            raise KicakConfigError("RABBIT_MQ_TLS must be true or false")
+        return tls
+
+    @property
+    def rabbitmq_ca_file(self) -> str | None:
+        """The optional RABBIT_MQ_CA_FILE value: a file of PEM CA certificates, or None if unset.
+
+        With TLS, the broker's certificate must then be issued by one of these CAs instead of one
+        the system trusts. An empty value raises `KicakConfigError`: remove the key instead.
+        """
+        ca_file = self.get("RABBIT_MQ_CA_FILE")
+        if ca_file == "":
+            logger.error("Invalid Kicak config key RABBIT_MQ_CA_FILE")
+            raise KicakConfigError(
+                "RABBIT_MQ_CA_FILE must not be empty; remove it to trust the system's CA "
+                "certificates"
+            )
+        return ca_file
+
+
+def _is_valid_utf8(value: str) -> bool:
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False  # returned, not raised, so no error carries the value as its context
+    return True

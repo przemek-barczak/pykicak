@@ -45,7 +45,8 @@ dependencies = [
 
 [dependency-groups]
 # Development tools, not published as package metadata: `pip install -e . --group dev` (pip 25.1+)
-test = ["pytest>=8"]
+# trustme issues the test certificates of the TLS tests; cryptography builds nonconforming ones
+test = ["pytest>=8", "trustme>=1.2", "cryptography"]
 dev = [
     { include-group = "test" },
     "build",
@@ -88,7 +89,14 @@ select = ["E4", "E7", "E9", "F", "W", "I", "B", "UP"]
 [tool.mypy]
 python_version = "3.12"
 strict = true
-files = ["pykicak"]
+files = ["pykicak", "examples", "tests"]
+
+[[tool.mypy.overrides]]
+# Test bodies are checked, but pytest functions and fixtures need no annotations
+module = ["tests.*"]
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+disallow_untyped_calls = false
 
 [[tool.mypy.overrides]]
 # pika ships no type information, and the types-pika stubs are an outdated beta
