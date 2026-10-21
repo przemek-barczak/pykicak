@@ -5,9 +5,12 @@ import threading
 import time
 from datetime import UTC, datetime, timedelta
 from typing import Any, TypedDict
+from unittest import mock
 
 import pika
+import pika.channel
 import pytest
+from pika.adapters.blocking_connection import BlockingChannel
 from pika.exceptions import (
     AMQPConnectionError,
     ChannelClosedByBroker,
@@ -1818,6 +1821,41 @@ def test_run_reconnects_when_the_connection_is_lost_while_moving_to_the_retry_qu
     assert replacement_channel.acked_delivery_tags == [1]
 
 
+def test_run_moves_no_copy_to_the_retry_queue_when_rabbitmq_cancelled_the_consumer(
+    config, monkeypatch, sleeps, caplog
+):
+    # Transient retries outlasted a quorum queue's consumer timeout on RabbitMQ 4.3+, which has
+    # returned the message to the queue: a copy in the retry queue would execute it twice
+    body = SampleMessage(message_id="input", text="input").to_bytes()
+    original_channel = FakeChannel()
+    replacement_channel = FakeChannel()
+    original_channel.queue_deliveries(body)
+    replacement_channel.queue_deliveries(body)  # RabbitMQ's redelivery
+
+    cancelled = False
+
+    def unavailable_beyond_the_consumer_timeout(message):
+        nonlocal cancelled
+        if not cancelled:
+            cancelled = True
+            original_channel.cancel_consumer()
+        unavailable(message)
+
+    executor = make_executor(
+        config, original_channel, handler=unavailable_beyond_the_consumer_timeout
+    )
+    channels = [original_channel, replacement_channel]
+    monkeypatch.setattr(executor, "_create_connection", lambda: FakeConnection(channels.pop(0)))
+
+    run_until_stopped(executor)
+
+    assert retry_copies(original_channel) == []
+    assert original_channel.acked_delivery_tags == []
+    assert len(retry_copies(replacement_channel)) == 1
+    assert replacement_channel.acked_delivery_tags == [1]
+    assert "Connection or channel lost while moving message id=input" in caplog.text
+
+
 def test_run_stops_when_rabbitmq_refuses_to_declare_the_retry_queue(config, sleeps):
     class RefusingRetryQueueChannel(FakeChannel):
         """Refuses the retry queue after the declarations of the first connection."""
@@ -2326,7 +2364,9 @@ def test_stop_requested_during_execute_requeues_unroutable_results_without_waiti
 
 
 @pytest.mark.parametrize(
-    "interruption", ["consumer-timeout", "connection-lost"], ids=["consumer-timeout", "lost"]
+    "interruption",
+    ["consumer-timeout", "consumer-cancelled", "connection-lost"],
+    ids=["consumer-timeout", "consumer-cancelled", "lost"],
 )
 def test_run_reconnects_when_the_held_input_is_requeued_by_rabbitmq(
     config, monkeypatch, caplog, interruption
@@ -2351,6 +2391,8 @@ def test_run_reconnects_when_the_held_input_is_requeued_by_rabbitmq(
         interrupted = True
         if interruption == "consumer-timeout":
             original_channel.is_open = False  # RabbitMQ closed it while pika answered heartbeats
+        elif interruption == "consumer-cancelled":
+            original_channel.cancel_consumer()  # RabbitMQ 4.3+ on a quorum queue's timeout
         else:
             raise StreamLostError("connection lost")
 
@@ -2366,6 +2408,31 @@ def test_run_reconnects_when_the_held_input_is_requeued_by_rabbitmq(
     assert "Connection or channel lost while publishing results of message id=input" in (
         caplog.text
     )
+
+
+def test_pika_blocking_channel_still_wraps_the_channel_the_cancel_hook_needs():
+    # _watch_for_consumer_cancellation() registers on the private `_impl` of BlockingChannel,
+    # because the public add_on_cancel_callback() never fires for a consume() generator
+    impl = mock.MagicMock()
+
+    channel = BlockingChannel(impl, mock.MagicMock())
+
+    assert channel._impl is impl
+    assert callable(pika.channel.Channel.add_on_cancel_callback)
+
+
+def test_run_warns_and_still_consumes_when_pika_offers_no_cancel_hook(config, monkeypatch, caplog):
+    channel = FakeChannel()
+    monkeypatch.setattr(channel, "_impl", object())  # a pika whose BlockingChannel lacks the hook
+    channel.queue_deliveries(SampleMessage(message_id="input", text="input").to_bytes())
+    executor = make_executor(config, channel)
+
+    run_until_stopped(executor)
+
+    assert channel.acked_delivery_tags == [1]
+    [warning] = [r for r in caplog.records if "Cannot watch for RabbitMQ cancelling" in r.message]
+    assert warning.levelname == "WARNING"
+    assert "may then be published twice" in warning.getMessage()
 
 
 def test_run_declares_the_queue_again_when_rabbitmq_cancels_the_consumer(
@@ -3421,6 +3488,85 @@ def test_run_does_not_commit_results_when_rabbitmq_closed_the_delivery_channel(
         r for r in caplog.records if "Connection or channel lost while publishing" in r.message
     ]
     assert [record.levelname for record in warnings] == ["WARNING"]
+
+
+def test_run_does_not_commit_results_when_rabbitmq_cancelled_the_consumer(
+    config, monkeypatch, sleeps, caplog
+):
+    # RabbitMQ 4.3+ returns a delivery that outlasted a quorum queue's consumer timeout to the
+    # queue and cancels the consumer, keeping the channel open
+    message = SampleMessage(message_id="input", text="input")
+    original_channel = FakeChannel()
+    replacement_channel = FakeChannel()
+    original_channel.queue_deliveries(message.to_bytes())
+    replacement_channel.queue_deliveries(message.to_bytes())  # RabbitMQ's redelivery
+    executions = 0
+
+    def outlasting_the_consumer_timeout(received):
+        nonlocal executions
+        executions += 1
+        if executions == 1:
+            original_channel.cancel_consumer()
+        return received
+
+    executor = reconnecting_executor(
+        config,
+        monkeypatch,
+        [(original_channel, None), (replacement_channel, None)],
+        outlasting_the_consumer_timeout,
+    )
+
+    run_until_stopped(executor)
+
+    assert "commit" not in original_channel.operations
+    assert original_channel.published_messages == []
+    assert original_channel.acked_delivery_tags == []
+    assert executor.processed_messages == [message, message]
+    assert [p.body for p in replacement_channel.published_messages] == [message.to_bytes()]
+    assert replacement_channel.acked_delivery_tags == [1]
+    [warning] = [
+        r for r in caplog.records if "Connection or channel lost while publishing" in r.message
+    ]
+    assert warning.levelname == "WARNING"
+    assert "cancelled the consumer" in warning.getMessage()
+
+
+@pytest.mark.parametrize("outcome", ["acknowledging", "dead-lettering"])
+def test_run_reconnects_when_rabbitmq_cancelled_the_consumer_of_a_settled_delivery(
+    config, monkeypatch, caplog, outcome
+):
+    # A terminator's settlement reaches RabbitMQ 4.3+ after it has taken the delivery back, and
+    # is ignored: the executor reconnects and executes the redelivery, warning, not erring
+    message = SampleMessage(message_id="input", text="input")
+    original_channel = FakeChannel()
+    replacement_channel = FakeChannel()
+    original_channel.queue_deliveries(message.to_bytes())
+    replacement_channel.queue_deliveries(message.to_bytes())  # RabbitMQ's redelivery
+
+    cancelled = False
+
+    def outlasting_the_consumer_timeout(_received):
+        nonlocal cancelled
+        if cancelled:
+            return None  # the redelivery
+        cancelled = True
+        original_channel.cancel_consumer()
+        if outcome == "dead-lettering":
+            raise MalformedMessageError("rejected by the application")
+        return None
+
+    executor = make_executor(config, original_channel, handler=outlasting_the_consumer_timeout)
+    channels = [original_channel, replacement_channel]
+    monkeypatch.setattr(executor, "_create_connection", lambda: FakeConnection(channels.pop(0)))
+
+    run_until_stopped(executor)
+
+    assert executor.processed_messages == [message, message]
+    assert original_channel.is_open is False  # the connection was discarded
+    assert replacement_channel.acked_delivery_tags == [1]
+    [warning] = [r for r in caplog.records if "cancelled the consumer" in r.message]
+    assert warning.levelname == "WARNING"
+    assert f"while {outcome} message id=input" in warning.getMessage()
 
 
 @pytest.mark.parametrize(

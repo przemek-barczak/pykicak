@@ -84,6 +84,17 @@ class ConsumedMethod:
     delivery_tag: int
 
 
+class FakeChannelImpl:
+    """Stands in for the pika channel that a BlockingChannel wraps as `_impl`."""
+
+    def __init__(self) -> None:
+        self.cancel_callbacks: list[Callable[[object], None]] = []
+
+    def add_on_cancel_callback(self, callback: Callable[[object], None]) -> None:
+        """`callback(method_frame)` runs when RabbitMQ cancels a consumer, as in pika."""
+        self.cancel_callbacks.append(callback)
+
+
 class FakeChannel:
     """Records calls made against it and can be fed canned consume() output.
 
@@ -108,6 +119,7 @@ class FakeChannel:
         self.inactivity_timeout: float | None = None
         self.before_delivery: Callable[[int], None] | None = None
         self.on_idle: Callable[[], None] | None = None
+        self._impl = FakeChannelImpl()
         self._pending_deliveries: list[tuple[bytes | None, pika.BasicProperties]] = []
         self._delivered_delivery_tags: set[int] = set()
         self.transactional = False
@@ -215,6 +227,16 @@ class FakeChannel:
 
     def close(self) -> None:
         self.is_open = False
+
+    def cancel_consumer(self) -> None:
+        """Test helper: RabbitMQ 4.3+ cancels the consumer, e.g. on a quorum queue's consumer
+        timeout, returning the delivery in progress to the queue; the channel stays open.
+
+        As in pika, only the callbacks registered on the wrapped channel (`_impl`) learn of it;
+        consume() would end only when advanced, which a test does not reach while executing.
+        """
+        for callback in self._impl.cancel_callbacks:
+            callback(object())
 
     def queue_deliveries(
         self, *bodies: bytes | None, properties: pika.BasicProperties | None = None

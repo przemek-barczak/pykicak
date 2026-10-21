@@ -85,7 +85,7 @@ jobs:
         run: pytest --cov --cov-report=term-missing
 
   integration:
-    name: Integration tests with RabbitMQ (pika ${{ matrix.pika }})
+    name: Integration (RabbitMQ ${{ matrix.rabbitmq }}, pika ${{ matrix.pika }})
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -93,6 +93,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # 4.2 takes a timed-out delivery back by closing the channel; 4.3 and newer, by cancelling
+        # the consumer of a quorum queue (classic queues no longer time out). Both are required.
+        rabbitmq: ["4.2", "4.4"]
         pika: ["latest", "1.4.0"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -134,9 +137,8 @@ jobs:
         # Started here, not as a service container, because it needs the files written above.
         # Readiness is read from its log: running rabbitmq-diagnostics during the boot, as root,
         # can create the Erlang cookie before the broker does, which it then cannot read.
-        # RabbitMQ 4.2, which the tests were verified on: 4.3 stopped evaluating consumer timeouts
-        # for classic queues, and refuses the x-consumer-timeout argument the consumer_timeout test
-        # declares, so that test still has to be adapted before CI moves to a newer broker.
+        env:
+          RABBITMQ_VERSION: ${{ matrix.rabbitmq }}
         run: |
           docker run -d --name rabbitmq \
             -e RABBITMQ_DEFAULT_USER=pykicak -e RABBITMQ_DEFAULT_PASS=pykicak \
@@ -144,9 +146,12 @@ jobs:
             -v "$RUNNER_TEMP/rabbitmq-tls:/etc/rabbitmq/tls:ro" \
             -v "$RUNNER_TEMP/rabbitmq-tls/20-tls.conf:/etc/rabbitmq/conf.d/20-tls.conf:ro" \
             -v "$RUNNER_TEMP/rabbitmq-advanced.config:/etc/rabbitmq/advanced.config:ro" \
-            rabbitmq:4.2
+            "rabbitmq:$RABBITMQ_VERSION"
           for _ in $(seq 60); do
-            if docker logs rabbitmq 2>&1 | grep -q "Server startup complete"; then exit 0; fi
+            if docker logs rabbitmq 2>&1 | grep -q "Server startup complete"; then
+              echo "RabbitMQ $(docker exec rabbitmq rabbitmqctl version)"
+              exit 0
+            fi
             sleep 2
           done
           docker logs rabbitmq

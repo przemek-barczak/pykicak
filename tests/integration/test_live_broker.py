@@ -913,10 +913,37 @@ _CONSUMER_TIMEOUT_MILLISECONDS = 1000
 _CONSUMER_TIMEOUT_WAIT_SECONDS = 90
 """How long a test waits for RabbitMQ to end a delivery that outlasted its consumer timeout.
 
-RabbitMQ checks the timeout on each channel's tick, once a minute by default: on RabbitMQ 4.2.5, a
-2-second timeout closed the channel 60 seconds after the delivery, and 3 seconds after it with
-`{rabbit, [{channel_tick_interval, 1000}]}` in `advanced.config`, which the CI broker sets.
+RabbitMQ 4.2 checks the timeout on each channel's tick, once a minute by default: on RabbitMQ
+4.2.5, a 2-second timeout closed the channel 60 seconds after the delivery, and 3 seconds after it
+with `{rabbit, [{channel_tick_interval, 1000}]}` in `advanced.config`, which the CI broker sets. On
+RabbitMQ 4.4.0, a quorum queue cancelled the consumer of a delivery held past a 1-second timeout
+about 11 seconds after the delivery, whatever the tick.
 """
+
+
+def _broker_version(config: KicakConfig) -> tuple[int, int]:
+    """Return RabbitMQ's major and minor version, as it reports them to a connection."""
+    connection = _open_connection(config)
+    try:
+        version = connection._impl.server_properties["version"]
+    finally:
+        connection.close()
+    if isinstance(version, bytes):
+        version = version.decode()
+    major, minor = version.split(".")[:2]
+    return int(major), int(minor)
+
+
+def _timing_out_queue_type(config: KicakConfig) -> QueueType:
+    """Return the queue type whose consumer timeout the broker under test enforces.
+
+    RabbitMQ 4.3 stopped evaluating consumer timeouts for classic queues, and refuses their
+    `x-consumer-timeout` argument; quorum queues return a timed-out delivery to the queue and
+    cancel its consumer, keeping the channel open. RabbitMQ 4.2 closes the channel instead, and
+    there `_wait_until_unconsumed()` needs a classic queue: a quorum queue kept listing the closed
+    channel's consumer for longer than the test waits (measured on 4.2.9).
+    """
+    return QueueType.CLASSIC if _broker_version(config) < (4, 3) else QueueType.QUORUM
 
 
 class _ConsumerTimeoutChannel:
@@ -931,13 +958,13 @@ class _ConsumerTimeoutChannel:
 
 
 class TimedOutTerminator(RecordingTerminator):
-    """Holds its first message until RabbitMQ's consumer_timeout ends the delivery, then stops
-    after executing the redelivery.
+    """Holds its first message until RabbitMQ's consumer timeout takes it back, then stops after
+    executing the redelivery.
 
-    Its queue is declared with the library's arguments plus a short `x-consumer-timeout`. While it
-    holds the message it does not use its own connection, like an `execute()` busy with its work,
-    so its acknowledgement is what meets the channel RabbitMQ closed, and has to be recognized as a
-    consumer timeout by the reply text.
+    Its source queue is declared with the library's arguments plus a short `x-consumer-timeout`.
+    While it holds the message it does not use its own connection, like an `execute()` busy with
+    its work, so its acknowledgement is what meets the channel RabbitMQ closed (RabbitMQ 4.2), or
+    the cancelled consumer (4.3 and newer).
     """
 
     def __init__(self, config: KicakConfig, **topology) -> None:
@@ -953,6 +980,32 @@ class TimedOutTerminator(RecordingTerminator):
         else:
             self.stop()
         super().execute(message)
+
+
+class TimedOutExecutor(RecordingExecutor):
+    """Like TimedOutTerminator, but publishes each message it receives as its result.
+
+    Only its source queue gets the short `x-consumer-timeout`; its destination queue is declared
+    as its own consumer declares it.
+    """
+
+    def __init__(self, config: KicakConfig, **topology) -> None:
+        super().__init__(config, **topology)
+        self._test_config = config
+
+    def _declare_input_queue(self, channel, queue_name: str) -> None:
+        if queue_name == self._source_queue:
+            channel = _ConsumerTimeoutChannel(channel)
+        super()._declare_input_queue(channel, queue_name)
+
+    def execute(
+        self, message: IntegrationMessage
+    ) -> IntegrationMessage | Sequence[IntegrationMessage] | None:
+        if not self.received:
+            _wait_until_unconsumed(self._test_config, self._source_queue)
+        else:
+            self.stop()
+        return super().execute(message)
 
 
 def _wait_until_unconsumed(config: KicakConfig, queue: str) -> None:
@@ -975,9 +1028,10 @@ def _wait_until_unconsumed(config: KicakConfig, queue: str) -> None:
 def test_terminator_reconnects_when_its_delivery_outlasts_the_consumer_timeout(
     config, topology, caplog
 ):
+    queue_type = _timing_out_queue_type(config)
     inject_exchange = topology.exchange("inject")
     names = topology.executor_topology("source", inject_exchange)
-    executor = TimedOutTerminator(config, **names)
+    executor = TimedOutTerminator(config, queue_type=queue_type, **names)
     thread, errors = _start_in_thread(executor)
     _wait_until_consuming(config, names["source_queue"])
     message = IntegrationMessage(message_id="held", payload="held")
@@ -988,18 +1042,65 @@ def test_terminator_reconnects_when_its_delivery_outlasts_the_consumer_timeout(
 
     assert not thread.is_alive()
     assert errors == []  # not CRASHED: the timeout was not mistaken for a fatal channel error
-    # The acknowledgement met the channel RabbitMQ closed, recognized by its reply text...
     [warning] = [
         record
         for record in caplog.records
         if record.name == "pykicak.executor" and "while acknowledging" in record.getMessage()
     ]
     assert warning.levelname == "WARNING"
-    assert "406" in warning.getMessage()
-    assert "timed out" in warning.getMessage()
+    if queue_type is QueueType.CLASSIC:
+        # RabbitMQ 4.2: the acknowledgement met the channel RabbitMQ closed, recognized by its
+        # reply text...
+        assert "406" in warning.getMessage()
+        assert "timed out" in warning.getMessage()
+    else:
+        # RabbitMQ 4.3+: RabbitMQ ignored the acknowledgement and cancelled the consumer...
+        assert "cancelled the consumer" in warning.getMessage()
     # ...so the executor reconnected and executed the redelivered message again
     assert executor.received == [message, message]
     assert executor.get_info().status == "STOPPED"
+    assert _ready_message_count(config, names["source_queue"]) == (0, 0)
+
+
+def test_executor_commits_no_results_for_a_delivery_that_outlasted_the_consumer_timeout(
+    config, topology, caplog
+):
+    queue_type = _timing_out_queue_type(config)
+    inject_exchange = topology.exchange("inject")
+    results_exchange = topology.exchange("results")
+    names = topology.executor_topology("source", inject_exchange)
+    downstream = topology.executor_topology("downstream", results_exchange)
+    with RecordingTerminator(config, queue_type=queue_type, **downstream):
+        pass  # declares the downstream queue as its own consumer does
+    executor = TimedOutExecutor(
+        config,
+        queue_type=queue_type,
+        destination_exchange=results_exchange,
+        destination_queues=[downstream["source_queue"]],
+        **names,
+    )
+    thread, errors = _start_in_thread(executor)
+    _wait_until_consuming(config, names["source_queue"])
+    message = IntegrationMessage(message_id="held", payload="held")
+    with OneShotInjector(config, inject_exchange, message) as injector:
+        injector.publish(message)
+
+    thread.join(timeout=_CONSUMER_TIMEOUT_WAIT_SECONDS + 30)
+
+    assert not thread.is_alive()
+    assert errors == []
+    # RabbitMQ had taken the input back, so the results of the timed-out execution were not
+    # committed: the redelivery's are the only ones published
+    [warning] = [
+        record
+        for record in caplog.records
+        if record.name == "pykicak.executor"
+        and "while publishing results of message id=held" in record.getMessage()
+    ]
+    assert warning.levelname == "WARNING"
+    assert executor.received == [message, message]
+    assert executor.get_info().status == "STOPPED"
+    assert _ready_message_count(config, downstream["source_queue"]) == (1, 0)
     assert _ready_message_count(config, names["source_queue"]) == (0, 0)
 
 

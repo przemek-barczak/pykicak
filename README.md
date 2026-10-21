@@ -49,7 +49,7 @@ A message is processed more than once when:
 - RabbitMQ refuses the commit of an Executor's results, or one of the declarations that verify its
   output side, so the input is requeued and executed again;
 - the acknowledgement fails, for example because the connection was lost, or RabbitMQ's
-  `consumer_timeout` closed the channel, right after the results were published, so RabbitMQ
+  `consumer_timeout` took the input back right after the results were published, so RabbitMQ
   redelivers the input, which is executed again and its results published again;
 - an Injector loses its connection before RabbitMQ confirms a message, so it publishes the message
   again;
@@ -879,8 +879,8 @@ reports while the results are published and the message is settled:
 | Results returned as unroutable | `UnroutableError`: no queue was bound to the destination exchange when the results were committed, although the output side was just verified | held, unacknowledged, with its results; the message is not at fault | logs an `ERROR`, waits (0.5 seconds, doubling up to 30, with jitter), verifies the output side, and publishes the results again, without executing the message again (see [Unroutable results are held](#unroutable-results-are-held)) |
 | Result too large | RabbitMQ refuses a result larger than its `max_message_size` (16 MiB by default in RabbitMQ 4) | dead-lettered as above; RabbitMQ discards the whole transaction, so none of its results is published | continues |
 | Results not committed | another error while verifying the output side, publishing, or committing the results, e.g. RabbitMQ refusing a declaration (`406`, `403`) or the commit | requeued by RabbitMQ when the connection closes | logs the error and raises it, stopping |
-| Connection lost while publishing results | a transient connection error while verifying the output side, before or during the commit, or while the results are held, or RabbitMQ having already closed the message's channel because it outlasted `consumer_timeout` | already requeued by RabbitMQ when the connection or channel closed; uncommitted results are discarded by RabbitMQ, not re-sent | reconnects and receives the message again |
-| Connection lost while settling | a transient connection error from the acknowledgement or rejection, the declaration of the dead-letter route before a rejection included, or from moving the message to the retry queue, or RabbitMQ closing the message's channel because it outlasted `consumer_timeout` | requeued by RabbitMQ when the connection or channel closed, instead of being acknowledged, requeued, or dead-lettered | reconnects and receives the message again; after an unexpected failure, still raises that error and stops |
+| Connection lost while publishing results | a transient connection error while verifying the output side, before or during the commit, or while the results are held, or RabbitMQ having already taken the message back because it outlasted `consumer_timeout` (closing its channel, or cancelling the consumer on RabbitMQ 4.3 and newer) | already requeued by RabbitMQ when the connection or channel closed; uncommitted results are discarded by RabbitMQ, not re-sent | reconnects and receives the message again |
+| Connection lost while settling | a transient connection error from the acknowledgement or rejection, the declaration of the dead-letter route before a rejection included, or from moving the message to the retry queue, or RabbitMQ taking the message back because it outlasted `consumer_timeout` (closing its channel, or cancelling the consumer on RabbitMQ 4.3 and newer, which then ignores the settlement) | requeued by RabbitMQ when the connection or channel closed, instead of being acknowledged, requeued, or dead-lettered | reconnects and receives the message again; after an unexpected failure, still raises that error and stops |
 | Input side not verified | between messages: a transient connection error, or RabbitMQ refusing a declaration of the input side | no message is held | reconnects; after a refusal, logs the error and raises it, stopping |
 
 Results returned by a terminator, whose `execute()` must return `None`, are an unexpected failure
@@ -1124,13 +1124,21 @@ Consider these when choosing the value:
   without closing the connection, RabbitMQ redelivers its in-flight message only after up to
   `heartbeat_seconds`.
 - **RabbitMQ has a separate limit on unacknowledged messages.** The broker's `consumer_timeout`
-  (30 minutes by default) closes the channel of a consumer that holds a message unacknowledged for
-  longer, with `406 PRECONDITION_FAILED`, and requeues the message. The Executor reacts as to an
-  expired heartbeat: it does not commit the results of that message, logs a `WARNING`, reconnects,
-  and executes the message again. Only if RabbitMQ closes the channel while the results are being
+  (30 minutes by default) takes back a message that a consumer holds unacknowledged for longer, and
+  requeues it. RabbitMQ 4.2 closes the consumer's channel, with `406 PRECONDITION_FAILED`, for
+  classic and quorum queues alike. RabbitMQ 4.3 and newer evaluate the timeout for quorum queues
+  only, and cancel the consumer, keeping its channel open; classic queues no longer have a consumer
+  timeout. Either way the Executor reacts as to an expired heartbeat: it does not commit the
+  results of that message or move it to the retry queue, logs a `WARNING`, reconnects, and
+  executes the message again. Only if RabbitMQ takes the message back while the results are being
   committed are they published, and then published again after the redelivery. If processing can
   take longer than `consumer_timeout`, raise `consumer_timeout` on the broker as well;
   `heartbeat_seconds` alone is not enough.
+- **On RabbitMQ 4.3 and newer, the Executor relies on an internal pika hook** to notice the
+  cancellation while it processes the message, because pika reports a cancelled consumer of its
+  `consume()` generator only later. If a pika version lacks the hook, the Executor logs a
+  `WARNING` whenever it starts consuming; a timed-out message is then still executed again, but
+  its results or its retry-queue copy may be published twice.
 - AMQP limits the value to 1–65535 seconds, and it must be an `int`. `None` raises `TypeError`:
   it would accept the broker's proposal, 60 seconds by default, which a long `execute()` outlasts.
   Injectors keep the broker's default: they hold a connection only while publishing one message, so
@@ -1172,8 +1180,8 @@ Things to plan for when running several instances:
   concurrently. The idempotency that pykicak requires must therefore be enforced by the database
   (see [Requirement: idempotent processing](#requirement-idempotent-processing)).
 - **Processing longer than `heartbeat_seconds` or `consumer_timeout` causes such redeliveries.**
-  RabbitMQ closes the connection or channel and redelivers the message while it is still being
-  processed (see [Long-running `execute()`](#long-running-execute)). With several instances, another
+  RabbitMQ closes the connection or channel, or cancels the consumer, and redelivers the message
+  while it is still being processed (see [Long-running `execute()`](#long-running-execute)). With several instances, another
   instance picks it up immediately.
 - **An unexpected error stops only the instance that hit it.** Each instance dead-letters the
   message and stops on its own, so a bug that fails every message dead-letters one message per
@@ -1388,11 +1396,14 @@ a copy of `.kicak.example` works as it is. Run them explicitly with:
 pytest -m integration
 ```
 
-One of them checks that an Executor reconnects when RabbitMQ's `consumer_timeout` ends a delivery.
-RabbitMQ checks that timeout only once a minute by default, so the test takes about a minute. A
-broker started with `[{rabbit, [{channel_tick_interval, 1000}]}].` in
-`/etc/rabbitmq/advanced.config` checks every second, and the test takes a few seconds; the CI
-integration job starts its broker that way. `rabbitmq.conf` has no setting for this interval.
+Two of them check how an Executor handles RabbitMQ's `consumer_timeout` ending a delivery: on a
+classic queue with RabbitMQ 4.2, and on a quorum queue with RabbitMQ 4.3 and newer, which evaluate
+the timeout for quorum queues only. RabbitMQ 4.2 checks that timeout only once a minute by default,
+so each of them takes about a minute there. A broker started with
+`[{rabbit, [{channel_tick_interval, 1000}]}].` in `/etc/rabbitmq/advanced.config` checks every
+second, and they take a few seconds; the CI integration job starts its brokers that way, with
+RabbitMQ 4.2 and 4.4. `rabbitmq.conf` has no setting for this interval. On RabbitMQ 4.4 they take
+about 15 seconds whatever the interval.
 
 The TLS integration tests also need a broker with a TLS listener, and the path of a `.kicak` file
 for it, with `RABBIT_MQ_TLS=true` and `RABBIT_MQ_CA_FILE`, in the `KICAK_TLS_CONFIG_PATH`

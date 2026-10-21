@@ -12,7 +12,7 @@ flowchart TB
         direction LR
         lint["lint<br/>ruff check, ruff format --check, mypy"]
         test["test<br/>Python 3.12 to 3.15, pika latest and 1.4.0,<br/>coverage of at least 85%"]
-        integration["integration<br/>RabbitMQ 4.2, plain and TLS,<br/>pika latest and 1.4.0"]
+        integration["integration<br/>RabbitMQ 4.2 and 4.4, plain and TLS,<br/>pika latest and 1.4.0"]
         build["build<br/>sdist and wheel, twine check,<br/>contents check, install and import"]
     end
 
@@ -37,7 +37,7 @@ Runs on every push to `main`, on every pull request, and as the first stage of a
 | --- | --- |
 | `lint` | `ruff check .`, `ruff format --check .`, and `mypy` (strict, over `pykicak`, `examples`, `tests`, and `.github/scripts`) |
 | `test` | The unit tests on Python 3.12, 3.13, 3.14, and 3.15 with the newest pika, and on 3.12 with pika 1.4.0, the oldest `pyproject.toml` allows. Statement coverage of `pykicak` must be at least 85% (`fail_under` in `pyproject.toml`; the unit tests reach about 99%) |
-| `integration` | The integration tests against RabbitMQ 4.2 with a plain and a TLS listener, with the newest pika and with pika 1.4.0. The broker stays on 4.2 until the consumer_timeout test is adapted to RabbitMQ 4.3, which no longer evaluates consumer timeouts for classic queues |
+| `integration` | The integration tests against RabbitMQ 4.2 and 4.4, each with a plain and a TLS listener, with the newest pika and with pika 1.4.0: four required jobs. The two broker versions take a delivery that outlasts its consumer timeout back in different ways, and both are tested |
 | `build` | Builds the sdist and the wheel, runs `twine check --strict`, checks with `.github/scripts/release_checks.py dist` that both hold the package version and nothing but the package, and imports the wheel from a fresh environment |
 
 ### `release.yml`: continuous delivery

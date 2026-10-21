@@ -247,8 +247,9 @@ def _is_consumer_timeout(error: Exception) -> bool:
     """Return whether RabbitMQ closed a channel because a delivery outlasted `consumer_timeout`.
 
     The broker's `consumer_timeout` bounds how long a delivery may stay unacknowledged. RabbitMQ
-    reports its expiry as `406 PRECONDITION_FAILED` with a reply text such as "delivery
-    acknowledgement on channel 1 timed out" (RabbitMQ 4.2), and requeues the delivery.
+    4.2 reports its expiry as `406 PRECONDITION_FAILED` with a reply text such as "delivery
+    acknowledgement on channel 1 timed out", and requeues the delivery. RabbitMQ 4.3 and newer
+    cancel the consumer instead (see `_consumer_cancelled()`).
     """
     return (
         isinstance(error, ChannelClosedByBroker)
@@ -727,6 +728,8 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
         self._input_checked_at = 0.0  # time.monotonic() of the last verification of the input side
         # Transactional channel for results, opened on first use for each connection
         self._results_channel: BlockingChannel | None = None
+        # The consuming channel whose consumer RabbitMQ cancelled, if any
+        self._cancelled_consumer_channel: BlockingChannel | None = None
         self._results_connection: pika.BlockingConnection | None = None
         self._returned_results: list[ReturnedMessage] = []
 
@@ -1319,9 +1322,10 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
         the message twice instead of losing it. If RabbitMQ does not take the copy, returning it
         as unroutable or refusing it, the delivery is requeued instead.
 
-        Returns False if the connection was lost, or RabbitMQ closed the delivery's channel; the
-        caller must reconnect, and RabbitMQ redelivers the message. RabbitMQ refusing to declare
-        the retry queue is raised.
+        Returns False if the connection was lost, or RabbitMQ took the delivery back (closing its
+        channel, or cancelling the consumer) before the copy was published; the caller must
+        reconnect, and RabbitMQ redelivers the message. RabbitMQ refusing to declare the retry
+        queue is raised.
         """
         original = properties if properties is not None else pika.BasicProperties()
         headers = _retry_headers(original.headers, _now())
@@ -1349,6 +1353,7 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
         )
         try:
             self._declare_retry_queue()
+            self._check_delivery_held()
             logger.debug(
                 "Moving message id=%s to retry queue %s round=%s",
                 message_id,
@@ -1415,9 +1420,11 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
         dead-lettered into a missing exchange, and a quorum queue also dead-letters a requeued
         message once it reaches its delivery limit.
 
-        Returns False if the connection was lost, or RabbitMQ closed the channel because the
-        delivery outlasted `consumer_timeout`: RabbitMQ then requeues the delivery itself, so the
-        settlement is not retried, and the caller must reconnect. Other errors are raised.
+        Returns False if the connection was lost, or RabbitMQ took the delivery back because it
+        outlasted `consumer_timeout`, closing the channel (RabbitMQ 4.2) or cancelling the
+        consumer (4.3 and newer, which ignore the settlement): RabbitMQ then requeues the delivery
+        itself, so the settlement is not retried, and the caller must reconnect. Other errors are
+        raised.
         """
         try:
             if requeue is None:
@@ -1425,6 +1432,7 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
             else:
                 self._declare_dead_letter_route()
                 self.channel.basic_nack(delivery_tag=delivery_tag, requeue=requeue)
+            cancelled = self._consumer_cancelled()
         except Exception as error:
             if not self._is_retryable_rabbitmq_error(error):
                 raise
@@ -1438,7 +1446,47 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
             )
             self._discard_connection()
             return False
+        if cancelled:
+            logger.warning(
+                "RabbitMQ cancelled the consumer of queue %s while %s message id=%s "
+                "delivery_tag=%i, e.g. because the message outlasted the queue's consumer "
+                "timeout; it returns the message to the queue and redelivers it; reconnecting",
+                self._source_queue,
+                action,
+                message_id,
+                delivery_tag,
+            )
+            self._discard_connection()
+            return False
         return True
+
+    def _consumer_cancelled(self) -> bool:
+        """Return whether RabbitMQ cancelled the consumer while keeping its channel open.
+
+        RabbitMQ 4.3 and newer do so when a delivery outlasts the consumer timeout, which they
+        evaluate for quorum queues only: they return the delivery to the queue and ignore a later
+        acknowledgement (RabbitMQ 4.2 closed the channel instead). Deleting the queue cancels the
+        consumer too. Events RabbitMQ has already sent, such as a cancellation while `execute()`
+        ran, are processed first; `_watch_for_consumer_cancellation()` notes the cancellation.
+        """
+        cast(pika.BlockingConnection, self._connection).process_data_events(time_limit=0)
+        channel = self.channel
+        return bool(channel.is_open and self._cancelled_consumer_channel is channel)
+
+    def _check_delivery_held(self) -> None:
+        """Raise `ChannelWrongStateError` if RabbitMQ took back the delivery being processed.
+
+        RabbitMQ takes it back, and redelivers it, when it outlasts the consumer timeout: RabbitMQ
+        4.2 closes the channel that delivered it, while 4.3 and newer cancel the consumer. Nothing
+        may then be published for the delivery, neither its results nor its retry copy, because
+        executing the redelivery publishes them again.
+        """
+        if self._consumer_cancelled():
+            raise ChannelWrongStateError(
+                "RabbitMQ cancelled the consumer of the message, which returns it to the queue"
+            )
+        if not self.channel.is_open:
+            raise ChannelWrongStateError("RabbitMQ closed the channel that delivered the message")
 
     def _accepted_class(self, sent_type: str | None) -> type[Accepted]:
         """Return the accepted class named by a delivery's `type` property, `sent_type`.
@@ -1581,18 +1629,16 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
         """Wait for `seconds` while holding an unacknowledged delivery, answering heartbeats.
 
         Waits in steps of at most one second. Returns False if `stop()` was called. Raises
-        `ChannelWrongStateError` if RabbitMQ closed the delivery's channel, which requeues it, and
-        connection errors if the connection is lost.
+        `ChannelWrongStateError` if RabbitMQ took the delivery back, closing its channel or
+        cancelling the consumer, which requeues it, and connection errors if the connection is
+        lost.
         """
         connection = cast(pika.BlockingConnection, self._connection)
         remaining = seconds
         while True:
             if self._stop_requested:
                 return False
-            if not self.channel.is_open:
-                raise ChannelWrongStateError(
-                    "RabbitMQ closed the channel that delivered the message"
-                )
+            self._check_delivery_held()
             if remaining <= 0:
                 return True
             step = min(remaining, _STOP_POLL_SECONDS)
@@ -1612,9 +1658,9 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
         to is reported only after it: this raises `UnroutableError` with the returned results.
         Connection and channel errors, including RabbitMQ refusing a declaration or the commit,
         are raised as they are; RabbitMQ discards an uncommitted transaction when its channel
-        closes. If RabbitMQ has closed the channel that delivered the input, which requeues the
-        input, this raises `ChannelWrongStateError` instead of committing. Nothing is retried or
-        reconnected here.
+        closes. If RabbitMQ has taken the input back, closing its channel or cancelling the
+        consumer, which requeues it, this raises `ChannelWrongStateError` instead of committing.
+        Nothing is retried or reconnected here.
         """
         channel = self._transactional_results_channel()
         logger.debug("Verifying the output side of exchange %s", self._destination_exchange)
@@ -1625,10 +1671,9 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
         self._returned_results.clear()
         for exchange_name, result, body in publications:
             self._basic_publish(channel, exchange_name, result, body)
-        if not self.channel.is_open:
-            # While publishing, pika processed RabbitMQ closing the delivery's channel, e.g. on
-            # consumer_timeout. RabbitMQ has requeued the input, so its results are not committed.
-            raise ChannelWrongStateError("RabbitMQ closed the channel that delivered the message")
+        # RabbitMQ requeues an input that outlasted its consumer timeout, so results committed for
+        # it now would be published again when the redelivery is executed
+        self._check_delivery_held()
         logger.debug("Committing the transaction of %d results", len(publications))
         channel.tx_commit()
         # RabbitMQ sends returned messages before the commit's reply, but pika hands them to the
@@ -1683,6 +1728,36 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
         """Start consuming, one message at a time, after ensuring a usable RabbitMQ connection."""
         self._ensure_connection_once()
         logger.debug("Setting RabbitMQ prefetch count to %d", _PREFETCH_COUNT)
-        self.channel.basic_qos(prefetch_count=_PREFETCH_COUNT)
+        channel = self.channel
+        channel.basic_qos(prefetch_count=_PREFETCH_COUNT)
+        self._watch_for_consumer_cancellation(channel)
         logger.debug("Consuming from RabbitMQ queue=%s", self._source_queue)
-        return iter(self.channel.consume(self._source_queue, inactivity_timeout=_STOP_POLL_SECONDS))
+        return iter(channel.consume(self._source_queue, inactivity_timeout=_STOP_POLL_SECONDS))
+
+    def _watch_for_consumer_cancellation(self, channel: BlockingChannel) -> None:
+        """Note RabbitMQ cancelling the consumer on `channel` as soon as pika processes it.
+
+        RabbitMQ 4.3 and newer cancel the consumer of a delivery that outlasts a quorum queue's
+        consumer timeout, and return the delivery to the queue; `_consumer_cancelled()` reads the
+        note. pika's consume() generator learns of a cancellation only when it is advanced, and
+        the public `BlockingChannel.add_on_cancel_callback()` never fires for it (pika 1.4 passes
+        the generator's events around those callbacks), so the callback is registered on the
+        channel that BlockingChannel wraps, its private `_impl`. This is the only place that uses
+        a private pika attribute. Without it, a timed-out delivery is still executed again, but
+        its results or its retry copy may be published for it too, and so twice.
+        """
+        register = getattr(getattr(channel, "_impl", None), "add_on_cancel_callback", None)
+        if not callable(register):
+            logger.warning(
+                "Cannot watch for RabbitMQ cancelling the consumer of queue %s: this pika "
+                "version's BlockingChannel has no _impl.add_on_cancel_callback(). A delivery that "
+                "outlasts a quorum queue's consumer timeout on RabbitMQ 4.3 or newer is still "
+                "executed again, but its results or retry copy may then be published twice",
+                self._source_queue,
+            )
+            return
+        register(lambda _method_frame: self._note_consumer_cancelled(channel))
+
+    def _note_consumer_cancelled(self, channel: BlockingChannel) -> None:
+        """Note that RabbitMQ cancelled the consumer on `channel`; see `_consumer_cancelled()`."""
+        self._cancelled_consumer_channel = channel
