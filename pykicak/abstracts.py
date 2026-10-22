@@ -10,6 +10,7 @@ import ssl
 import types
 import typing
 from collections.abc import Callable
+from datetime import UTC, datetime
 from types import NoneType, TracebackType
 from typing import Self, TypeVar
 
@@ -38,6 +39,13 @@ _MAX_NAME_BYTES = 255  # AMQP carries queue and exchange names as short strings
 _RESERVED_NAME_PREFIX = "amq."
 _ORIGINAL_PUBLISHER_HEADER = "x-kicak-original-publisher"
 """Header naming the user of the agent that created a message; see `_basic_publish()`."""
+_PUBLISHED_AT_HEADER = "x-kicak-published-at"
+"""Header with the time a message was published, ISO 8601 in UTC; see `_basic_publish()`."""
+
+
+def _now() -> datetime:
+    """The current time, timezone-aware in UTC."""
+    return datetime.now(UTC)
 
 
 def _check_name(argument: str, name: object, *, suffix: str = "") -> None:
@@ -383,9 +391,11 @@ class KicakAbstract(abc.ABC):
         created the message, an Injector's message or an Executor's result, so it names itself
         twice: in `user_id`, the user its connection authenticated as, which RabbitMQ verifies,
         and in the `x-kicak-original-publisher` header, which a copy moved to a retry queue keeps
-        while its `user_id` changes. What this waits for depends on the channel: in confirm
-        mode, RabbitMQ's confirmation; on a transactional channel, nothing, because RabbitMQ
-        delivers nothing before `tx_commit()`.
+        while its `user_id` changes. The `x-kicak-published-at` header records when it was
+        published, so the Executor that receives it can tell how long it waited in its queue;
+        a copy moved to a retry queue is stamped again. What this waits for depends on the
+        channel: in confirm mode, RabbitMQ's confirmation; on a transactional channel, nothing,
+        because RabbitMQ delivers nothing before `tx_commit()`.
         """
         logger.debug(
             "Publishing message type=%s id=%s exchange=%s routing_key='' body_bytes=%d",
@@ -404,7 +414,10 @@ class KicakAbstract(abc.ABC):
                 message_id=message.message_id,
                 type=type(message).kicak_type,
                 user_id=self._user_id,
-                headers={_ORIGINAL_PUBLISHER_HEADER: self._user_id},
+                headers={
+                    _ORIGINAL_PUBLISHER_HEADER: self._user_id,
+                    _PUBLISHED_AT_HEADER: _now().isoformat(),
+                },
             ),
             mandatory=True,
         )

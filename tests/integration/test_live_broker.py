@@ -324,6 +324,23 @@ def test_every_message_names_its_verified_user_and_its_original_publisher(config
     assert foreign_result.headers["x-kicak-original-publisher"] == user
     # ...and a retry copy keeps the creator of the message
     assert retry_copy.headers["x-kicak-original-publisher"] == "origin-user"
+    # Every message an agent publishes, and every retry copy, says when it was published,
+    # including the copy of the foreign message, which had no such header
+    published_at = {
+        name: datetime.fromisoformat(properties.headers["x-kicak-published-at"])
+        for name, properties in (
+            ("from_injector", from_injector),
+            ("injected_result", injected_result),
+            ("retry_copy", retry_copy),
+            ("foreign_result", foreign_result),
+        )
+    }
+    assert all(time.utcoffset() is not None for time in published_at.values())
+    # In the order they were published: the foreign message failed, and was copied to the
+    # retry queue, before the injected message was executed
+    assert published_at["from_injector"] <= published_at["retry_copy"]
+    assert published_at["retry_copy"] <= published_at["injected_result"]
+    assert published_at["injected_result"] <= published_at["foreign_result"]
 
 
 @pytest.mark.parametrize("queue_type", list(QueueType))

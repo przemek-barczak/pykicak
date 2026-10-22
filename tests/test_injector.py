@@ -1,5 +1,6 @@
 import dataclasses
 import pickle
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from pika.exceptions import (
@@ -423,6 +424,31 @@ def test_run_retries_on_a_new_connection_with_the_same_message(config, monkeypat
     assert "Injection of message id=message-1 failed, retrying attempt 2/3" in caplog.text
 
 
+def test_run_stamps_a_retried_message_with_the_time_of_the_attempt_that_published_it(
+    config, monkeypatch
+):
+    class ConnectionLostChannel(FakeChannel):
+        def basic_publish(self, exchange, routing_key, body, properties=None, mandatory=False):
+            raise StreamLostError("connection lost")
+
+    now = datetime(2026, 10, 1, 12, 0, tzinfo=UTC)
+
+    def sleep(seconds: float) -> None:
+        nonlocal now
+        now += timedelta(seconds=seconds)
+
+    monkeypatch.setattr("pykicak.abstracts._now", lambda: now)
+    monkeypatch.setattr("pykicak.injector.time.sleep", sleep)
+    retry_channel = FakeChannel()
+    injector = CountingInjector(config, retry_channel, exchange_name="my-exchange")
+    scripted_connections(injector, monkeypatch, ConnectionLostChannel(), retry_channel)
+
+    injector.run()
+
+    [published] = retry_channel.published_messages
+    assert published.properties.headers["x-kicak-published-at"] == "2026-10-01T12:00:01+00:00"
+
+
 def test_run_retries_when_a_blocked_connection_times_out(config, monkeypatch, caplog):
     class BlockedChannel(FakeChannel):
         def basic_publish(self, exchange, routing_key, body, properties=None, mandatory=False):
@@ -796,7 +822,8 @@ def test_publish_marks_message_as_persistent_json_with_its_message_id(config):
     assert properties.type == "sample.v1"  # the declared class's kicak_type
 
 
-def test_publish_names_its_own_user_as_user_id_and_original_publisher(config):
+def test_publish_names_its_own_user_and_the_time_it_published_the_message(config, monkeypatch):
+    monkeypatch.setattr("pykicak.abstracts._now", lambda: datetime(2026, 10, 1, 12, 0, tzinfo=UTC))
     channel = FakeChannel()
     injector = CountingInjector(config, channel, exchange_name="my-exchange")
     injector.connect()
@@ -806,4 +833,7 @@ def test_publish_names_its_own_user_as_user_id_and_original_publisher(config):
     properties = channel.published_messages[0].properties
     # RabbitMQ verifies user_id; the injector starts the flow, so it is also its origin
     assert properties.user_id == "guest"
-    assert properties.headers == {"x-kicak-original-publisher": "guest"}
+    assert properties.headers == {
+        "x-kicak-original-publisher": "guest",
+        "x-kicak-published-at": "2026-10-01T12:00:00+00:00",
+    }

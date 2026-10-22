@@ -19,6 +19,7 @@ from pika.exceptions import (
     UnroutableError,
 )
 
+import pykicak.abstracts as abstracts_module
 import pykicak.executor as executor_module
 from pykicak.config import KicakConfig
 from pykicak.executor import (
@@ -1662,6 +1663,7 @@ def test_run_moves_message_to_retry_queue_after_exhausting_transient_retries(
     assert properties.headers == {
         "x-kicak-retry-round": 1,
         "x-kicak-retrying-since": "2026-10-01T12:00:00+00:00",
+        "x-kicak-published-at": "2026-10-01T12:00:00+00:00",
     }
     # Acknowledged after the copy, never requeued or dead-lettered
     assert channel.operations == ["publish ", "ack 1", "publish ", "ack 2"]
@@ -1730,6 +1732,7 @@ def test_retry_copy_keeps_application_properties_but_not_rabbitmq_headers(config
         "tenant": "acme",
         "x-kicak-retry-round": 1,
         "x-kicak-retrying-since": "2026-10-01T12:00:00+00:00",
+        "x-kicak-published-at": "2026-10-01T12:00:00+00:00",
         # The original user_id, which RabbitMQ would refuse from this executor's user
         "x-kicak-original-publisher": "publisher",
     }
@@ -1745,6 +1748,7 @@ def test_retry_round_increases_and_keeps_the_time_of_the_first_round(config, sle
         headers={
             "x-kicak-retry-round": 3,
             "x-kicak-retrying-since": "2026-09-30T08:00:00+00:00",
+            "x-kicak-published-at": "2026-09-30T08:30:00+00:00",
         },
     )
     channel.queue_deliveries(
@@ -1756,6 +1760,8 @@ def test_retry_round_increases_and_keeps_the_time_of_the_first_round(config, sle
     assert retry_copies(channel)[0].properties.headers == {
         "x-kicak-retry-round": 4,
         "x-kicak-retrying-since": "2026-09-30T08:00:00+00:00",
+        # Published anew: the time it waits in the source queue includes the retry delay
+        "x-kicak-published-at": "2026-10-01T12:00:00+00:00",
     }
 
 
@@ -1962,6 +1968,7 @@ def test_dead_letter_copy_records_why_when_and_from_which_queue(config, clock):
             "x-first-death-queue": "input-queue.retry",
             "x-kicak-retry-round": 2,
             "x-kicak-retrying-since": "2026-09-30T08:00:00+00:00",
+            "x-kicak-published-at": "2026-09-30T08:30:00+00:00",
         },
     )
     body = SampleMessage(message_id="body-id", text="input").to_bytes()
@@ -1976,9 +1983,11 @@ def test_dead_letter_copy_records_why_when_and_from_which_queue(config, clock):
     properties = copy.properties
     assert properties.headers == {
         "tenant": "acme",
-        # Its history: how often it was moved to the retry queue before
+        # Its history: how often it was moved to the retry queue before, and when it was
+        # published to the source queue last
         "x-kicak-retry-round": 2,
         "x-kicak-retrying-since": "2026-09-30T08:00:00+00:00",
+        "x-kicak-published-at": "2026-09-30T08:30:00+00:00",
         "x-kicak-dead-letter-reason": "malformed",
         "x-kicak-error-type": "pykicak.executor.MalformedMessageError",
         "x-kicak-error-message": "fails application validation",
@@ -2130,6 +2139,7 @@ def test_retry_copy_of_a_replayed_message_drops_its_dead_letter_headers(config, 
         "tenant": "acme",
         "x-kicak-retry-round": 1,
         "x-kicak-retrying-since": "2026-10-01T12:00:00+00:00",
+        "x-kicak-published-at": "2026-10-01T12:00:00+00:00",
     }
 
 
@@ -2501,7 +2511,7 @@ def test_run_publishes_each_result_with_its_message_id_property(config):
     ],
     ids=["from-a-pykicak-agent", "from-another-client", "unknown-publisher"],
 )
-def test_results_name_the_executor_as_their_original_publisher(config, received):
+def test_results_name_the_executor_as_their_original_publisher(config, clock, received):
     channel = FakeChannel()
     executor = make_executor(
         config,
@@ -2518,7 +2528,10 @@ def test_results_name_the_executor_as_their_original_publisher(config, received)
     # The executor created the result, whoever created its input
     properties = channel.published_messages[0].properties
     assert properties.user_id == "guest"
-    assert properties.headers == {"x-kicak-original-publisher": "guest"}
+    assert properties.headers == {
+        "x-kicak-original-publisher": "guest",
+        "x-kicak-published-at": "2026-10-01T12:00:00+00:00",
+    }
 
 
 @pytest.mark.parametrize(
@@ -3032,6 +3045,7 @@ class FakeClock:
 def clock(monkeypatch) -> FakeClock:
     fake = FakeClock()
     monkeypatch.setattr(executor_module, "_now", fake)
+    monkeypatch.setattr(abstracts_module, "_now", fake)  # the publish stamps of results
     return fake
 
 
@@ -4614,7 +4628,7 @@ def test_logs_how_long_each_part_of_a_completed_delivery_took(config, caplog, st
         "Message handled outcome=completed reason=None type=SampleMessage id=input "
         "queue=input-queue delivery_tag=1 redelivered=False retry_round=0 attempts=1 results=2 "
         "total_seconds=2.875 execute_seconds=2.000 backoff_seconds=0.000 publish_seconds=0.750 "
-        "held_seconds=0.000 settle_seconds=0.125"
+        "held_seconds=0.000 settle_seconds=0.125 queued_seconds=None"
     )
     assert kicak_values(record) == {
         "event": "message_handled",
@@ -4634,6 +4648,7 @@ def test_logs_how_long_each_part_of_a_completed_delivery_took(config, caplog, st
         "publish_seconds": 0.75,
         "held_seconds": 0.0,
         "settle_seconds": 0.125,
+        "queued_seconds": None,  # delivered without an x-kicak-published-at header
     }
 
 
@@ -4675,7 +4690,7 @@ def test_logs_one_handled_line_for_every_counted_delivery_whatever_its_outcome(
     for record, value in zip(records, values, strict=True):
         # The text holds the same values as the kicak attribute, durations to the millisecond
         assert logged_pairs(record) == {
-            name: f"{item:.3f}" if name.endswith("_seconds") else str(item)
+            name: f"{item:.3f}" if name.endswith("_seconds") and item is not None else str(item)
             for name, item in value.items()
             if name != "event"
         }
@@ -4950,3 +4965,68 @@ def test_stopped_line_tells_how_long_a_stop_while_reconnecting_took(
         "Executor for queue input-queue stopped on request while reconnecting stop_seconds=0.500"
     )
     assert kicak_values(record)["stop_seconds"] == 0.5
+
+
+@pytest.mark.parametrize(
+    ("published_at", "queued_seconds"),
+    [
+        ("2026-10-01T11:59:57.500000+00:00", 2.5),
+        (b"2026-10-01T11:59:57.500000+00:00", 2.5),
+        ("2026-10-01T13:59:58+02:00", 2.0),  # another time zone
+        # The publisher's clock is ahead: shown as it is, not corrected
+        ("2026-10-01T12:00:01.500000+00:00", -1.5),
+        ("2026-10-01T11:59:58", None),  # no time zone
+        ("yesterday", None),
+        (42, None),
+        (None, None),  # from another client, without the header
+    ],
+    ids=[
+        "utc",
+        "bytes",
+        "other-zone",
+        "publisher-ahead",
+        "without-zone",
+        "not-a-time",
+        "number",
+        "missing",
+    ],
+)
+def test_handled_line_tells_how_long_the_delivery_waited_since_it_was_published(
+    config, caplog, clock, published_at, queued_seconds
+):
+    caplog.set_level("INFO", logger="pykicak.executor")
+    headers = {} if published_at is None else {"x-kicak-published-at": published_at}
+    channel = FakeChannel()
+    channel.queue_deliveries(
+        SampleMessage(message_id="input", text="input").to_bytes(),
+        properties=pika.BasicProperties(type=SAMPLE_TYPE, headers=headers),
+    )
+    executor = make_executor(config, channel)
+
+    run_until_stopped(executor)
+
+    [record] = handled_records(caplog)
+    assert kicak_values(record)["queued_seconds"] == queued_seconds
+    expected_text = "None" if queued_seconds is None else f"{queued_seconds:.3f}"
+    assert record.message.endswith(f" queued_seconds={expected_text}")
+
+
+def test_results_are_stamped_with_the_time_they_were_published(config, clock):
+    def slow(_message):
+        clock.advance(5)
+        return SampleMessage(message_id="result", text="result")
+
+    channel = FakeChannel()
+    channel.queue_deliveries(
+        SampleMessage(message_id="input", text="input").to_bytes(),
+        properties=pika.BasicProperties(
+            type=SAMPLE_TYPE, headers={"x-kicak-published-at": "2026-09-30T08:00:00+00:00"}
+        ),
+    )
+    executor = make_executor(config, channel, handler=slow, destination_exchange="output-exchange")
+
+    run_until_stopped(executor)
+
+    # When the executor published the result, not when its input was published or received
+    [result] = channel.published_messages
+    assert result.properties.headers["x-kicak-published-at"] == "2026-10-01T12:00:05+00:00"

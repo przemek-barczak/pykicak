@@ -823,8 +823,10 @@ included, so it comes back as the same version of the message, and its headers, 
 RabbitMQ manages itself (`x-death`, `x-delivery-count`, `x-first-death-*`, and `x-last-death-*`).
 Its `user_id` becomes the Executor's own user, because RabbitMQ refuses any other, while its
 `x-kicak-original-publisher` header keeps naming the agent that created the message (see
-[Who published a message](#who-published-a-message)). It also gets two headers that count the
-rounds:
+[Who published a message](#who-published-a-message)), and its `x-kicak-published-at` header
+becomes the time of the move, because the copy is published anew (see
+[When a message was published](#when-a-message-was-published)). It also gets two headers that count
+the rounds:
 
 | Header | Value |
 | --- | --- |
@@ -890,8 +892,8 @@ classifier ──► Executor ── malformed, a bug, or a result too large ─
 The copy keeps the body, the `message_id` property exactly as the message arrived, so it is found by
 the same ID, and the other properties, its `type` included, so it can be replayed as the same version
 of the message. It keeps the message's headers, its retry headers `x-kicak-retry-round` and
-`x-kicak-retrying-since` included, as its history, except the headers RabbitMQ manages itself. It
-never expires. Its `user_id` becomes the Executor's own user, while its `x-kicak-original-publisher`
+`x-kicak-retrying-since` and its `x-kicak-published-at` included, as its history, except the
+headers RabbitMQ manages itself. It never expires. Its `user_id` becomes the Executor's own user, while its `x-kicak-original-publisher`
 header keeps naming the agent that created the message (see
 [Who published a message](#who-published-a-message)). It also gets headers that say why, when, and
 from where:
@@ -1320,8 +1322,9 @@ Things to plan for when running several instances:
 Every message is published as mandatory and persistent (`delivery_mode=2`), with the content type
 `application/json`, its `message_id` as the AMQP `message_id` property, its class's `kicak_type` as
 the AMQP `type` property (see
-[Type names: the contract between agents](#type-names-the-contract-between-agents)), and the names
-of its publisher and its creator (see [Who published a message](#who-published-a-message)). The
+[Type names: the contract between agents](#type-names-the-contract-between-agents)), the names
+of its publisher and its creator (see [Who published a message](#who-published-a-message)), and
+the time it was published (see [When a message was published](#when-a-message-was-published)). The
 Injector publishes in publisher-confirm mode: a publish returns only after RabbitMQ has taken
 responsibility for the message, for persistent messages in durable queues after writing it to disk.
 The Executor publishes its results in a transaction (see
@@ -1375,6 +1378,22 @@ A message that another client published without the header was created by that c
 it names the client's `user_id` in the header, if the client set one, and has no such header
 otherwise.
 
+### When a message was published
+
+Every message a pykicak agent publishes, an Injector's message and an Executor's result alike,
+carries the time it was published in its `x-kicak-published-at` header, in ISO 8601 and UTC, e.g.
+`2026-10-01T17:05:42.123456+00:00`, taken from the publishing host's clock. An Injector stamps each
+attempt anew, so a retried injection carries the time of the attempt that published it, and an
+Executor stamps its results when it publishes them, not when their input arrived. A copy moved to
+the retry queue is published anew too, so it gets the time of the move, while a dead-letter copy
+keeps the time of the message it copies (see [Dead-letter queue](#dead-letter-queue)).
+
+The Executor that receives the message compares that time with its own clock to tell how long the
+message waited in its queue, `queued_seconds` in its log (see
+[Durations in the logs](#durations-in-the-logs)). The header is not verified by RabbitMQ, like
+`x-kicak-original-publisher`, and a message that another client published without it has no
+`queued_seconds`.
+
 ## Retries and logging
 
 Injectors retry transient RabbitMQ connection and publish failures up to three attempts, with
@@ -1427,7 +1446,7 @@ each part of its handling took, so that statistics such as averages and percenti
 computed outside the library:
 
 ```text
-Message handled outcome=completed reason=None type=Chunk id=doc-17 queue=chunker delivery_tag=42 redelivered=False retry_round=0 attempts=1 results=3 total_seconds=1.284 execute_seconds=1.201 backoff_seconds=0.000 publish_seconds=0.071 held_seconds=0.000 settle_seconds=0.001
+Message handled outcome=completed reason=None type=Chunk id=doc-17 queue=chunker delivery_tag=42 redelivered=False retry_round=0 attempts=1 results=3 total_seconds=1.284 execute_seconds=1.201 backoff_seconds=0.000 publish_seconds=0.071 held_seconds=0.000 settle_seconds=0.001 queued_seconds=0.350
 ```
 
 | Key | Value |
@@ -1445,10 +1464,20 @@ Message handled outcome=completed reason=None type=Chunk id=doc-17 queue=chunker
 | `publish_seconds` | verifying the output side, publishing, and committing the results, all attempts together |
 | `held_seconds` | holding results RabbitMQ returned as unroutable (see [Unroutable results are held](#unroutable-results-are-held)) |
 | `settle_seconds` | acknowledging or requeueing the delivery, including publishing its copy for the retry queue or the dead-letter queue and waiting for RabbitMQ's confirmation |
+| `queued_seconds` | how long the delivery waited since it was published, before the Executor took it: from its `x-kicak-published-at` header (see [When a message was published](#when-a-message-was-published)) to the Executor's clock when it took the delivery; `None` without a valid header |
 
 The parts do not overlap, and what `total_seconds` has beyond them is decoding the delivery,
 serializing the results, and logging. Durations are seconds, three decimals in the text, measured
 with a monotonic clock (`time.perf_counter()`), so setting the system clock does not affect them.
+
+`queued_seconds` is the exception: it comes before the delivery was taken, outside
+`total_seconds`, and compares the clocks of two hosts, the publisher's and the Executor's. Keep them
+synchronized, e.g. with NTP; a difference between them shows in it as it is, not corrected, and can
+make it negative, so do not clamp it, which would bias averages. For a message back from the retry
+queue (`retry_round` above 0), it includes the time it spent there, `retry_delay_seconds`, because
+the copy was published when it was moved; leave such deliveries out to measure queue waits alone. A
+message replayed from the dead-letter queue keeps the time it was published before it was
+dead-lettered, so its `queued_seconds` includes its time in the dead-letter queue.
 
 The record also carries the same values, typed (numbers, booleans, and `None`), as its `kicak`
 attribute: a dict with one more key, `event`, here `"message_handled"`. Log handlers that write

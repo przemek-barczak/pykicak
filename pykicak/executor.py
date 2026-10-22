@@ -10,7 +10,7 @@ import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime
+from datetime import datetime
 from enum import Enum, StrEnum, auto
 from types import NoneType
 from typing import assert_never, cast
@@ -28,8 +28,10 @@ from pika.spec import Basic
 
 from pykicak.abstracts import (
     _ORIGINAL_PUBLISHER_HEADER,
+    _PUBLISHED_AT_HEADER,
     KicakAbstract,
     _check_name,
+    _now,
     _type_arguments,
     _union_members,
 )
@@ -78,13 +80,6 @@ _BROKER_HEADERS = frozenset({"x-death", "x-delivery-count"})
 _BROKER_HEADER_PREFIXES = ("x-first-death-", "x-last-death-")
 _STOP_POLL_SECONDS = 1.0  # longest wait, for a message or a reconnection, before checking stop()
 _PRECONDITION_FAILED = 406
-# The line logged for every delivery handled; the record's `kicak` attribute holds its values
-_HANDLED_LINE = (
-    "Message handled outcome=%s reason=%s type=%s id=%s queue=%s delivery_tag=%i "
-    "redelivered=%s retry_round=%i attempts=%i results=%i total_seconds=%.3f "
-    "execute_seconds=%.3f backoff_seconds=%.3f publish_seconds=%.3f held_seconds=%.3f "
-    "settle_seconds=%.3f"
-)
 
 
 class _StopRequested(Exception):
@@ -245,6 +240,9 @@ class _Handling:
     """
 
     started_at: float
+    queued_seconds: float | None = None
+    """How long the delivery waited since it was published: see `_queued_seconds()`."""
+
     results: int = 0
     """How many results `execute()` returned, once they are validated and serialized."""
 
@@ -428,9 +426,9 @@ def _logged_outcome(outcome: _Outcome | _DeadLetterReason) -> tuple[str, str | N
     return outcome.name.lower(), None
 
 
-def _now() -> datetime:
-    """The current time, timezone-aware in UTC."""
-    return datetime.now(UTC)
+def _logged_text(value: object) -> str:
+    """Return a value of the `Message handled` line as its text shows it: seconds to the ms."""
+    return f"{value:.3f}" if isinstance(value, float) else str(value)
 
 
 def _monotonic() -> float:
@@ -603,9 +601,12 @@ def _retry_headers(headers: Mapping[str, object] | None, now: datetime) -> dict[
 
     The application's headers are kept, and RabbitMQ's own ones dropped (see `_copied_headers()`).
     The round counts the moves into the retry queue, and `x-kicak-retrying-since` keeps the time
-    of the first one; a missing or invalid value starts them again.
+    of the first one; a missing or invalid value starts them again. The copy is published anew,
+    so `x-kicak-published-at` becomes `now`, and the `queued_seconds` of its return to the source
+    queue includes the retry delay.
     """
     kept = _copied_headers(headers)
+    kept[_PUBLISHED_AT_HEADER] = now.isoformat()
     kept[_RETRY_ROUND_HEADER] = _retry_round_of(kept) + 1
     since = kept.get(_RETRYING_SINCE_HEADER)
     if isinstance(since, bytes):
@@ -717,6 +718,28 @@ def _is_iso_datetime(value: str) -> bool:
         return datetime.fromisoformat(value).tzinfo is not None
     except ValueError:
         return False
+
+
+def _queued_seconds(properties: pika.BasicProperties | None, received_at: datetime) -> float | None:
+    """Return how long a delivery waited since it was published, or None if that is unknown.
+
+    From its `x-kicak-published-at` header, which every pykicak agent sets, to `received_at`.
+    The two times come from the clocks of two hosts, so a difference between them shows, and
+    the result can even be negative; it is not corrected. None for a delivery without the
+    header, e.g. from another client, or whose header is not an ISO 8601 time with a time zone.
+    """
+    published = None if properties is None else (properties.headers or {}).get(_PUBLISHED_AT_HEADER)
+    if isinstance(published, bytes):
+        published = published.decode("utf-8", errors="replace")
+    if not isinstance(published, str):
+        return None
+    try:
+        published_at = datetime.fromisoformat(published)
+    except ValueError:
+        return None
+    if published_at.utcoffset() is None:
+        return None
+    return (received_at - published_at).total_seconds()
 
 
 def _as_messages(results: object) -> tuple[KicakMessage, ...]:
@@ -1602,7 +1625,9 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
         settled, or as abandoned to RabbitMQ; and its `Message handled` line is logged.
         """
         self._settlement = None
-        handling = self._handling = _Handling(started_at=_monotonic())
+        handling = self._handling = _Handling(
+            started_at=_monotonic(), queued_seconds=_queued_seconds(properties, _now())
+        )
         try:
             return self._process_delivery(delivery_tag, redelivered, properties, body)
         finally:
@@ -1631,6 +1656,8 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
         names it: by the accepted class its `type` property names, or None, and its sender's
         `message_id` property.
         """
+        if not logger.isEnabledFor(logging.INFO):
+            return
         finished_at = _monotonic()
         if delivery is None:
             sent_type = _sent_type(properties)
@@ -1662,9 +1689,12 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
             "publish_seconds": seconds[_TimedPart.PUBLISH],
             "held_seconds": seconds[_TimedPart.HELD],
             "settle_seconds": 0.0 if settle_started_at is None else finished_at - settle_started_at,
+            "queued_seconds": handling.queued_seconds,
         }
         logger.info(
-            _HANDLED_LINE, *fields.values(), extra={"kicak": {"event": "message_handled", **fields}}
+            "Message handled %s",
+            " ".join(f"{name}={_logged_text(value)}" for name, value in fields.items()),
+            extra={"kicak": {"event": "message_handled", **fields}},
         )
 
     def _process_delivery(
@@ -1818,8 +1848,9 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
         """Move a delivery that failed transiently to the retry queue, then acknowledge it.
 
         The copy keeps the body and the application's properties and headers, gets the next
-        retry round in its headers and this executor's user as its `user_id`, keeps the user who
-        created the message in `x-kicak-original-publisher`, and expires in the retry queue after
+        retry round and the time of the move (`x-kicak-published-at`) in its headers and this
+        executor's user as its `user_id`, keeps the user who created the message in
+        `x-kicak-original-publisher`, and expires in the retry queue after
         `retry_delay_seconds`, which returns it to the back of the source queue. The delivery is
         acknowledged only after RabbitMQ has confirmed the copy, so a failure in between executes
         the message twice instead of losing it. If RabbitMQ does not take the copy, returning it
