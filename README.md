@@ -1127,7 +1127,8 @@ JSON, use `.isoformat()`, which gives for example `"2026-10-01T17:05:42.123456+0
 For each message the status goes from `"WAITING_FOR_MESSAGE"` to `"PROCESSING"`, then
 `"SENDING_RESULT"` if it has results, and back. The first attempt to connect or to verify the
 topology keeps the current status; only a failed attempt enters a recovery status, and the
-Executor logs a `WARNING` when it enters one and an `INFO` when it leaves it. A lost connection is
+Executor logs a `WARNING` when it enters one and an `INFO` when it leaves it, which tells how long
+it lasted (see [Durations in the logs](#durations-in-the-logs)). A lost connection is
 `"UPSTREAM_RECOVER"` even when it is noticed while sending results, because the message is executed
 again after reconnecting. The recovery statuses last however long the recovery takes (see
 [Retries and logging](#retries-and-logging)).
@@ -1180,7 +1181,8 @@ messages: a message delivered twice counts twice, and every count describes this
 A growing `abandoned` usually means that processing outlasts `heartbeat_seconds` or
 `consumer_timeout`, so messages are executed again (see
 [Long-running `execute()`](#long-running-execute)). A delivery received after `stop()` is not
-processed, and not counted.
+processed, and not counted. How long the deliveries took is in the logs: see
+[Durations in the logs](#durations-in-the-logs).
 
 ```python
 from datetime import timedelta
@@ -1417,6 +1419,84 @@ import logging
 
 logging.basicConfig(level=logging.INFO)
 ```
+
+### Durations in the logs
+
+Every delivery an Executor takes ends with one `INFO` line, whatever its outcome, telling how long
+each part of its handling took, so that statistics such as averages and percentiles can be
+computed outside the library:
+
+```text
+Message handled outcome=completed reason=None type=Chunk id=doc-17 queue=chunker delivery_tag=42 redelivered=False retry_round=0 attempts=1 results=3 total_seconds=1.284 execute_seconds=1.201 backoff_seconds=0.000 publish_seconds=0.071 held_seconds=0.000 settle_seconds=0.001
+```
+
+| Key | Value |
+| --- | --- |
+| `outcome` | how the delivery ended, named like the field of [`counts`](#status-information) that counts it: `completed`, `dead_lettered`, `moved_to_retry`, `requeued`, or `abandoned` |
+| `reason` | for `dead_lettered`, its `x-kicak-dead-letter-reason` (`malformed`, `result-too-large`, or `unexpected-error`); otherwise `None` |
+| `type`, `id` | the message's class and `message_id`; for a delivery that could not be decoded, the accepted class its `type` property names and its sender's `message_id` property, each `None` if there is none |
+| `queue`, `delivery_tag` | the source queue, and the delivery's tag on the consuming channel |
+| `redelivered`, `retry_round` | RabbitMQ's redelivered flag, and how often the message was moved to the retry queue before (see [Status information](#status-information)) |
+| `attempts` | the calls of `execute()`; 0 for a delivery that could not be decoded |
+| `results` | the results `execute()` returned, once validated and serialized; they are published only when the outcome is `completed` |
+| `total_seconds` | from taking the delivery until it was settled or left to RabbitMQ |
+| `execute_seconds` | in `execute()`, all its calls together |
+| `backoff_seconds` | waiting between the calls retried after `TransientProcessingError` |
+| `publish_seconds` | verifying the output side, publishing, and committing the results, all attempts together |
+| `held_seconds` | holding results RabbitMQ returned as unroutable (see [Unroutable results are held](#unroutable-results-are-held)) |
+| `settle_seconds` | acknowledging or requeueing the delivery, including publishing its copy for the retry queue or the dead-letter queue and waiting for RabbitMQ's confirmation |
+
+The parts do not overlap, and what `total_seconds` has beyond them is decoding the delivery,
+serializing the results, and logging. Durations are seconds, three decimals in the text, measured
+with a monotonic clock (`time.perf_counter()`), so setting the system clock does not affect them.
+
+The record also carries the same values, typed (numbers, booleans, and `None`), as its `kicak`
+attribute: a dict with one more key, `event`, here `"message_handled"`. Log handlers that write
+records as JSON, such as python-json-logger's, include it, so nothing has to parse the text, and a
+handler of your own can feed a monitoring system:
+
+```python
+import logging
+
+from prometheus_client import Histogram
+
+EXECUTE_SECONDS = Histogram("kicak_execute_seconds", "Time in execute()", ["queue"])
+
+
+class ExecuteTimes(logging.Handler):
+    def emit(self, record: logging.LogRecord) -> None:
+        values = getattr(record, "kicak", None)
+        if values and values["event"] == "message_handled" and values["outcome"] == "completed":
+            EXECUTE_SECONDS.labels(queue=values["queue"]).observe(values["execute_seconds"])
+
+
+executor_logger = logging.getLogger("pykicak.executor")
+executor_logger.setLevel(logging.INFO)  # the lines are logged at INFO
+executor_logger.addHandler(ExecuteTimes())
+```
+
+The lines describe deliveries, not messages. Delivery is at-least-once, so a message executed twice
+has two lines, the second usually `redelivered=True`; group them by `id` for figures per message.
+There is exactly one line for every delivery `get_info().counts` counts, so a delivery received
+after `stop()`, which is not processed, has none. The `total_seconds` of an `abandoned` delivery is
+work that is done again; for how long processing takes, average over `outcome=completed`, because
+malformed messages usually fail fast.
+
+Two more `INFO` lines carry a duration, also in their `kicak` attribute:
+
+```text
+Executor for queue chunker recovered from UPSTREAM_RECOVER: WAITING_FOR_MESSAGE recovery_seconds=12.345
+Executor for queue chunker stopped on request stop_seconds=4.210
+```
+
+- `recovery_seconds` is how long the recovery status lasted, from the failure that entered it to
+  the recovery (`event` `"recovered"`, with `queue`, `recovered_from`, `status`, and
+  `recovery_seconds`).
+- `stop_seconds` is how long a graceful stop took, from the first `stop()` until the connection was
+  closed, finishing the message in progress included; the line says `stopped on request while
+  reconnecting` when the stop ended a reconnection (`event` `"stopped"`, with `queue` and
+  `stop_seconds`). It helps size the time a platform gives the process to stop, such as Kubernetes'
+  `terminationGracePeriodSeconds`.
 
 ### Connection names
 

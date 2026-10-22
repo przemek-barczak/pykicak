@@ -8,6 +8,7 @@ import math
 import random
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import Enum, StrEnum, auto
@@ -77,6 +78,13 @@ _BROKER_HEADERS = frozenset({"x-death", "x-delivery-count"})
 _BROKER_HEADER_PREFIXES = ("x-first-death-", "x-last-death-")
 _STOP_POLL_SECONDS = 1.0  # longest wait, for a message or a reconnection, before checking stop()
 _PRECONDITION_FAILED = 406
+# The line logged for every delivery handled; the record's `kicak` attribute holds its values
+_HANDLED_LINE = (
+    "Message handled outcome=%s reason=%s type=%s id=%s queue=%s delivery_tag=%i "
+    "redelivered=%s retry_round=%i attempts=%i results=%i total_seconds=%.3f "
+    "execute_seconds=%.3f backoff_seconds=%.3f publish_seconds=%.3f held_seconds=%.3f "
+    "settle_seconds=%.3f"
+)
 
 
 class _StopRequested(Exception):
@@ -211,6 +219,55 @@ class _Activity[Accepted: KicakMessage]:
     entered_at: datetime
     delivery: _Delivery[Accepted] | None = None
     counts: ExecutorCounts = field(default_factory=ExecutorCounts)
+
+
+class _TimedPart(StrEnum):
+    """A part of handling a delivery whose duration the `Message handled` line reports."""
+
+    EXECUTE = "execute"
+    """The calls of `execute()`."""
+
+    BACKOFF = "backoff"
+    """The waits between the calls of `execute()` retried after `TransientProcessingError`."""
+
+    PUBLISH = "publish"
+    """Verifying the output side, publishing the results, and committing them."""
+
+    HELD = "held"
+    """The waits while the results RabbitMQ returned as unroutable are held."""
+
+
+@dataclass(slots=True)
+class _Handling:
+    """How the handling of one delivery went, for the `Message handled` line logged at its end.
+
+    Times are of `_monotonic()`, durations in seconds. Only the thread running `run()` uses it.
+    """
+
+    started_at: float
+    results: int = 0
+    """How many results `execute()` returned, once they are validated and serialized."""
+
+    seconds: dict[_TimedPart, float] = field(default_factory=lambda: dict.fromkeys(_TimedPart, 0.0))
+    settle_started_at: float | None = None
+    """When settling the delivery began, the last part of its handling, or None if it did not."""
+
+    @contextmanager
+    def timing(self, part: _TimedPart) -> Iterator[None]:
+        """Add how long the `with` block takes to the duration of `part`, also if it raises."""
+        started_at = _monotonic()
+        try:
+            yield
+        finally:
+            self.seconds[part] += _monotonic() - started_at
+
+    def start_settling(self) -> None:
+        """Note that settling begins: a copy to publish, or the acknowledgement or rejection.
+
+        Only the first call counts, so the copy and the acknowledgement after it are one part.
+        """
+        if self.settle_started_at is None:
+            self.settle_started_at = _monotonic()
 
 
 @dataclass(frozen=True, slots=True, kw_only=True, repr=False)
@@ -360,9 +417,25 @@ def _counted(counts: ExecutorCounts, outcome: _Outcome | _DeadLetterReason) -> E
     return replace(counts, dead_lettered=dead_lettered)
 
 
+def _logged_outcome(outcome: _Outcome | _DeadLetterReason) -> tuple[str, str | None]:
+    """Return how a delivery ended as the `Message handled` line names it, and why, if known.
+
+    The outcome is named like the field of `ExecutorCounts` that counts it, and the reason of a
+    dead-lettering like its `x-kicak-dead-letter-reason` header.
+    """
+    if isinstance(outcome, _DeadLetterReason):
+        return "dead_lettered", outcome.value
+    return outcome.name.lower(), None
+
+
 def _now() -> datetime:
     """The current time, timezone-aware in UTC."""
     return datetime.now(UTC)
+
+
+def _monotonic() -> float:
+    """Seconds of a clock for durations, which, unlike `_now()`'s, is never set back or forward."""
+    return time.perf_counter()
 
 
 def _dead_letter_exchange_of(queue_name: str) -> str:
@@ -796,7 +869,9 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
 
     Call `stop()`, from any thread or a signal handler, to make `run()` finish the message in
     progress and return before taking another one. `get_info()` reports what the Executor is
-    doing, since when, whether a stop was requested, and which message it is processing.
+    doing, since when, whether a stop was requested, and which message it is processing. Every
+    delivery it takes ends with a `Message handled` line logged at `INFO`, whatever the outcome,
+    telling how it ended and how long each part of its handling took, for statistics.
 
     All queue/exchange names are application topology, not connection configuration, so they
     are passed in by the caller (typically sourced from an application's messaging/queues.py,
@@ -958,9 +1033,13 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
         # counts, replaced as a whole so that a reader never mixes two moments, e.g. a status
         # with another status's message, or a message already counted.
         self._activity: _Activity[Accepted] = _Activity(ExecutorStatus.CREATED, _now())
+        self._status_entered_monotonic = _monotonic()  # when the status was entered, for durations
         # How the delivery being processed was settled, or None while it is not (yet) settled
         self._settlement: _Outcome | _DeadLetterReason | None = None
+        # How the handling of the delivery being processed goes, or went, for its log line
+        self._handling = _Handling(started_at=0.0)
         self._stop_requested_at: datetime | None = None
+        self._stop_requested_monotonic: float | None = None  # _stop_requested_at, for durations
         self._final_status: tuple[ExecutorStatus, datetime] | None = None
         # The classes Accepted stands for, by the type name they are sent with, and Result's class
         self._accepted_types = cast(dict[str, type[Accepted]], accepted_types)
@@ -1212,6 +1291,7 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
         keeps the time of the first call.
         """
         if self._stop_requested_at is None:
+            self._stop_requested_monotonic = _monotonic()
             self._stop_requested_at = _now()
         self._stop_requested = True
 
@@ -1268,21 +1348,34 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
 
         Only the thread running `run()` calls it, so `_activity` has a single writer. Setting the
         current status again keeps the time it was entered. The delivery being processed and the
-        counts are kept.
+        counts are kept. Leaving a recovery status logs how long it lasted, as `recovery_seconds`.
         """
         activity = self._activity
         previous = activity.status
         if status is previous:
             return
+        entered_monotonic = _monotonic()
+        previous_seconds = entered_monotonic - self._status_entered_monotonic
         self._activity = replace(activity, status=status, entered_at=_now())
+        self._status_entered_monotonic = entered_monotonic
         if status in _RECOVERY_STATUSES:
             logger.warning("Executor for queue %s is recovering: %s", self._source_queue, status)
         elif previous in _RECOVERY_STATUSES:
             logger.info(
-                "Executor for queue %s recovered from %s: %s",
+                "Executor for queue %s recovered from %s: %s recovery_seconds=%.3f",
                 self._source_queue,
                 previous,
                 status,
+                previous_seconds,
+                extra={
+                    "kicak": {
+                        "event": "recovered",
+                        "queue": self._source_queue,
+                        "recovered_from": previous.value,
+                        "status": status.value,
+                        "recovery_seconds": previous_seconds,
+                    }
+                },
             )
 
     def _set_delivery(self, delivery: _Delivery[Accepted]) -> None:
@@ -1333,6 +1426,7 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
             self._activity = _Activity(
                 ExecutorStatus.UPSTREAM_RECOVER, _now(), counts=self._activity.counts
             )
+            self._status_entered_monotonic = _monotonic()
             self._final_status = None
         try:
             self._consume_until_stopped()
@@ -1348,6 +1442,7 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
         """Connect and consume until a stop request; raise on any other end."""
         logger.debug("Starting Executor consumer for queue=%s", self._source_queue)
         self._running = True
+        stopped_while = ""
         try:
             self.connect()
             consumer = self._retry_rabbitmq_operation(
@@ -1407,11 +1502,8 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
                     self._set_activity(ExecutorStatus.WAITING_FOR_MESSAGE)
                 else:
                     consumer = self._reconnect()
-            logger.info("Executor for queue %s stopped on request", self._source_queue)
         except _StopRequested:
-            logger.info(
-                "Executor for queue %s stopped on request while reconnecting", self._source_queue
-            )
+            stopped_while = " while reconnecting"
         except BaseException:
             self._running = False
             self._close_without_masking()  # the error that ended run() is the one to raise
@@ -1420,6 +1512,29 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
         # The stop stays graceful even if closing fails: every message is settled or left to
         # RabbitMQ, which requeues it once the connection is gone. close() logs the failure.
         self._close_without_masking()
+        self._log_stopped(stopped_while)
+
+    def _log_stopped(self, stopped_while: str) -> None:
+        """Log that `run()` stopped on request, and how long the stop took, as `stop_seconds`.
+
+        From the first `stop()` to the connection being closed: finishing the message in
+        progress, if any, included.
+        """
+        requested_at = self._stop_requested_monotonic
+        stop_seconds = 0.0 if requested_at is None else _monotonic() - requested_at
+        logger.info(
+            "Executor for queue %s stopped on request%s stop_seconds=%.3f",
+            self._source_queue,
+            stopped_while,
+            stop_seconds,
+            extra={
+                "kicak": {
+                    "event": "stopped",
+                    "queue": self._source_queue,
+                    "stop_seconds": stop_seconds,
+                }
+            },
+        )
 
     def _reconnect(
         self,
@@ -1484,15 +1599,73 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
         consuming. A stop request while the results are held requeues the delivery.
 
         However it ends, also by raising, the delivery is counted in `ExecutorInfo.counts`: as
-        settled, or as abandoned to RabbitMQ.
+        settled, or as abandoned to RabbitMQ; and its `Message handled` line is logged.
         """
         self._settlement = None
+        handling = self._handling = _Handling(started_at=_monotonic())
         try:
             return self._process_delivery(delivery_tag, redelivered, properties, body)
         finally:
             # Settled, or left to RabbitMQ to redeliver: no longer being processed
             settlement = self._settlement
-            self._finish_delivery(_Outcome.ABANDONED if settlement is None else settlement)
+            outcome = _Outcome.ABANDONED if settlement is None else settlement
+            delivery = self._activity.delivery
+            self._finish_delivery(outcome)
+            self._log_handled(handling, outcome, delivery, delivery_tag, redelivered, properties)
+
+    def _log_handled(
+        self,
+        handling: _Handling,
+        outcome: _Outcome | _DeadLetterReason,
+        delivery: _Delivery[Accepted] | None,
+        delivery_tag: int,
+        redelivered: bool,
+        properties: pika.BasicProperties | None,
+    ) -> None:
+        """Log the `Message handled` line of a delivery: how it ended, and what its parts took.
+
+        One line at `INFO` for every delivery counted in `ExecutorInfo.counts`, whatever its
+        outcome, so that statistics such as averages can be computed from the logs. The record
+        also carries the line's values, typed, as its `kicak` attribute, for structured (e.g.
+        JSON) log handlers. A delivery that was not decoded is named as its dead-letter line
+        names it: by the accepted class its `type` property names, or None, and its sender's
+        `message_id` property.
+        """
+        finished_at = _monotonic()
+        if delivery is None:
+            sent_type = _sent_type(properties)
+            accepted = None if sent_type is None else self._accepted_types.get(sent_type)
+            type_name = None if accepted is None else accepted.__name__
+            message_id = _sent_message_id(properties)
+            attempts = 0
+        else:
+            type_name = type(delivery.message).__name__
+            message_id = delivery.message.message_id
+            attempts = delivery.attempt
+        logged_outcome, reason = _logged_outcome(outcome)
+        settle_started_at = handling.settle_started_at
+        seconds = handling.seconds
+        fields: dict[str, object] = {
+            "outcome": logged_outcome,
+            "reason": reason,
+            "type": type_name,
+            "id": message_id,
+            "queue": self._source_queue,
+            "delivery_tag": delivery_tag,
+            "redelivered": redelivered,
+            "retry_round": _retry_round_of(None if properties is None else properties.headers),
+            "attempts": attempts,
+            "results": handling.results,
+            "total_seconds": finished_at - handling.started_at,
+            "execute_seconds": seconds[_TimedPart.EXECUTE],
+            "backoff_seconds": seconds[_TimedPart.BACKOFF],
+            "publish_seconds": seconds[_TimedPart.PUBLISH],
+            "held_seconds": seconds[_TimedPart.HELD],
+            "settle_seconds": 0.0 if settle_started_at is None else finished_at - settle_started_at,
+        }
+        logger.info(
+            _HANDLED_LINE, *fields.values(), extra={"kicak": {"event": "message_handled", **fields}}
+        )
 
     def _process_delivery(
         self,
@@ -1530,6 +1703,7 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
             publications = self._prepare_publications(
                 self._execute_with_retries(message, message_id)
             )
+            self._handling.results = len(publications)
         except MalformedMessageError as error:
             logger.exception(
                 "Message dead-lettered type=%s id=%s queue=%s delivery_tag=%i "
@@ -1656,6 +1830,7 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
         reconnect, and RabbitMQ redelivers the message. RabbitMQ refusing to declare the retry
         queue is raised.
         """
+        self._handling.start_settling()
         original = properties if properties is not None else pika.BasicProperties()
         headers = _retry_headers(original.headers, _now())
         copy_properties = self._copy_properties(
@@ -1748,6 +1923,7 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
         reconnect, and RabbitMQ redelivers the message. RabbitMQ refusing to declare the
         dead-letter route is raised.
         """
+        self._handling.start_settling()
         original = properties if properties is not None else pika.BasicProperties()
         headers = _dead_letter_headers(original.headers, reason, error, self._source_queue, _now())
         copy_properties = self._copy_properties(
@@ -1853,6 +2029,7 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
         itself, so the settlement is not retried, nor recorded, and the caller must reconnect.
         Other errors are raised.
         """
+        self._handling.start_settling()
         requeue = outcome is _Outcome.REQUEUED
         if requeue:
             action = "requeueing"
@@ -1968,7 +2145,8 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
             )
             self._set_attempt(attempt)
             try:
-                return self.execute(message)
+                with self._handling.timing(_TimedPart.EXECUTE):
+                    return self.execute(message)
             except TransientProcessingError as error:
                 if attempt == self._max_processing_attempts:
                     raise
@@ -1982,7 +2160,8 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
                     delay_seconds,
                     error,
                 )
-                time.sleep(delay_seconds)
+                with self._handling.timing(_TimedPart.BACKOFF):
+                    time.sleep(delay_seconds)
         raise RuntimeError("Processing retry loop exited unexpectedly")
 
     def _prepare_publications(self, results: object) -> list[tuple[str, KicakMessage, bytes]]:
@@ -2040,10 +2219,12 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
         takes the input back during the hold, closing its channel or cancelling the consumer,
         e.g. on `consumer_timeout`.
         """
+        handling = self._handling
         attempt = 0
         while True:
             try:
-                self._publish_results(publications)
+                with handling.timing(_TimedPart.PUBLISH):
+                    self._publish_results(publications)
             except UnroutableError as error:
                 delay_seconds = _capped_backoff_seconds(attempt) * random.random()
                 attempt += 1
@@ -2056,7 +2237,9 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
                     self._destination_exchange,
                     delay_seconds,
                 )
-                if not self._hold_delivery(delay_seconds):
+                with handling.timing(_TimedPart.HELD):
+                    held = self._hold_delivery(delay_seconds)
+                if not held:
                     return False
             else:
                 self._set_activity(ExecutorStatus.SENDING_RESULT)
