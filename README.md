@@ -42,6 +42,11 @@ A message is processed more than once when:
   as often as the failure lasts; if the Executor loses its connection between putting the message
   into the retry queue and acknowledging it, it is executed once more on top (see
   [Retry queue](#retry-queue));
+- an Executor dead-letters a message, and loses its connection, or `consumer_timeout` takes the
+  message back, between putting a copy of it into the dead-letter queue and acknowledging it, so
+  the message is executed again: it may be dead-lettered a second time, or succeed and be in the
+  dead-letter queue and processed (see [Dead-letter queue](#dead-letter-queue)); and if RabbitMQ
+  does not take the copy, the Executor requeues the message, which is executed again;
 - an Executor holds results that RabbitMQ returned as unroutable (see
   [Unroutable results are held](#unroutable-results-are-held)), and `stop()` is called, so it
   requeues the input, or the connection is lost or `consumer_timeout` expires meanwhile, so
@@ -257,7 +262,8 @@ publish them to the upstream Executor's `source_exchange`, with that queue in it
 
 **Dead-letter names follow a convention.** The input queue's `x-dead-letter-exchange` argument is
 `<queue>.dlx`, a durable fanout exchange, and the durable dead-letter queue `<queue>.dlq` is bound
-to it, so rejected messages are kept for inspection or replay. For the queue `classifier`, these are
+to it, so dead-lettered messages are kept for inspection or replay (see
+[Dead-letter queue](#dead-letter-queue)). For the queue `classifier`, these are
 `classifier.dlx` and `classifier.dlq`. Only the queue's own Executor declares them. Because every
 input queue's arguments follow from its name and `queue_type` alone, any Executor can declare a
 queue exactly as the queue's own Executor does, which is what lets an upstream Executor restore a
@@ -337,9 +343,10 @@ restores whatever was deleted. That is logged only at `DEBUG`.
 - **Right before publishing the results** of each message: the output side, on the results
   channel. So a downstream queue, binding, or destination exchange deleted since is restored
   before the results are published, and none of the queues misses them.
-- **Right before rejecting a message**: the dead-letter route. RabbitMQ drops a message
-  dead-lettered into an exchange that does not exist, and a quorum queue also dead-letters a
-  requeued message once it reaches its delivery limit.
+- **Right before dead-lettering or requeueing a message**: the dead-letter route. The copy of a
+  dead-lettered message is published to the dead-letter exchange, and a quorum queue dead-letters
+  a requeued message once it reaches its delivery limit; RabbitMQ drops a message it dead-letters
+  into an exchange that does not exist.
 - **Right before moving a message to the retry queue**: the retry queue.
 
 The input side is the input queue, its binding to the source exchange, the dead-letter route, and
@@ -749,7 +756,7 @@ that decides what happens to the message and to the Executor:
 | --- | --- | --- |
 | returns | its results are published, then it is acknowledged | continues |
 | raises `TransientProcessingError`: the failure may clear, e.g. a service is down, times out, or limits your rate | `execute()` is called again, up to `max_processing_attempts` times; if it still fails, the message is moved to the **retry queue**, not dead-lettered, and executed again after `retry_delay_seconds` (10 by default), as often as needed (see [Retry queue](#retry-queue)) | continues |
-| raises `MalformedMessageError`: the message can never succeed, e.g. its content is invalid | **dead-lettered** to `<queue>.dlq` at once, without another attempt | continues |
+| raises `MalformedMessageError`: the message can never succeed, e.g. its content is invalid | **dead-lettered** to `<queue>.dlq` at once, without another attempt, with headers saying why (see [Dead-letter queue](#dead-letter-queue)) | continues |
 | raises **any other exception**: treated as a bug | dead-lettered, so it cannot block the queue | **stops**: `run()` raises the exception, and the status is `"CRASHED"` |
 | raises a `BaseException` such as `KeyboardInterrupt` or `SystemExit` | not settled; RabbitMQ requeues it | stops at once, in the middle of `execute()`: `run()` raises it, and the status is `"CRASHED"` |
 
@@ -865,6 +872,70 @@ message instead and logs an `ERROR`; RabbitMQ then delivers it again at once. Ra
 declare the retry queue, for example with `406 PRECONDITION_FAILED` because a queue of that name
 exists with other arguments, stops the Executor.
 
+### Dead-letter queue
+
+A dead-lettered message is kept in `<queue>.dlq` together with the reason it is there, so it can be
+looked into without searching the logs:
+
+```text
+classifier ──► Executor ── malformed, a bug, or a result too large ──► classifier.dlx ──► classifier.dlq
+```
+
+1. The Executor publishes a copy of the message to the dead-letter exchange `<queue>.dlx`, right
+   after declaring the dead-letter route again, and acknowledges the original only after RabbitMQ
+   has confirmed the copy.
+2. Every queue bound to `<queue>.dlx` receives the copy: `<queue>.dlq`, and any queue you bind to
+   it yourself, for example one that raises alerts.
+
+The copy keeps the body, the `message_id` property exactly as the message arrived, so it is found by
+the same ID, and the other properties, its `type` included, so it can be replayed as the same version
+of the message. It keeps the message's headers, its retry headers `x-kicak-retry-round` and
+`x-kicak-retrying-since` included, as its history, except the headers RabbitMQ manages itself. It
+never expires. Its `user_id` becomes the Executor's own user, while its `x-kicak-original-publisher`
+header keeps naming the agent that created the message (see
+[Who published a message](#who-published-a-message)). It also gets headers that say why, when, and
+from where:
+
+| Header | Value |
+| --- | --- |
+| `x-kicak-dead-letter-reason` | `malformed`: a `MalformedMessageError`, raised by `execute()`, or by the Executor for a message it cannot decode or whose results are invalid; `unexpected-error`: any other exception, treated as a bug, which also stopped the Executor; `result-too-large`: RabbitMQ refused one of its results as larger than its `max_message_size` |
+| `x-kicak-error-type` | the class of the exception with its module, e.g. `pykicak.executor.MalformedMessageError` or `myapp.errors.InvoiceError`; a built-in one without it, e.g. `KeyError` |
+| `x-kicak-error-message` | the text of the exception, at most 1024 bytes of UTF-8; a longer one is cut and ends with `…` |
+| `x-kicak-dead-lettered-at` | when the message was dead-lettered, in ISO 8601 and UTC |
+| `x-kicak-dead-lettered-from` | the queue it was taken from |
+
+The error text travels with the message: whoever can read the dead-letter queue, for example in
+RabbitMQ's management UI, can read it. The library's own texts hold no values from the message, but
+the texts of your exceptions, and of the libraries you call, hold whatever they were given. Keep
+secrets out of them, as out of your logs, where the Executor writes the same error.
+
+**Messages RabbitMQ dead-letters itself.** A quorum queue dead-letters a message that reached its
+delivery limit (see [Queue type](#queue-type)), and a queue with a length limit or a message TTL set
+by a policy dead-letters the messages it drops. RabbitMQ routes them through the same
+`<queue>.dlx`, with its own `x-death` header recording the queue and the reason, for example
+`delivery_limit`, and without the headers above. The Executor's copies have no `x-death`, because
+RabbitMQ did not dead-letter them. So read `x-kicak-dead-letter-reason` first, and `x-death` when
+it is missing.
+
+**A message can be both in the dead-letter queue and processed.** If the connection is lost, or
+RabbitMQ's `consumer_timeout` takes the message back, after RabbitMQ has confirmed the copy but
+before the Executor acknowledges the original, RabbitMQ redelivers the original, which is executed
+again. It may then be dead-lettered again, leaving two copies, or succeed, for example once a bug is
+fixed. Replaying a message from the dead-letter queue is safe because agents are idempotent (see
+[Requirement: idempotent processing](#requirement-idempotent-processing)). A replayed message still
+carries the headers above; the Executor drops them from every copy it makes, so a later move to the
+retry queue or the dead-letter queue never shows a stale reason.
+
+**When the copy cannot be placed.** If RabbitMQ returns the copy as unroutable, because the
+dead-letter queue or its binding was deleted right after the Executor declared them, or refuses it,
+for example because the dead-letter queue is full and refuses new messages, the Executor requeues the
+message instead and logs an `ERROR`; RabbitMQ then delivers it again at once. Rejecting it for
+RabbitMQ to dead-letter would not help: RabbitMQ dead-letters a rejected message at most once and
+drops it, telling nobody, when no queue takes it. RabbitMQ refusing to declare the dead-letter route,
+or refusing the copy in another way, for example with `403 ACCESS_REFUSED`, stops the Executor.
+After an unexpected failure, the Executor stops either way, and raises that failure, not the error
+of the copy.
+
 ### Every outcome of a delivery
 
 The Executor decides the outcome of every delivery from how `execute()` ends, and from what RabbitMQ
@@ -873,14 +944,14 @@ reports while the results are published and the message is settled:
 | Outcome | Cause | Delivery is… | Executor |
 | --- | --- | --- | --- |
 | Success | `execute()` returns | results published in one transaction, then acknowledged | continues |
-| Deterministic failure | a `type` property that is missing or names a type the Executor does not accept, missing body, undecodable body (not JSON, `NaN` and `Infinity` included, a number too large for a float, nested too deeply to decode, not a JSON object, missing or unexpected fields, no valid `message_id`, refused by the message class's `__post_init__` with any exception), `MalformedMessageError` raised by `execute()`, or results returned by `execute()` that are not `KicakMessage`s or cannot be serialized | rejected with `basic_nack(requeue=False)`, so RabbitMQ routes it to the dead-letter exchange | continues |
+| Deterministic failure | a `type` property that is missing or names a type the Executor does not accept, missing body, undecodable body (not JSON, `NaN` and `Infinity` included, a number too large for a float, nested too deeply to decode, not a JSON object, missing or unexpected fields, no valid `message_id`, refused by the message class's `__post_init__` with any exception), `MalformedMessageError` raised by `execute()`, or results returned by `execute()` that are not `KicakMessage`s or cannot be serialized | dead-lettered: copied to the dead-letter exchange with headers saying why, and acknowledged once RabbitMQ has confirmed the copy; if RabbitMQ does not take the copy (returns it as unroutable, or refuses it), requeued with `basic_nack(requeue=True)` and logged at `ERROR` (see [Dead-letter queue](#dead-letter-queue)) | continues; RabbitMQ refusing to declare the dead-letter route stops it |
 | Transient failure | `TransientProcessingError` raised by `execute()` | retried in-process; if every attempt fails, copied to the retry queue and acknowledged once RabbitMQ has confirmed the copy; if RabbitMQ does not take the copy (returns it as unroutable, or refuses it), requeued with `basic_nack(requeue=True)` and logged at `ERROR` | continues; RabbitMQ refusing to declare the retry queue stops it |
 | Unexpected failure | any other exception from `execute()`, results of another class than the declared result type, or results returned by a terminator | dead-lettered as above | logs the error and raises it, stopping |
 | Results returned as unroutable | `UnroutableError`: no queue was bound to the destination exchange when the results were committed, although the output side was just verified | held, unacknowledged, with its results; the message is not at fault | logs an `ERROR`, waits (0.5 seconds, doubling up to 30, with jitter), verifies the output side, and publishes the results again, without executing the message again (see [Unroutable results are held](#unroutable-results-are-held)) |
 | Result too large | RabbitMQ refuses a result larger than its `max_message_size` (16 MiB by default in RabbitMQ 4) | dead-lettered as above; RabbitMQ discards the whole transaction, so none of its results is published | continues |
 | Results not committed | another error while verifying the output side, publishing, or committing the results, e.g. RabbitMQ refusing a declaration (`406`, `403`) or the commit | requeued by RabbitMQ when the connection closes | logs the error and raises it, stopping |
 | Connection lost while publishing results | a transient connection error while verifying the output side, before or during the commit, or while the results are held, or RabbitMQ having already taken the message back because it outlasted `consumer_timeout` (closing its channel, or cancelling the consumer on RabbitMQ 4.3 and newer) | already requeued by RabbitMQ when the connection or channel closed; uncommitted results are discarded by RabbitMQ, not re-sent | reconnects and receives the message again |
-| Connection lost while settling | a transient connection error from the acknowledgement or rejection, the declaration of the dead-letter route before a rejection included, or from moving the message to the retry queue, or RabbitMQ taking the message back because it outlasted `consumer_timeout` (closing its channel, or cancelling the consumer on RabbitMQ 4.3 and newer, which then ignores the settlement) | requeued by RabbitMQ when the connection or channel closed, instead of being acknowledged, requeued, or dead-lettered | reconnects and receives the message again; after an unexpected failure, still raises that error and stops |
+| Connection lost while settling | a transient connection error from the acknowledgement or a requeue, or from moving the message to the dead-letter queue or the retry queue, the declarations before them included, or RabbitMQ taking the message back because it outlasted `consumer_timeout` (closing its channel, or cancelling the consumer on RabbitMQ 4.3 and newer, which then ignores the settlement) | requeued by RabbitMQ when the connection or channel closed, instead of being acknowledged, requeued, or dead-lettered | reconnects and receives the message again; after an unexpected failure, still raises that error and stops |
 | Input side not verified | between messages: a transient connection error, or RabbitMQ refusing a declaration of the input side | no message is held | reconnects; after a refusal, logs the error and raises it, stopping |
 
 Results returned by a terminator, whose `execute()` must return `None`, are an unexpected failure
@@ -902,9 +973,8 @@ and the Executor continues. None of that input's results is published.
 `TransientProcessingError`, with 0.5- and 1.0-second delays that double up to a 30-second cap, and
 the message then goes to the retry queue (see [Retry queue](#retry-queue)).
 
-Dead-lettered messages keep their original body. RabbitMQ adds an `x-death` header recording the
-source queue and the reason: `rejected` when the Executor rejected the message, which it logs at
-`ERROR` level, or `delivery_limit` when a quorum queue's delivery limit was reached.
+Every dead-lettered message is logged at `ERROR`, and its copy in `<queue>.dlq` keeps its original
+body and says why it is there (see [Dead-letter queue](#dead-letter-queue)).
 
 ### Unroutable results are held
 
@@ -1129,16 +1199,17 @@ Consider these when choosing the value:
   classic and quorum queues alike. RabbitMQ 4.3 and newer evaluate the timeout for quorum queues
   only, and cancel the consumer, keeping its channel open; classic queues no longer have a consumer
   timeout. Either way the Executor reacts as to an expired heartbeat: it does not commit the
-  results of that message or move it to the retry queue, logs a `WARNING`, reconnects, and
-  executes the message again. Only if RabbitMQ takes the message back while the results are being
-  committed are they published, and then published again after the redelivery. If processing can
+  results of that message or move it to the retry queue or the dead-letter queue, logs a
+  `WARNING`, reconnects, and executes the message again. Only if RabbitMQ takes the message back
+  while the results are being committed are they published, and then published again after the
+  redelivery. If processing can
   take longer than `consumer_timeout`, raise `consumer_timeout` on the broker as well;
   `heartbeat_seconds` alone is not enough.
 - **On RabbitMQ 4.3 and newer, the Executor relies on an internal pika hook** to notice the
   cancellation while it processes the message, because pika reports a cancelled consumer of its
   `consume()` generator only later. If a pika version lacks the hook, the Executor logs a
   `WARNING` whenever it starts consuming; a timed-out message is then still executed again, but
-  its results or its retry-queue copy may be published twice.
+  its results or its copy for the retry queue or the dead-letter queue may be published twice.
 - AMQP limits the value to 1–65535 seconds, and it must be an `int`. `None` raises `TypeError`:
   it would accept the broker's proposal, 60 seconds by default, which a long `execute()` outlasts.
   Injectors keep the broker's default: they hold a connection only while publishing one message, so
@@ -1241,20 +1312,21 @@ Every message a pykicak agent publishes names two RabbitMQ users:
 | `x-kicak-original-publisher` header | the agent that created the message | only as far as the clients that may publish to your exchanges: RabbitMQ does not check headers |
 
 An agent's user is `RABBIT_MQ_USERNAME` from its configuration. The two names differ only on a
-copy that an Executor moves to its retry queue: the copy keeps the header of the message it copies,
-while its `user_id` becomes the Executor's. Every other message is created by the agent that
-publishes it, so it names that agent twice: an Injector's message names the Injector, and an
-Executor's result names the Executor, whoever created its input. For example:
+copy that an Executor moves to its retry queue or its dead-letter queue: the copy keeps the header
+of the message it copies, while its `user_id` becomes the Executor's. Every other message is created
+by the agent that publishes it, so it names that agent twice: an Injector's message names the
+Injector, and an Executor's result names the Executor, whoever created its input. For example:
 
 ```text
 Injector "loader" injects message M        user_id=loader  x-kicak-original-publisher=loader
 Executor "parser" moves M to its retry     user_id=parser  x-kicak-original-publisher=loader
+Executor "parser" dead-letters M           user_id=parser  x-kicak-original-publisher=loader
 Executor "parser" publishes result R of M  user_id=parser  x-kicak-original-publisher=parser
 ```
 
-A message that another client published without the header was created by that client: a retry
-copy of it names the client's `user_id` in the header, if the client set one, and has no such
-header otherwise.
+A message that another client published without the header was created by that client: a copy of
+it names the client's `user_id` in the header, if the client set one, and has no such header
+otherwise.
 
 ## Retries and logging
 

@@ -864,7 +864,7 @@ def test_run_does_not_verify_the_output_side_without_results(config):
     ],
     ids=["dead-letter", "unexpected-error"],
 )
-def test_run_declares_the_dead_letter_route_right_before_rejecting(config, body, handler):
+def test_run_declares_the_dead_letter_route_right_before_dead_lettering(config, body, handler):
     channel = DeclarationRecordingChannel()
     executor = make_executor(config, channel, handler=handler)
     channel.queue_deliveries(body)
@@ -872,10 +872,11 @@ def test_run_declares_the_dead_letter_route_right_before_rejecting(config, body,
     with pytest.raises((StopConsuming, ZeroDivisionError)):
         executor.run()
 
-    assert channel.operations[: len(INPUT_SIDE) + len(DEAD_LETTER_ROUTE) + 1] == [
+    assert channel.operations[: len(INPUT_SIDE) + len(DEAD_LETTER_ROUTE) + 2] == [
         *INPUT_SIDE,
         *DEAD_LETTER_ROUTE,
-        "nack 1 requeue=False",
+        "publish input-queue.dlx",
+        "ack 1",
     ]
 
 
@@ -1098,6 +1099,29 @@ def test_run_acknowledges_without_publishing_when_execute_returns_none(config):
 # --- deterministic failures: dead-letter and continue ---------------------------------------
 
 
+def dead_letter_copies(channel: FakeChannel) -> list[PublishedMessage]:
+    """The messages published to the dead-letter exchange of the default TOPOLOGY."""
+    return [
+        published
+        for published in channel.published_messages
+        if published.exchange == "input-queue.dlx"
+    ]
+
+
+def dead_lettered(channel: FakeChannel) -> list[int]:
+    """The delivery tags acknowledged right after a copy went to the dead-letter exchange.
+
+    The executor dead-letters a delivery by publishing a copy of it to the dead-letter exchange of
+    the default TOPOLOGY and acknowledging it once RabbitMQ has confirmed the copy.
+    """
+    operations = channel.operations
+    return [
+        int(operation.removeprefix("ack "))
+        for previous, operation in zip(operations, operations[1:], strict=False)
+        if previous == "publish input-queue.dlx" and operation.startswith("ack ")
+    ]
+
+
 def test_run_dead_letters_undecodable_message_and_continues(config, caplog):
     channel = FakeChannel()
     executor = make_executor(config, channel)
@@ -1109,8 +1133,8 @@ def test_run_dead_letters_undecodable_message_and_continues(config, caplog):
 
     run_until_stopped(executor)
 
-    assert channel.nacked_deliveries == [NackedDelivery(delivery_tag=1, requeue=False)]
-    assert channel.acked_delivery_tags == [2]
+    assert dead_lettered(channel) == [1]
+    assert channel.acked_delivery_tags == [1, 2]
     assert executor.processed_messages == [valid]
     dead_letter_records = [r for r in caplog.records if "Message dead-lettered" in r.message]
     assert len(dead_letter_records) == 1
@@ -1145,7 +1169,7 @@ def test_undecodable_delivery_is_logged_with_the_sent_message_id(
 
     run_until_stopped(executor)
 
-    assert channel.nacked_deliveries == [NackedDelivery(delivery_tag=1, requeue=False)]
+    assert dead_lettered(channel) == [1]
     [record] = [r for r in caplog.records if "Message dead-lettered" in r.message]
     assert f"type=SampleMessage id={logged_id} queue=" in record.message
 
@@ -1178,8 +1202,8 @@ def test_run_dead_letters_json_nested_too_deeply_and_continues(config):
 
     run_until_stopped(executor)
 
-    assert channel.nacked_deliveries == [NackedDelivery(delivery_tag=1, requeue=False)]
-    assert channel.acked_delivery_tags == [2]
+    assert dead_lettered(channel) == [1]
+    assert channel.acked_delivery_tags == [1, 2]
     assert executor.processed_messages == [valid]
 
 
@@ -1200,8 +1224,8 @@ def test_run_dead_letters_message_its_class_refuses_with_any_exception_and_conti
 
     run_until_stopped(executor)
 
-    assert channel.nacked_deliveries == [NackedDelivery(delivery_tag=1, requeue=False)]
-    assert channel.acked_delivery_tags == [2]
+    assert dead_lettered(channel) == [1]
+    assert channel.acked_delivery_tags == [1, 2]
     assert executor.processed_messages == [valid]
     assert "Message dead-lettered type=ValidatedMessage id=bad" in caplog.text
     assert "text must not be 'invalid'" in caplog.text
@@ -1448,8 +1472,8 @@ def test_run_dead_letters_a_delivery_whose_type_is_not_accepted_and_continues(
 
     run_until_stopped(executor)
 
-    assert channel.nacked_deliveries == [NackedDelivery(delivery_tag=1, requeue=False)]
-    assert channel.acked_delivery_tags == [2]
+    assert dead_lettered(channel) == [1]
+    assert channel.acked_delivery_tags == [1, 2]
     assert executor.processed_messages == [accepted]
     [record] = [r for r in caplog.records if "Message dead-lettered" in r.message]
     assert record.levelname == "ERROR"
@@ -1501,8 +1525,8 @@ def test_run_dead_letters_and_raises_when_a_result_is_not_of_the_declared_type(
         executor.run()
 
     # A bug in the executor's own code: nothing of the input's results is published
-    assert channel.published_messages == []
-    assert channel.nacked_deliveries == [NackedDelivery(delivery_tag=1, requeue=False)]
+    assert channel.published_messages == dead_letter_copies(channel)
+    assert dead_lettered(channel) == [1]
     assert len(executor.processed_messages) == 1
     assert executor.get_info().status == ExecutorStatus.CRASHED
     assert "failed unexpectedly type=SampleMessage id=input" in caplog.text
@@ -1516,7 +1540,7 @@ def test_run_dead_letters_message_with_unexpected_fields(config):
 
     run_until_stopped(executor)
 
-    assert channel.nacked_deliveries == [NackedDelivery(delivery_tag=1, requeue=False)]
+    assert dead_lettered(channel) == [1]
     assert executor.processed_messages == []
 
 
@@ -1536,8 +1560,8 @@ def test_run_dead_letters_message_without_valid_message_id_and_continues(config,
 
     run_until_stopped(executor)
 
-    assert channel.nacked_deliveries == [NackedDelivery(delivery_tag=1, requeue=False)]
-    assert channel.acked_delivery_tags == [2]
+    assert dead_lettered(channel) == [1]
+    assert channel.acked_delivery_tags == [1, 2]
     assert executor.processed_messages == [SampleMessage(message_id="valid", text="valid")]
 
 
@@ -1548,8 +1572,8 @@ def test_run_dead_letters_message_without_body(config):
 
     run_until_stopped(executor)
 
-    assert channel.nacked_deliveries == [NackedDelivery(delivery_tag=1, requeue=False)]
-    assert channel.acked_delivery_tags == []
+    assert dead_lettered(channel) == [1]
+    assert dead_letter_copies(channel)[0].body == b""
 
 
 def test_run_dead_letters_message_rejected_by_execute_without_publishing(config):
@@ -1564,9 +1588,8 @@ def test_run_dead_letters_message_rejected_by_execute_without_publishing(config)
 
     run_until_stopped(executor)
 
-    assert channel.nacked_deliveries == [NackedDelivery(delivery_tag=1, requeue=False)]
-    assert channel.published_messages == []
-    assert channel.acked_delivery_tags == []
+    assert dead_lettered(channel) == [1]
+    assert channel.published_messages == dead_letter_copies(channel)
 
 
 # --- transient failures: retry, then the retry queue ----------------------------------------------
@@ -1766,15 +1789,20 @@ def test_invalid_retry_headers_start_again(config, sleeps, clock, headers, expec
     assert copy_headers[name] == expected
 
 
-class RetryRefusingChannel(FakeChannel):
-    """Consuming channel whose publishes to the retry queue raise `error` (confirm mode)."""
+class CopyRefusingChannel(FakeChannel):
+    """Consuming channel (confirm mode) whose publishes of copies raise `error`.
 
-    def __init__(self, error: Exception) -> None:
+    The copies to `target`: the retry queue of the default TOPOLOGY, routed by its name through
+    the default exchange, or its dead-letter exchange.
+    """
+
+    def __init__(self, error: Exception, target: str = "input-queue.retry") -> None:
         super().__init__()
         self._error = error
+        self._target = target
 
     def basic_publish(self, exchange, routing_key, body, properties=None, mandatory=False):
-        if routing_key == "input-queue.retry":
+        if self._target in (exchange, routing_key):
             if isinstance(self._error, StreamLostError):
                 self.is_open = False
             raise self._error
@@ -1789,7 +1817,7 @@ class RetryRefusingChannel(FakeChannel):
 def test_run_requeues_the_message_when_rabbitmq_does_not_take_its_retry_copy(
     config, sleeps, caplog, error
 ):
-    channel = RetryRefusingChannel(error)
+    channel = CopyRefusingChannel(error)
     executor = make_executor(config, channel, handler=unavailable)
     channel.queue_deliveries(SampleMessage(message_id="input", text="input").to_bytes())
 
@@ -1805,7 +1833,7 @@ def test_run_reconnects_when_the_connection_is_lost_while_moving_to_the_retry_qu
     config, monkeypatch, sleeps
 ):
     body = SampleMessage(message_id="input", text="input").to_bytes()
-    original_channel = RetryRefusingChannel(StreamLostError("connection lost"))
+    original_channel = CopyRefusingChannel(StreamLostError("connection lost"))
     replacement_channel = FakeChannel()
     original_channel.queue_deliveries(body)
     replacement_channel.queue_deliveries(body)  # RabbitMQ's redelivery
@@ -1904,6 +1932,293 @@ def test_stop_during_transient_retries_still_moves_the_message_to_the_retry_queu
     assert executor.get_info().status == ExecutorStatus.STOPPED
 
 
+# --- dead-letter copies: why, when, and from which queue ------------------------------------
+
+
+def test_dead_letter_copy_records_why_when_and_from_which_queue(config, clock):
+    def reject(_message):
+        raise MalformedMessageError("fails application validation")
+
+    channel = FakeChannel()
+    executor = make_executor(config, channel, handler=reject)
+    received = pika.BasicProperties(
+        type=SAMPLE_TYPE,
+        content_type="application/json",
+        correlation_id="flow-7",
+        message_id="property-id",
+        user_id="publisher",
+        expiration="5000",
+        headers={
+            "tenant": "acme",
+            "x-death": [{"queue": "input-queue.retry", "reason": "expired", "count": 1}],
+            "x-delivery-count": 3,
+            "x-first-death-queue": "input-queue.retry",
+            "x-kicak-retry-round": 2,
+            "x-kicak-retrying-since": "2026-09-30T08:00:00+00:00",
+        },
+    )
+    body = SampleMessage(message_id="body-id", text="input").to_bytes()
+    channel.queue_deliveries(body, properties=received)
+
+    run_until_stopped(executor)
+
+    [copy] = dead_letter_copies(channel)
+    assert copy.routing_key == ""
+    assert copy.mandatory is True
+    assert copy.body == body
+    properties = copy.properties
+    assert properties.headers == {
+        "tenant": "acme",
+        # Its history: how often it was moved to the retry queue before
+        "x-kicak-retry-round": 2,
+        "x-kicak-retrying-since": "2026-09-30T08:00:00+00:00",
+        "x-kicak-dead-letter-reason": "malformed",
+        "x-kicak-error-type": "pykicak.executor.MalformedMessageError",
+        "x-kicak-error-message": "fails application validation",
+        "x-kicak-dead-lettered-at": "2026-10-01T12:00:00+00:00",
+        "x-kicak-dead-lettered-from": "input-queue",
+        # The original user_id, which RabbitMQ would refuse from this executor's user
+        "x-kicak-original-publisher": "publisher",
+    }
+    # The message_id property as the delivery had it, so the copy is found by the same ID
+    assert properties.message_id == "property-id"
+    assert properties.user_id == "guest"  # the executor's own user, from CONNECTION_VALUES
+    assert properties.expiration is None  # it must not expire in the dead-letter queue
+    assert properties.delivery_mode == 2
+    assert properties.type == SAMPLE_TYPE
+    assert properties.content_type == "application/json"
+    assert properties.correlation_id == "flow-7"
+
+
+class UnprintableError(Exception):
+    def __str__(self) -> str:
+        raise RuntimeError("cannot describe this error")
+
+
+def raise_error(error: Exception):
+    """execute() handler raising `error`."""
+
+    def handler(_message):
+        raise error
+
+    return handler
+
+
+@pytest.mark.parametrize(
+    ("body", "handler", "reason", "error_type", "error_message"),
+    [
+        (
+            b"not json",
+            None,
+            "malformed",
+            "pykicak.executor.MalformedMessageError",
+            "Could not decode message as SampleMessage: ",
+        ),
+        (
+            SampleMessage(message_id="input", text="input").to_bytes(),
+            lambda _message: 1 / 0,
+            "unexpected-error",
+            "ZeroDivisionError",
+            "division by zero",
+        ),
+        (
+            SampleMessage(message_id="input", text="input").to_bytes(),
+            raise_error(InvalidTextError("text is invalid")),
+            "unexpected-error",
+            "tests.test_executor.InvalidTextError",
+            "text is invalid",
+        ),
+        (
+            SampleMessage(message_id="input", text="input").to_bytes(),
+            raise_error(UnprintableError()),
+            "unexpected-error",
+            "tests.test_executor.UnprintableError",
+            "<exception str() failed>",
+        ),
+    ],
+    ids=["malformed", "builtin-error", "application-error", "unprintable-error"],
+)
+def test_dead_letter_copy_names_the_reason_and_the_error(
+    config, body, handler, reason, error_type, error_message
+):
+    channel = FakeChannel()
+    executor = make_executor(config, channel, handler=handler)
+    channel.queue_deliveries(body)
+
+    with pytest.raises((StopConsuming, ZeroDivisionError, InvalidTextError, UnprintableError)):
+        executor.run()
+
+    assert dead_lettered(channel) == [1]
+    headers = dead_letter_copies(channel)[0].properties.headers
+    assert headers["x-kicak-dead-letter-reason"] == reason
+    assert headers["x-kicak-error-type"] == error_type
+    assert headers["x-kicak-error-message"].startswith(error_message)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("q" * 1024, "q" * 1024),
+        ("q" * 1025, "q" * 1021 + "…"),
+        # 2000 bytes, cut between the two bytes of a character, which is dropped
+        ("ł" * 1000, "ł" * 510 + "…"),
+        # A lone surrogate, e.g. from the JSON string "\ud800", cannot be encoded in UTF-8
+        ("text \ud800 here", "text ? here"),
+    ],
+    ids=["fits", "too-long", "too-long-multibyte", "lone-surrogate"],
+)
+def test_dead_letter_copy_carries_at_most_1024_bytes_of_utf8_error_text(config, text, expected):
+    channel = FakeChannel()
+    executor = make_executor(config, channel, handler=raise_error(MalformedMessageError(text)))
+    channel.queue_deliveries(SampleMessage(message_id="input", text="input").to_bytes())
+
+    run_until_stopped(executor)
+
+    [copy] = dead_letter_copies(channel)
+    assert copy.properties.headers["x-kicak-error-message"] == expected
+    assert len(expected.encode("utf-8")) <= 1024
+    copy.properties.encode()  # pika can send it
+
+
+def test_dead_letter_copy_of_a_delivery_without_body_or_message_id(config, clock):
+    channel = FakeChannel()
+    executor = make_executor(config, channel)
+    channel.queue_deliveries(None)
+
+    run_until_stopped(executor)
+
+    [copy] = dead_letter_copies(channel)
+    assert copy.body == b""
+    assert copy.properties.message_id is None
+    assert copy.properties.headers == {
+        "x-kicak-dead-letter-reason": "malformed",
+        "x-kicak-error-type": "pykicak.executor.MalformedMessageError",
+        "x-kicak-error-message": "Received a message with no body",
+        "x-kicak-dead-lettered-at": "2026-10-01T12:00:00+00:00",
+        "x-kicak-dead-lettered-from": "input-queue",
+    }
+
+
+def test_retry_copy_of_a_replayed_message_drops_its_dead_letter_headers(config, sleeps, clock):
+    channel = FakeChannel()
+    executor = make_executor(config, channel, handler=unavailable)
+    replayed = pika.BasicProperties(
+        type=SAMPLE_TYPE,
+        headers={
+            "tenant": "acme",
+            "x-kicak-dead-letter-reason": "unexpected-error",
+            "x-kicak-error-type": "KeyError",
+            "x-kicak-error-message": "'text'",
+            "x-kicak-dead-lettered-at": "2026-09-30T08:00:00+00:00",
+            "x-kicak-dead-lettered-from": "input-queue",
+        },
+    )
+    channel.queue_deliveries(
+        SampleMessage(message_id="input", text="input").to_bytes(), properties=replayed
+    )
+
+    run_until_stopped(executor)
+
+    assert retry_copies(channel)[0].properties.headers == {
+        "tenant": "acme",
+        "x-kicak-retry-round": 1,
+        "x-kicak-retrying-since": "2026-10-01T12:00:00+00:00",
+    }
+
+
+@pytest.mark.parametrize(
+    "error",
+    [UnroutableError([]), NackError([])],
+    ids=["unroutable", "refused"],
+)
+def test_run_requeues_the_message_when_rabbitmq_does_not_take_its_dead_letter_copy(
+    config, caplog, error
+):
+    channel = CopyRefusingChannel(error, target="input-queue.dlx")
+    executor = make_executor(config, channel)
+    channel.queue_deliveries(b"not json")
+
+    run_until_stopped(executor)  # continues with the next message
+
+    # Never rejected without requeueing, which RabbitMQ may drop when no queue takes it
+    assert channel.nacked_deliveries == [NackedDelivery(delivery_tag=1, requeue=True)]
+    assert channel.acked_delivery_tags == []
+    errors = [r for r in caplog.records if "could not be dead-lettered to" in r.message]
+    assert [record.levelname for record in errors] == ["ERROR"]
+
+
+def test_run_requeues_and_raises_when_rabbitmq_does_not_take_a_dead_letter_copy_after_a_bug(
+    config,
+):
+    channel = CopyRefusingChannel(NackError([]), target="input-queue.dlx")
+    executor = make_executor(config, channel, handler=lambda _message: 1 / 0)
+    channel.queue_deliveries(SampleMessage(message_id="input", text="input").to_bytes())
+
+    with pytest.raises(ZeroDivisionError):
+        executor.run()
+
+    assert channel.nacked_deliveries == [NackedDelivery(delivery_tag=1, requeue=True)]
+    assert executor.get_info().status == ExecutorStatus.CRASHED
+
+
+def test_run_reconnects_when_the_connection_is_lost_while_publishing_a_dead_letter_copy(
+    config, monkeypatch, sleeps, caplog
+):
+    original_channel = CopyRefusingChannel(
+        StreamLostError("connection lost"), target="input-queue.dlx"
+    )
+    replacement_channel = FakeChannel()
+    original_channel.queue_deliveries(b"not json")
+    replacement_channel.queue_deliveries(b"not json")  # RabbitMQ's redelivery
+    executor = make_executor(config, original_channel)
+    channels = [original_channel, replacement_channel]
+    monkeypatch.setattr(executor, "_create_connection", lambda: FakeConnection(channels.pop(0)))
+
+    run_until_stopped(executor)
+
+    assert original_channel.acked_delivery_tags == []
+    assert original_channel.nacked_deliveries == []
+    assert dead_lettered(replacement_channel) == [1]
+    warnings = [
+        r for r in caplog.records if "Connection or channel lost while dead-lettering" in r.message
+    ]
+    assert [record.levelname for record in warnings] == ["WARNING"]
+
+
+def test_run_stops_when_rabbitmq_refuses_a_dead_letter_copy(config, caplog):
+    channel = CopyRefusingChannel(
+        ChannelClosedByBroker(403, "ACCESS_REFUSED"), target="input-queue.dlx"
+    )
+    executor = make_executor(config, channel)
+    channel.queue_deliveries(b"not json")
+
+    with pytest.raises(ChannelClosedByBroker):
+        executor.run()
+
+    assert executor.get_info().status == ExecutorStatus.CRASHED
+    assert channel.acked_delivery_tags == []
+    assert channel.nacked_deliveries == []  # closing the connection requeues it
+    errors = [r for r in caplog.records if "Dead-lettering message id=None" in r.message]
+    assert [record.levelname for record in errors] == ["ERROR"]
+    assert "stopping the executor" in errors[0].message
+
+
+def test_run_raises_the_processing_error_when_its_dead_letter_copy_is_refused(config, caplog):
+    channel = CopyRefusingChannel(
+        ChannelClosedByBroker(403, "ACCESS_REFUSED"), target="input-queue.dlx"
+    )
+    executor = make_executor(config, channel, handler=lambda _message: 1 / 0)
+    channel.queue_deliveries(SampleMessage(message_id="input", text="input").to_bytes())
+
+    with pytest.raises(ZeroDivisionError):  # not masked by the refusal
+        executor.run()
+
+    assert executor.get_info().status == ExecutorStatus.CRASHED
+    assert channel.acked_delivery_tags == []
+    assert channel.nacked_deliveries == []  # closing the connection requeues it
+    assert "could not be dead-lettered after the unexpected error" in caplog.text
+
+
 # --- unexpected failures: dead-letter and stop ----------------------------------------------
 
 
@@ -1921,7 +2236,7 @@ def test_run_dead_letters_and_raises_on_unexpected_processing_error(config, capl
     with pytest.raises(ZeroDivisionError):
         executor.run()
 
-    assert channel.nacked_deliveries == [NackedDelivery(delivery_tag=1, requeue=False)]
+    assert dead_lettered(channel) == [1]
     assert len(executor.processed_messages) == 1
     assert channel.is_open is False
     assert "failed unexpectedly type=SampleMessage id=input" in caplog.text
@@ -1980,8 +2295,8 @@ def test_run_dead_letters_and_raises_when_terminator_returns_results(config, han
     with pytest.raises(RuntimeError, match="no destination_exchange"):
         executor.run()
 
-    assert channel.nacked_deliveries == [NackedDelivery(delivery_tag=1, requeue=False)]
-    assert channel.published_messages == []
+    assert dead_lettered(channel) == [1]
+    assert channel.published_messages == dead_letter_copies(channel)
 
 
 def results_for_input_only(results):
@@ -2027,9 +2342,13 @@ def test_run_dead_letters_input_whose_results_are_invalid_and_continues(
     run_until_stopped(executor)
 
     # Nothing of the invalid results is published; the next message is processed as usual
-    assert [p.body for p in channel.published_messages] == [following.to_bytes()]
-    assert channel.nacked_deliveries == [NackedDelivery(delivery_tag=1, requeue=False)]
-    assert channel.acked_delivery_tags == [2]
+    assert [p.exchange for p in channel.published_messages] == [
+        "input-queue.dlx",
+        "output-exchange",
+    ]
+    assert channel.published_messages[1].body == following.to_bytes()
+    assert dead_lettered(channel) == [1]
+    assert channel.acked_delivery_tags == [1, 2]
     dead_letter_records = [
         r
         for r in caplog.records
@@ -2950,8 +3269,8 @@ def test_info_has_no_message_for_a_delivery_that_cannot_be_decoded(config):
 
     run_until_stopped(executor)
 
-    assert "nack: None" in steps
-    assert channel.nacked_deliveries == [NackedDelivery(1, requeue=False)]
+    assert "publish: None" in steps
+    assert dead_lettered(channel) == [1]
 
 
 def test_info_drops_the_message_when_the_connection_is_lost_while_settling(
@@ -3537,22 +3856,30 @@ def test_run_reconnects_when_rabbitmq_cancelled_the_consumer_of_a_settled_delive
 ):
     # A terminator's settlement reaches RabbitMQ 4.3+ after it has taken the delivery back, and
     # is ignored: the executor reconnects and executes the redelivery, warning, not erring
+    class CancellingAfterTheCopyChannel(FakeChannel):
+        """RabbitMQ cancels the consumer right after confirming a dead-letter copy."""
+
+        def basic_publish(self, exchange, routing_key, body, properties=None, mandatory=False):
+            super().basic_publish(exchange, routing_key, body, properties, mandatory)
+            if exchange == "input-queue.dlx":
+                self.cancel_consumer()
+
     message = SampleMessage(message_id="input", text="input")
-    original_channel = FakeChannel()
+    original_channel = CancellingAfterTheCopyChannel()
     replacement_channel = FakeChannel()
     original_channel.queue_deliveries(message.to_bytes())
     replacement_channel.queue_deliveries(message.to_bytes())  # RabbitMQ's redelivery
 
-    cancelled = False
+    executed = False
 
     def outlasting_the_consumer_timeout(_received):
-        nonlocal cancelled
-        if cancelled:
+        nonlocal executed
+        if executed:
             return None  # the redelivery
-        cancelled = True
-        original_channel.cancel_consumer()
+        executed = True
         if outcome == "dead-lettering":
             raise MalformedMessageError("rejected by the application")
+        original_channel.cancel_consumer()
         return None
 
     executor = make_executor(config, original_channel, handler=outlasting_the_consumer_timeout)
@@ -3564,9 +3891,39 @@ def test_run_reconnects_when_rabbitmq_cancelled_the_consumer_of_a_settled_delive
     assert executor.processed_messages == [message, message]
     assert original_channel.is_open is False  # the connection was discarded
     assert replacement_channel.acked_delivery_tags == [1]
+    if outcome == "dead-lettering":
+        # The copy stays in the dead-letter queue although the redelivery succeeded
+        assert len(dead_letter_copies(original_channel)) == 1
     [warning] = [r for r in caplog.records if "cancelled the consumer" in r.message]
     assert warning.levelname == "WARNING"
     assert f"while {outcome} message id=input" in warning.getMessage()
+
+
+def test_run_publishes_no_dead_letter_copy_when_rabbitmq_cancelled_the_consumer(
+    config, monkeypatch, caplog
+):
+    # execute() outlasted a quorum queue's consumer timeout on RabbitMQ 4.3+, which has returned
+    # the message to the queue: the redelivery decides its fate, not this delivery
+    message = SampleMessage(message_id="input", text="input")
+    original_channel = FakeChannel()
+    replacement_channel = FakeChannel()
+    original_channel.queue_deliveries(message.to_bytes())
+    replacement_channel.queue_deliveries(message.to_bytes())  # RabbitMQ's redelivery
+
+    def reject_beyond_the_consumer_timeout(_received):
+        original_channel.cancel_consumer()
+        raise MalformedMessageError("rejected by the application")
+
+    executor = make_executor(config, original_channel, handler=reject_beyond_the_consumer_timeout)
+    channels = [original_channel, replacement_channel]
+    monkeypatch.setattr(executor, "_create_connection", lambda: FakeConnection(channels.pop(0)))
+
+    run_until_stopped(executor)
+
+    assert dead_letter_copies(original_channel) == []
+    assert original_channel.acked_delivery_tags == []
+    assert dead_lettered(replacement_channel) == [1]
+    assert "Connection or channel lost while dead-lettering message id=input" in caplog.text
 
 
 @pytest.mark.parametrize(
@@ -3642,14 +3999,22 @@ def test_run_dead_letters_input_whose_result_is_too_large_and_continues(
 
     run_until_stopped(executor)
 
-    assert channel.nacked_deliveries == [NackedDelivery(delivery_tag=1, requeue=False)]
-    assert [p.body for p in channel.published_messages] == [small.to_bytes()]
-    assert channel.acked_delivery_tags == [2]
+    assert dead_lettered(channel) == [1]
+    assert [p.exchange for p in channel.published_messages] == [
+        "input-queue.dlx",
+        "output-exchange",
+    ]
+    assert channel.published_messages[1].body == small.to_bytes()
+    assert channel.acked_delivery_tags == [1, 2]
     records = [
         r for r in caplog.records if "Message dead-lettered type=SampleMessage id=huge" in r.message
     ]
     assert [record.levelname for record in records] == ["ERROR"]
     assert "larger than configured max size" in records[0].message
+    headers = dead_letter_copies(channel)[0].properties.headers
+    assert headers["x-kicak-dead-letter-reason"] == "result-too-large"
+    assert headers["x-kicak-error-type"] == "pika.exceptions.ChannelClosedByBroker"
+    assert "larger than configured max size" in headers["x-kicak-error-message"]
 
 
 def test_run_opens_a_new_results_channel_after_reconnecting(config, monkeypatch, sleeps):
@@ -3717,7 +4082,7 @@ def always_transient(_message):
     ("body", "handler", "action", "settled"),
     [
         (SampleMessage(message_id="input", text="input").to_bytes(), None, "acknowledging", "ack"),
-        (b"not json", None, "dead-lettering", NackedDelivery(1, requeue=False)),
+        (b"not json", None, "dead-lettering", "dead-letter"),
         # Moved to the retry queue, then acknowledged
         (
             SampleMessage(message_id="input", text="input").to_bytes(),
@@ -3744,10 +4109,9 @@ def test_run_reconnects_when_connection_is_lost_while_settling(
 
     assert original_channel.acked_delivery_tags == []
     assert original_channel.nacked_deliveries == []
-    if settled == "ack":
-        assert replacement_channel.acked_delivery_tags == [1]
-    else:
-        assert replacement_channel.nacked_deliveries == [settled]
+    assert replacement_channel.acked_delivery_tags == [1]
+    if settled == "dead-letter":
+        assert dead_lettered(replacement_channel) == [1]
     assert replacement_channel.prefetch_count_when_consuming == 1
     warnings = [
         r for r in caplog.records if f"Connection or channel lost while {action}" in r.message

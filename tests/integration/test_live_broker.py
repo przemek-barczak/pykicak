@@ -21,6 +21,7 @@ import threading
 import time
 import uuid
 from collections.abc import Iterator, Sequence
+from datetime import datetime
 from typing import Any, cast
 
 import pika
@@ -340,9 +341,14 @@ def test_executor_dead_letters_undecodable_message(config, topology, queue_type)
 
     assert executor.received == []
     assert body == b"not json"
-    death = properties.headers["x-death"][0]
-    assert death["reason"] == "rejected"
-    assert death["queue"] == names["source_queue"]
+    headers = properties.headers
+    assert "x-death" not in headers  # the executor's copy: RabbitMQ did not dead-letter it
+    assert headers["x-kicak-dead-letter-reason"] == "malformed"
+    assert headers["x-kicak-error-type"] == "pykicak.executor.MalformedMessageError"
+    assert headers["x-kicak-error-message"].startswith("Could not decode message as")
+    assert headers["x-kicak-dead-lettered-from"] == names["source_queue"]
+    assert datetime.fromisoformat(headers["x-kicak-dead-lettered-at"]).tzinfo is not None
+    assert properties.user_id == config.rabbitmq_username
 
 
 @pytest.mark.parametrize("queue_type", list(QueueType))
@@ -379,7 +385,8 @@ def test_executor_accepts_the_versions_it_declares_and_dead_letters_others(
     # The version nobody accepts is kept in the dead-letter queue, with its type
     assert body == unknown.to_bytes()
     assert properties.type == "integration.v3"
-    assert properties.headers["x-death"][0]["reason"] == "rejected"
+    assert properties.headers["x-kicak-dead-letter-reason"] == "malformed"
+    assert "'integration.v3', which is not accepted" in properties.headers["x-kicak-error-message"]
 
 
 @pytest.mark.parametrize("queue_type", list(QueueType))
@@ -397,6 +404,8 @@ def test_executor_dead_letters_message_rejected_by_execute(config, topology, que
     assert IntegrationMessage.from_bytes(body) == message
     assert properties.message_id == "reject"
     assert properties.content_type == "application/json"
+    assert properties.headers["x-kicak-dead-letter-reason"] == "malformed"
+    assert properties.headers["x-kicak-original-publisher"] == config.rabbitmq_username
 
 
 @pytest.mark.parametrize("queue_type", list(QueueType))
@@ -729,7 +738,7 @@ def test_executor_declares_its_dead_letter_exchange_again_before_dead_lettering(
         properties, body = _get_dead_letter(executor.channel, _dead_letter_queue(names))
 
     assert IntegrationMessage.from_bytes(body) == message
-    assert properties.headers["x-death"][0]["reason"] == "rejected"
+    assert properties.headers["x-kicak-dead-letter-reason"] == "malformed"
 
 
 class ResultSizeExecutor(RecordingExecutor):
@@ -780,7 +789,7 @@ def test_executor_dead_letters_input_whose_result_is_too_large(config, topology)
     finally:
         connection.close()
     assert IntegrationMessage.from_bytes(body).message_id == "huge"
-    assert properties.headers["x-death"][0]["reason"] == "rejected"
+    assert properties.headers["x-kicak-dead-letter-reason"] == "result-too-large"
 
 
 @pytest.mark.parametrize("queue_type", list(QueueType))

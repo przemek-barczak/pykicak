@@ -6,7 +6,7 @@ This demonstrates both executor roles from the PoC topology (see examples.poc.me
 2. terminator1/terminator2 — each declares its own queue bound to the fanout exchange
 
 Every role also declares its input queue's dead-letter exchange and queue, `<queue>.dlx` and
-`<queue>.dlq`, which retain the deliveries that role rejects, and its retry queue
+`<queue>.dlq`, which retain the deliveries that role dead-letters, and its retry queue
 `<queue>.retry`, where a message that keeps failing transiently waits before it is executed
 again. Each executor takes its topology from examples.poc.messaging, the single place where the
 PoC's queue, exchange, and binding names are defined.

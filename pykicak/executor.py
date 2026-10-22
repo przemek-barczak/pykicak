@@ -54,6 +54,24 @@ _LONGEST_QUEUE_NAME_SUFFIX = max(
 )
 _RETRY_ROUND_HEADER = "x-kicak-retry-round"
 _RETRYING_SINCE_HEADER = "x-kicak-retrying-since"
+# Why and when a copy in the dead-letter queue was dead-lettered, and from which queue
+_DEAD_LETTER_REASON_HEADER = "x-kicak-dead-letter-reason"
+_ERROR_TYPE_HEADER = "x-kicak-error-type"
+_ERROR_MESSAGE_HEADER = "x-kicak-error-message"
+_DEAD_LETTERED_AT_HEADER = "x-kicak-dead-lettered-at"
+_DEAD_LETTERED_FROM_HEADER = "x-kicak-dead-lettered-from"
+_DEAD_LETTER_HEADERS = frozenset(
+    {
+        _DEAD_LETTER_REASON_HEADER,
+        _ERROR_TYPE_HEADER,
+        _ERROR_MESSAGE_HEADER,
+        _DEAD_LETTERED_AT_HEADER,
+        _DEAD_LETTERED_FROM_HEADER,
+    }
+)
+# Keeps the message properties well within one frame (frame_max is 128 KiB by default)
+_MAX_ERROR_MESSAGE_BYTES = 1024
+_TRUNCATION_MARK = "…"
 # Headers RabbitMQ sets itself; a copy must not carry stale ones, e.g. a quorum delivery count
 _BROKER_HEADERS = frozenset({"x-death", "x-delivery-count"})
 _BROKER_HEADER_PREFIXES = ("x-first-death-", "x-last-death-")
@@ -182,6 +200,19 @@ class QueueType(StrEnum):
     It limits how often a message is redelivered: on RabbitMQ 4.0 and newer, by default, a
     message is dead-lettered on its 21st delivery instead of being requeued again.
     """
+
+
+class _DeadLetterReason(StrEnum):
+    """Why the executor dead-lettered a delivery: its `x-kicak-dead-letter-reason` header."""
+
+    MALFORMED = "malformed"
+    """`MalformedMessageError`: the delivery, or the results `execute()` returned, are invalid."""
+
+    RESULT_TOO_LARGE = "result-too-large"
+    """RabbitMQ refused one of its results as larger than its `max_message_size`."""
+
+    UNEXPECTED_ERROR = "unexpected-error"
+    """Any other exception, treated as a bug; the executor stopped."""
 
 
 def _now() -> datetime:
@@ -323,18 +354,29 @@ def _checked_retry_delay_milliseconds(retry_delay_seconds: float) -> int:
     return milliseconds
 
 
+def _copied_headers(headers: Mapping[str, object] | None) -> dict[str, object]:
+    """Return the headers of a delivery that a copy the executor publishes of it keeps.
+
+    RabbitMQ's own headers are dropped, and so are the reasons of an earlier dead-lettering, which
+    a message replayed from a dead-letter queue still carries.
+    """
+    return {
+        name: value
+        for name, value in (headers or {}).items()
+        if name not in _BROKER_HEADERS
+        and not name.startswith(_BROKER_HEADER_PREFIXES)
+        and name not in _DEAD_LETTER_HEADERS
+    }
+
+
 def _retry_headers(headers: Mapping[str, object] | None, now: datetime) -> dict[str, object]:
     """Return the headers of a message's copy for the retry queue: its next retry round.
 
-    The application's headers are kept, and RabbitMQ's own ones dropped. The round counts the
-    moves into the retry queue, and `x-kicak-retrying-since` keeps the time of the first one; a
-    missing or invalid value starts them again.
+    The application's headers are kept, and RabbitMQ's own ones dropped (see `_copied_headers()`).
+    The round counts the moves into the retry queue, and `x-kicak-retrying-since` keeps the time
+    of the first one; a missing or invalid value starts them again.
     """
-    kept = {
-        name: value
-        for name, value in (headers or {}).items()
-        if name not in _BROKER_HEADERS and not name.startswith(_BROKER_HEADER_PREFIXES)
-    }
+    kept = _copied_headers(headers)
     previous_round = kept.get(_RETRY_ROUND_HEADER)
     valid_round = (
         isinstance(previous_round, int)
@@ -349,6 +391,58 @@ def _retry_headers(headers: Mapping[str, object] | None, now: datetime) -> dict[
         since = now.isoformat()
     kept[_RETRYING_SINCE_HEADER] = since
     return kept
+
+
+def _dead_letter_headers(
+    headers: Mapping[str, object] | None,
+    reason: _DeadLetterReason,
+    error: BaseException,
+    source_queue: str,
+    now: datetime,
+) -> dict[str, object]:
+    """Return the headers of a message's copy for the dead-letter queue: why it is there.
+
+    The application's headers and the retry headers, its history, are kept, and RabbitMQ's own
+    ones dropped (see `_copied_headers()`).
+    """
+    kept = _copied_headers(headers)
+    kept[_DEAD_LETTER_REASON_HEADER] = reason.value
+    kept[_ERROR_TYPE_HEADER] = _error_type_name(error)
+    kept[_ERROR_MESSAGE_HEADER] = _error_description(error)
+    kept[_DEAD_LETTERED_AT_HEADER] = now.isoformat()
+    kept[_DEAD_LETTERED_FROM_HEADER] = source_queue
+    return kept
+
+
+def _error_type_name(error: BaseException) -> str:
+    """Return the name of the class of `error` with its module, e.g. `json.JSONDecodeError`.
+
+    A built-in exception is named without its module, e.g. `KeyError`.
+    """
+    error_class = type(error)
+    module = error_class.__module__
+    if module == "builtins":
+        return error_class.__qualname__
+    return f"{module}.{error_class.__qualname__}"
+
+
+def _error_description(error: BaseException) -> str:
+    """Return the text of `error` that a header can carry: at most 1024 bytes of valid UTF-8.
+
+    A lone surrogate, which UTF-8 cannot encode and pika would fail on, becomes `?`, and a longer
+    text is cut at a character boundary and ends with `…`. An exception whose `str()` raises is
+    described as the traceback module does.
+    """
+    try:
+        text = str(error)
+    except Exception:
+        text = "<exception str() failed>"
+    encoded = text.encode("utf-8", errors="replace")
+    if len(encoded) <= _MAX_ERROR_MESSAGE_BYTES:
+        return encoded.decode("utf-8")
+    kept = encoded[: _MAX_ERROR_MESSAGE_BYTES - len(_TRUNCATION_MARK.encode("utf-8"))]
+    # Dropping the bytes of a character the cut split leaves valid UTF-8
+    return kept.decode("utf-8", errors="ignore") + _TRUNCATION_MARK
 
 
 def _text_property(value: object) -> str | None:
@@ -510,8 +604,12 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
     - Success: the results returned by `execute()` are published to the destination exchange
       in one RabbitMQ transaction, so RabbitMQ delivers all of them or none, and the delivery is
       acknowledged only after the transaction is committed.
-    - Deterministic failure (`MalformedMessageError`): the delivery is rejected with
-      `basic_nack(requeue=False)`, so RabbitMQ routes it to the dead-letter exchange.
+    - Deterministic failure (`MalformedMessageError`): the delivery is dead-lettered. A copy of
+      it is published to the dead-letter exchange, with headers saying why, when, and from
+      which queue (`x-kicak-dead-letter-reason`, `x-kicak-error-type`, `x-kicak-error-message`,
+      `x-kicak-dead-lettered-at`, `x-kicak-dead-lettered-from`), and the delivery is
+      acknowledged once RabbitMQ has confirmed the copy. If RabbitMQ returns the copy as
+      unroutable or refuses it, the delivery is requeued instead.
     - Transient failure (`TransientProcessingError`): `execute()` is retried, and if the failure
       persists the message is moved to the retry queue, which returns it to the back of the
       source queue after `retry_delay_seconds`. It is never dead-lettered for it.
@@ -534,8 +632,9 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
     - Any other failure to verify the output side or to publish the results, e.g. RabbitMQ
       refusing a declaration or the commit: the error is raised, stopping the executor, and
       closing the connection requeues the delivery.
-    - Connection lost while acknowledging or rejecting the delivery, or moving it to the retry
-      queue, or RabbitMQ took the delivery back because it outlasted `consumer_timeout`:
+    - Connection lost while acknowledging or requeueing the delivery, or moving it to the retry
+      queue or the dead-letter queue, or RabbitMQ took the delivery back because it outlasted
+      `consumer_timeout`:
       RabbitMQ requeues it, so the executor reconnects and receives it again, unless it was
       stopping anyway because of an unexpected error, which it then still raises.
 
@@ -585,7 +684,9 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
 
         The dead-letter exchange of `source_queue`, set as its `x-dead-letter-exchange`
         argument, is `<source_queue>.dlx`, and the dead-letter queue bound to it is
-        `<source_queue>.dlq`, so rejected deliveries are retained for inspection or replay. Like
+        `<source_queue>.dlq`, so dead-lettered deliveries are retained for inspection or replay:
+        the executor publishes a copy of each, saying why, to the exchange, and RabbitMQ
+        dead-letters there what it removes itself, e.g. at a quorum queue's delivery limit. Like
         `source_queue`, both are owned and declared only by this executor.
 
         `destination_exchange`, if given, receives the results returned by `execute()`, and
@@ -1199,12 +1300,12 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
         """Execute one delivery, then acknowledge, dead-letter, or move it to the retry queue.
 
         Returns False if the connection was lost while publishing the results, settling the
-        delivery, or moving it to the retry queue, or RabbitMQ took the delivery back because it
-        outlasted `consumer_timeout` (closing its channel, or cancelling the consumer), also
-        while the results were held. RabbitMQ then discards the uncommitted results and requeues
-        the delivery, and the results are not re-sent on a new connection: executing the
-        delivery again publishes them once. The caller must reconnect and resume consuming. A
-        stop request while the results are held requeues the delivery.
+        delivery, or moving it to the retry queue or the dead-letter queue, or RabbitMQ took the
+        delivery back because it outlasted `consumer_timeout` (closing its channel, or cancelling
+        the consumer), also while the results were held. RabbitMQ then discards the uncommitted
+        results and requeues the delivery, and the results are not re-sent on a new connection:
+        executing the delivery again publishes them once. The caller must reconnect and resume
+        consuming. A stop request while the results are held requeues the delivery.
         """
         # The sender's message_id property until the body is decoded, then the body's own
         message_id = _sent_message_id(properties)
@@ -1238,13 +1339,15 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
                 self._dead_letter_exchange,
                 error,
             )
-            return self._settle(delivery_tag, message_id, "dead-lettering", requeue=False)
+            return self._dead_letter(
+                delivery_tag, properties, body, message_id, _DeadLetterReason.MALFORMED, error
+            )
         except TransientProcessingError as error:
             # Only execute() raises it, so the body was decoded, and message_id is the body's
             return self._move_to_retry_queue(
                 delivery_tag, properties, cast(bytes, body), cast(str, message_id), error
             )
-        except Exception:
+        except Exception as error:
             logger.exception(
                 "Message processing failed unexpectedly type=%s id=%s queue=%s delivery_tag=%i; "
                 "dead-lettering it to %s and stopping the executor",
@@ -1254,7 +1357,23 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
                 delivery_tag,
                 self._dead_letter_exchange,
             )
-            self._settle(delivery_tag, message_id, "dead-lettering", requeue=False)
+            try:
+                self._dead_letter(
+                    delivery_tag,
+                    properties,
+                    body,
+                    message_id,
+                    _DeadLetterReason.UNEXPECTED_ERROR,
+                    error,
+                )
+            except Exception as dead_letter_error:
+                # The executor stops either way; the processing error is the one to raise
+                logger.error(
+                    "Message id=%s could not be dead-lettered after the unexpected error, which "
+                    "is raised instead of %r",
+                    message_id,
+                    dead_letter_error,
+                )
             raise
         else:
             try:
@@ -1281,7 +1400,14 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
                         self._dead_letter_exchange,
                         error,
                     )
-                    return self._settle(delivery_tag, message_id, "dead-lettering", requeue=False)
+                    return self._dead_letter(
+                        delivery_tag,
+                        properties,
+                        body,
+                        message_id,
+                        _DeadLetterReason.RESULT_TOO_LARGE,
+                        error,
+                    )
                 if not self._is_retryable_rabbitmq_error(error):
                     logger.exception(
                         "Results of message id=%s could not be published to exchange %s; "
@@ -1330,27 +1456,11 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
         """
         original = properties if properties is not None else pika.BasicProperties()
         headers = _retry_headers(original.headers, _now())
-        original_publisher = _original_publisher_of(original)
-        if original_publisher is None:
-            headers.pop(_ORIGINAL_PUBLISHER_HEADER, None)  # an invalid value
-        else:
-            headers[_ORIGINAL_PUBLISHER_HEADER] = original_publisher
-        copy_properties = pika.BasicProperties(
-            content_type=original.content_type,
-            content_encoding=original.content_encoding,
-            headers=headers,
-            delivery_mode=2,
-            priority=original.priority,
-            correlation_id=original.correlation_id,
-            reply_to=original.reply_to,
-            expiration=str(self._retry_delay_milliseconds),
+        copy_properties = self._copy_properties(
+            original,
+            headers,
             message_id=message_id,
-            timestamp=original.timestamp,
-            type=original.type,
-            app_id=original.app_id,
-            # RabbitMQ refuses a user_id that is not the publishing user's own; the original one
-            # lives on in the x-kicak-original-publisher header
-            user_id=self._user_id,
+            expiration=str(self._retry_delay_milliseconds),
         )
         try:
             self._declare_retry_queue()
@@ -1407,19 +1517,133 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
         )
         return self._settle(delivery_tag, message_id, "acknowledging")
 
+    def _dead_letter(
+        self,
+        delivery_tag: int,
+        properties: pika.BasicProperties | None,
+        body: bytes | None,
+        message_id: str | None,
+        reason: _DeadLetterReason,
+        error: BaseException,
+    ) -> bool:
+        """Dead-letter a delivery: publish a copy that says why, then acknowledge the delivery.
+
+        The copy keeps the body, the `message_id` property unchanged, and the application's
+        properties and headers, including its retry headers, and gets this executor's user as
+        its `user_id`, keeping the user who created the message in `x-kicak-original-publisher`.
+        Its headers record why it was dead-lettered (`x-kicak-dead-letter-reason`,
+        `x-kicak-error-type`, `x-kicak-error-message`), when (`x-kicak-dead-lettered-at`), and
+        from which queue (`x-kicak-dead-lettered-from`), which `basic_nack()` cannot add. It is
+        published as mandatory to the dead-letter exchange, right after the dead-letter route is
+        declared again, and the delivery is acknowledged only after RabbitMQ has confirmed the
+        copy, so a failure in between repeats the message instead of losing it: it is
+        dead-lettered twice, or executed again. RabbitMQ dead-letters a rejected message at most
+        once, dropping it if no queue takes it; a copy RabbitMQ returns as unroutable or refuses
+        is noticed instead, and the delivery is requeued.
+
+        Returns False if the connection was lost, or RabbitMQ took the delivery back (closing its
+        channel, or cancelling the consumer) before the copy was published; the caller must
+        reconnect, and RabbitMQ redelivers the message. RabbitMQ refusing to declare the
+        dead-letter route is raised.
+        """
+        original = properties if properties is not None else pika.BasicProperties()
+        headers = _dead_letter_headers(original.headers, reason, error, self._source_queue, _now())
+        copy_properties = self._copy_properties(
+            original, headers, message_id=original.message_id, expiration=None
+        )
+        try:
+            self._declare_dead_letter_route()
+            self._check_delivery_held()
+            logger.debug(
+                "Dead-lettering message id=%s to %s reason=%s",
+                message_id,
+                self._dead_letter_exchange,
+                reason,
+            )
+            self.channel.basic_publish(
+                exchange=self._dead_letter_exchange,
+                routing_key="",  # a fanout exchange ignores it
+                body=b"" if body is None else body,
+                properties=copy_properties,
+                mandatory=True,
+            )
+        except (UnroutableError, NackError) as copy_error:
+            logger.error(
+                "Message id=%s could not be dead-lettered to %s; requeueing it instead: %r",
+                message_id,
+                self._dead_letter_exchange,
+                copy_error,
+            )
+            return self._settle(delivery_tag, message_id, "requeueing", requeue=True)
+        except Exception as copy_error:
+            if not self._is_retryable_rabbitmq_error(copy_error):
+                logger.exception(
+                    "Dead-lettering message id=%s to %s failed; stopping the executor",
+                    message_id,
+                    self._dead_letter_exchange,
+                )
+                raise
+            logger.warning(
+                "Connection or channel lost while dead-lettering message id=%s to %s; RabbitMQ "
+                "will redeliver it: %s",
+                message_id,
+                self._dead_letter_exchange,
+                copy_error,
+            )
+            self._discard_connection()
+            return False
+        return self._settle(delivery_tag, message_id, "dead-lettering")
+
+    def _copy_properties(
+        self,
+        original: pika.BasicProperties,
+        headers: Mapping[str, object],
+        *,
+        message_id: object,
+        expiration: str | None,
+    ) -> pika.BasicProperties:
+        """Return the properties of a copy this executor publishes of a delivery.
+
+        The copy keeps the delivery's application properties, with `headers`, `message_id`, and
+        `expiration` (never the delivery's own) as given, and is persistent. Its `user_id` is
+        this executor's user, because RabbitMQ refuses any other, so the user who created the
+        message is kept in the `x-kicak-original-publisher` header.
+        """
+        copy_headers = dict(headers)
+        original_publisher = _original_publisher_of(original)
+        if original_publisher is None:
+            copy_headers.pop(_ORIGINAL_PUBLISHER_HEADER, None)  # an invalid value
+        else:
+            copy_headers[_ORIGINAL_PUBLISHER_HEADER] = original_publisher
+        return pika.BasicProperties(
+            content_type=original.content_type,
+            content_encoding=original.content_encoding,
+            headers=copy_headers,
+            delivery_mode=2,
+            priority=original.priority,
+            correlation_id=original.correlation_id,
+            reply_to=original.reply_to,
+            expiration=expiration,
+            message_id=message_id,
+            timestamp=original.timestamp,
+            type=original.type,
+            app_id=original.app_id,
+            user_id=self._user_id,
+        )
+
     def _settle(
         self,
         delivery_tag: int,
         message_id: str | None,
         action: str,
         *,
-        requeue: bool | None = None,
+        requeue: bool = False,
     ) -> bool:
-        """Acknowledge the delivery, or with `requeue` given, reject it with `basic_nack()`.
+        """Acknowledge the delivery, or with `requeue`, return it to the queue with `basic_nack()`.
 
-        A rejection first declares the dead-letter route again: RabbitMQ drops a message
-        dead-lettered into a missing exchange, and a quorum queue also dead-letters a requeued
-        message once it reaches its delivery limit.
+        A requeue first declares the dead-letter route again: a quorum queue dead-letters a
+        requeued message once it reaches its delivery limit, and RabbitMQ drops a message
+        dead-lettered into a missing exchange.
 
         Returns False if the connection was lost, or RabbitMQ took the delivery back because it
         outlasted `consumer_timeout`, closing the channel (RabbitMQ 4.2) or cancelling the
@@ -1428,11 +1652,11 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
         raised.
         """
         try:
-            if requeue is None:
-                self.channel.basic_ack(delivery_tag)
-            else:
+            if requeue:
                 self._declare_dead_letter_route()
-                self.channel.basic_nack(delivery_tag=delivery_tag, requeue=requeue)
+                self.channel.basic_nack(delivery_tag=delivery_tag, requeue=True)
+            else:
+                self.channel.basic_ack(delivery_tag)
             cancelled = self._consumer_cancelled()
         except Exception as error:
             if not self._is_retryable_rabbitmq_error(error):
@@ -1479,8 +1703,8 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
 
         RabbitMQ takes it back, and redelivers it, when it outlasts the consumer timeout: RabbitMQ
         4.2 closes the channel that delivered it, while 4.3 and newer cancel the consumer. Nothing
-        may then be published for the delivery, neither its results nor its retry copy, because
-        executing the redelivery publishes them again.
+        may then be published for the delivery, neither its results nor its copy for the retry
+        queue or the dead-letter queue, because the redelivery decides its outcome again.
         """
         if self._consumer_cancelled():
             raise ChannelWrongStateError(

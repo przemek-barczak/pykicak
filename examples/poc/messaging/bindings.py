@@ -10,9 +10,10 @@ Each executor binds its own input queue to its source exchange, and the fan-out 
 binds both terminator queues to its destination exchange before publishing, so a deleted
 binding is restored from either side.
 
-Each input queue dead-letters the deliveries its executor rejects (`basic_nack(requeue=False)`)
-to its own dead-letter exchange, which is bound to a dead-letter queue that retains them. pykicak
-derives both names from the queue's, so they are not defined here:
+Each input queue's executor dead-letters the deliveries it cannot process to the queue's own
+dead-letter exchange, publishing a copy that says why, and the exchange is bound to a dead-letter
+queue that retains them. pykicak derives both names from the queue's, so they are not defined
+here:
 
 ```text
 poc.heartbeat.source      ──► poc.heartbeat.source.dlx      ──► poc.heartbeat.source.dlq
