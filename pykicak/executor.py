@@ -31,6 +31,8 @@ from pykicak.abstracts import (
     _PUBLISHED_AT_HEADER,
     KicakAbstract,
     _check_name,
+    _log_values,
+    _monotonic,
     _now,
     _type_arguments,
     _union_members,
@@ -243,8 +245,17 @@ class _Handling:
     queued_seconds: float | None = None
     """How long the delivery waited since it was published: see `_queued_seconds()`."""
 
+    input_bytes: int | None = None
+    """The size of the delivery's body, or None for a delivery without one."""
+
     results: int = 0
     """How many results `execute()` returned, once they are validated and serialized."""
+
+    result_bytes: int = 0
+    """The size of all the results' bodies together."""
+
+    largest_result_bytes: int = 0
+    """The size of the largest result's body, the one RabbitMQ's `max_message_size` limits."""
 
     seconds: dict[_TimedPart, float] = field(default_factory=lambda: dict.fromkeys(_TimedPart, 0.0))
     settle_started_at: float | None = None
@@ -424,16 +435,6 @@ def _logged_outcome(outcome: _Outcome | _DeadLetterReason) -> tuple[str, str | N
     if isinstance(outcome, _DeadLetterReason):
         return "dead_lettered", outcome.value
     return outcome.name.lower(), None
-
-
-def _logged_text(value: object) -> str:
-    """Return a value of the `Message handled` line as its text shows it: seconds to the ms."""
-    return f"{value:.3f}" if isinstance(value, float) else str(value)
-
-
-def _monotonic() -> float:
-    """Seconds of a clock for durations, which, unlike `_now()`'s, is never set back or forward."""
-    return time.perf_counter()
 
 
 def _dead_letter_exchange_of(queue_name: str) -> str:
@@ -1626,7 +1627,9 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
         """
         self._settlement = None
         handling = self._handling = _Handling(
-            started_at=_monotonic(), queued_seconds=_queued_seconds(properties, _now())
+            started_at=_monotonic(),
+            queued_seconds=_queued_seconds(properties, _now()),
+            input_bytes=None if body is None else len(body),
         )
         try:
             return self._process_delivery(delivery_tag, redelivered, properties, body)
@@ -1683,6 +1686,9 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
             "retry_round": _retry_round_of(None if properties is None else properties.headers),
             "attempts": attempts,
             "results": handling.results,
+            "input_bytes": handling.input_bytes,
+            "result_bytes": handling.result_bytes,
+            "largest_result_bytes": handling.largest_result_bytes,
             "total_seconds": finished_at - handling.started_at,
             "execute_seconds": seconds[_TimedPart.EXECUTE],
             "backoff_seconds": seconds[_TimedPart.BACKOFF],
@@ -1691,11 +1697,19 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
             "settle_seconds": 0.0 if settle_started_at is None else finished_at - settle_started_at,
             "queued_seconds": handling.queued_seconds,
         }
-        logger.info(
-            "Message handled %s",
-            " ".join(f"{name}={_logged_text(value)}" for name, value in fields.items()),
-            extra={"kicak": {"event": "message_handled", **fields}},
-        )
+        _log_values(logger, "Message handled", "message_handled", fields)
+
+    def _record_results(self, publications: list[tuple[str, KicakMessage, bytes]]) -> None:
+        """Note how many results the delivery has, and their sizes, for its `Message handled` line.
+
+        Sizes are of the bodies only: RabbitMQ's `max_message_size` limits the body of each
+        message, not its headers.
+        """
+        sizes = [len(serialized) for _exchange, _message, serialized in publications]
+        handling = self._handling
+        handling.results = len(sizes)
+        handling.result_bytes = sum(sizes)
+        handling.largest_result_bytes = max(sizes, default=0)
 
     def _process_delivery(
         self,
@@ -1733,7 +1747,7 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
             publications = self._prepare_publications(
                 self._execute_with_retries(message, message_id)
             )
-            self._handling.results = len(publications)
+            self._record_results(publications)
         except MalformedMessageError as error:
             logger.exception(
                 "Message dead-lettered type=%s id=%s queue=%s delivery_tag=%i "

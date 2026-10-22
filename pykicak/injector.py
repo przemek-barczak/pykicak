@@ -6,12 +6,22 @@ import abc
 import logging
 import math
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import cast
 
 from pika.exchange_type import ExchangeType
 
-from pykicak.abstracts import KicakAbstract, _check_name, _type_arguments, _union_members
+from pykicak.abstracts import (
+    KicakAbstract,
+    _check_name,
+    _log_values,
+    _monotonic,
+    _type_arguments,
+    _union_members,
+)
 from pykicak.config import KicakConfig
 from pykicak.messages import KicakMessage, _type_name_of
 
@@ -23,6 +33,59 @@ _DEFAULT_BLOCKED_TIMEOUT_SECONDS = 60.0
 
 
 _INJECTOR_TYPE_USAGE = "KicakInjectorAbstract[MyMessage]"
+
+
+class _TimedPart(StrEnum):
+    """A part of an injection whose duration the `Message injected` line reports."""
+
+    CONNECT = "connect"
+    """Opening a connection and declaring the exchange, when the attempt needs a connection."""
+
+    PUBLISH = "publish"
+    """Publishing the message and waiting for RabbitMQ's confirmation."""
+
+    BACKOFF = "backoff"
+    """The time between two attempts: discarding the failed connection and waiting to retry."""
+
+
+@dataclass(slots=True)
+class _Injection:
+    """How the injection of one message goes, for the `Message injected` line logged at its end.
+
+    Times are of `_monotonic()`, durations in seconds.
+    """
+
+    message: KicakMessage
+    body: bytes
+    started_at: float
+    generate_seconds: float | None
+    """How long `generate()` took, or None for a message given to `publish()`."""
+
+    attempts: int = 0
+    seconds: dict[_TimedPart, float] = field(default_factory=lambda: dict.fromkeys(_TimedPart, 0.0))
+    attempt_ended_at: float = 0.0
+    error: BaseException | None = None
+    """What ended the last attempt, if the message was not injected."""
+
+    @contextmanager
+    def timing(self, part: _TimedPart) -> Iterator[None]:
+        """Add how long the `with` block takes to the duration of `part`, also if it raises."""
+        started_at = _monotonic()
+        try:
+            yield
+        finally:
+            self.seconds[part] += _monotonic() - started_at
+
+    @contextmanager
+    def attempt(self) -> Iterator[None]:
+        """Count an attempt, adding the time since the previous one ended to the backoff."""
+        if self.attempts:
+            self.seconds[_TimedPart.BACKOFF] += _monotonic() - self.attempt_ended_at
+        self.attempts += 1
+        try:
+            yield
+        finally:
+            self.attempt_ended_at = _monotonic()
 
 
 def _declared_message_type(injector_class: type) -> type[KicakMessage]:
@@ -88,6 +151,10 @@ class KicakInjectorAbstract[M: KicakMessage](KicakAbstract, abc.ABC):
     The class must declare its own `kicak_type`. The injector raises `TypeError` when it is
     created if the declaration is missing or invalid, e.g. for a subclass of the unparameterized
     class, or names more than one class.
+
+    Every message it tries to publish, by `run()` or `publish()`, is logged at `INFO` in a
+    `Message injected` line, whether or not it was injected, telling its attempts, its size, and
+    how long each part took, for statistics.
 
     The destination exchange is application topology, not connection configuration,
     so it is passed in by the caller (typically sourced from an application's
@@ -214,7 +281,12 @@ class KicakInjectorAbstract[M: KicakMessage](KicakAbstract, abc.ABC):
         """
         if self._channel is None:
             raise RuntimeError("Not connected. Call connect() first.")
-        self._publish_with_retries(message, self._serialize(message))
+        started_at = _monotonic()
+        injection = _Injection(message, self._serialize(message), started_at, None)
+        try:
+            self._publish_with_retries(injection)
+        finally:
+            self._log_injected(injection)
 
     def _serialize(self, message: KicakMessage) -> bytes:
         """Check `message`'s class and serialize it, logging a failure at ERROR and raising it.
@@ -244,20 +316,64 @@ class KicakInjectorAbstract[M: KicakMessage](KicakAbstract, abc.ABC):
             )
             raise
 
-    def _publish_with_retries(self, message: KicakMessage, body: bytes) -> None:
-        """Connect if needed and publish, up to three attempts; raise InjectionError on failure."""
+    def _publish_with_retries(self, injection: _Injection) -> None:
+        """Connect if needed and publish, up to three attempts; raise InjectionError on failure.
+
+        Records the attempts, how long their parts took, and what ended the last one in
+        `injection`.
+        """
+        message = injection.message
 
         def connect_and_publish() -> None:
-            self._ensure_connection_once()
-            self._publish_serialized(self._exchange_name, message, body)
+            with injection.attempt():
+                with injection.timing(_TimedPart.CONNECT):
+                    self._ensure_connection_once()
+                with injection.timing(_TimedPart.PUBLISH):
+                    self._publish_serialized(self._exchange_name, message, injection.body)
 
         try:
             self._retry_rabbitmq_operation(
                 connect_and_publish,
                 f"Injection of message id={message.message_id}",
             )
-        except Exception as error:
-            raise InjectionError(message, self._exchange_name) from error
+        except BaseException as error:
+            injection.error = error
+            if isinstance(error, Exception):
+                raise InjectionError(message, self._exchange_name) from error
+            raise  # e.g. KeyboardInterrupt, which is not an injection failure to wrap
+
+    def _log_injected(self, injection: _Injection) -> None:
+        """Log the `Message injected` line: whether the message was injected, and what it took.
+
+        One line at `INFO` for every message handed to RabbitMQ, by `run()` or `publish()`,
+        whatever the outcome, so that statistics can be computed from the logs; nothing is
+        logged for a message that was never published, e.g. because `generate()` returned None
+        or raised. The record also carries the values, typed, as its `kicak` attribute.
+        """
+        if not logger.isEnabledFor(logging.INFO):
+            return
+        message = injection.message
+        error = injection.error
+        seconds = injection.seconds
+        _log_values(
+            logger,
+            "Message injected",
+            "message_injected",
+            {
+                "outcome": "injected" if error is None else "failed",
+                "error": None if error is None else type(error).__name__,
+                "type": type(message).__name__,
+                "id": message.message_id,
+                "exchange": self._exchange_name,
+                "attempts": injection.attempts,
+                "message_bytes": len(injection.body),
+                "total_seconds": _monotonic() - injection.started_at,
+                "generate_seconds": injection.generate_seconds,
+                "connect_seconds": seconds[_TimedPart.CONNECT],
+                "publish_seconds": seconds[_TimedPart.PUBLISH],
+                "backoff_seconds": seconds[_TimedPart.BACKOFF],
+            },
+        )
 
     def run(self, interval_seconds: float = 0) -> None:
         """Inject one generated message on a short-lived connection, or repeat it at an interval.
@@ -308,6 +424,7 @@ class KicakInjectorAbstract[M: KicakMessage](KicakAbstract, abc.ABC):
 
     def _inject(self) -> None:
         """Generate one message and publish it on a connection that is closed afterwards."""
+        started_at = _monotonic()
         try:
             message = self.generate()
         except Exception:
@@ -315,12 +432,14 @@ class KicakInjectorAbstract[M: KicakMessage](KicakAbstract, abc.ABC):
                 "%s.generate() failed exchange=%s", type(self).__name__, self._exchange_name
             )
             raise
+        generate_seconds = _monotonic() - started_at
         if message is None:
             logger.debug("Injector generated no message; nothing to publish")
             return
         logger.debug("Injector generated message type=%s", type(message).__name__)
-        body = self._serialize(message)
+        injection = _Injection(message, self._serialize(message), started_at, generate_seconds)
         try:
-            self._publish_with_retries(message, body)
+            self._publish_with_retries(injection)
         finally:
             self._discard_connection()  # short-lived: no connection is kept between injections
+            self._log_injected(injection)  # its total includes closing the connection

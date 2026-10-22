@@ -39,10 +39,14 @@ from tests.fakes import (
     BoundQueue,
     FakeChannel,
     FakeConnection,
+    FakeStopwatch,
     NackedDelivery,
     PublishedMessage,
     StopConsuming,
     captured_connection_parameters,
+    expected_pairs,
+    kicak_values,
+    logged_pairs,
 )
 
 
@@ -4260,6 +4264,8 @@ class OversizedResultChannel(FakeChannel):
 def test_run_dead_letters_input_whose_result_is_too_large_and_continues(
     config, monkeypatch, caplog
 ):
+    caplog.set_level("INFO", logger="pykicak.executor")
+
     class ResultsChannelsConnection(FakeConnection):
         """Opens the given results channels in order, as the executor reopens a closed one."""
 
@@ -4303,6 +4309,14 @@ def test_run_dead_letters_input_whose_result_is_too_large_and_continues(
     assert headers["x-kicak-dead-letter-reason"] == "result-too-large"
     assert headers["x-kicak-error-type"] == "pika.exceptions.ChannelClosedByBroker"
     assert "larger than configured max size" in headers["x-kicak-error-message"]
+    # Its line tells how large the results it could not publish were
+    first = kicak_values(handled_records(caplog)[0])
+    assert (first["outcome"], first["reason"]) == ("dead_lettered", "result-too-large")
+    assert (first["results"], first["result_bytes"], first["largest_result_bytes"]) == (
+        1,
+        len(huge.to_bytes()),
+        len(huge.to_bytes()),
+    )
 
 
 def test_run_opens_a_new_results_channel_after_reconnecting(config, monkeypatch, sleeps):
@@ -4538,22 +4552,6 @@ def test_backoff_ignores_stop_outside_run(config, sleeps):
 # --- durations in the logs ------------------------------------------------------------------
 
 
-class FakeStopwatch:
-    """Stands in for executor._monotonic(); tests move it forward explicitly.
-
-    Its steps are binary fractions, so the durations computed from it are exact.
-    """
-
-    def __init__(self) -> None:
-        self.current = 100.0
-
-    def advance(self, seconds: float) -> None:
-        self.current += seconds
-
-    def __call__(self) -> float:
-        return self.current
-
-
 @pytest.fixture
 def stopwatch(monkeypatch) -> FakeStopwatch:
     fake = FakeStopwatch()
@@ -4590,17 +4588,6 @@ def handled_records(caplog) -> list[Any]:
     return [record for record in caplog.records if record.message.startswith("Message handled")]
 
 
-def kicak_values(record) -> dict[str, Any]:
-    """The values a record carries, typed, as its `kicak` attribute."""
-    values: dict[str, Any] = vars(record)["kicak"]
-    return values
-
-
-def logged_pairs(record) -> dict[str, str]:
-    """The key=value pairs of a record's text."""
-    return dict(token.split("=", 1) for token in record.message.split() if "=" in token)
-
-
 def test_logs_how_long_each_part_of_a_completed_delivery_took(config, caplog, stopwatch):
     caplog.set_level("INFO", logger="pykicak.executor")
     message = SampleMessage(message_id="input", text="input")
@@ -4627,8 +4614,15 @@ def test_logs_how_long_each_part_of_a_completed_delivery_took(config, caplog, st
     assert record.message == (
         "Message handled outcome=completed reason=None type=SampleMessage id=input "
         "queue=input-queue delivery_tag=1 redelivered=False retry_round=0 attempts=1 results=2 "
+        "input_bytes=40 result_bytes=90 largest_result_bytes=50 "
         "total_seconds=2.875 execute_seconds=2.000 backoff_seconds=0.000 publish_seconds=0.750 "
         "held_seconds=0.000 settle_seconds=0.125 queued_seconds=None"
+    )
+    # Logged where the executor logs it, not in the helper that formats it
+    assert (record.name, record.filename, record.funcName) == (
+        "pykicak.executor",
+        "executor.py",
+        "_log_handled",
     )
     assert kicak_values(record) == {
         "event": "message_handled",
@@ -4642,6 +4636,9 @@ def test_logs_how_long_each_part_of_a_completed_delivery_took(config, caplog, st
         "retry_round": 0,
         "attempts": 1,
         "results": 2,
+        "input_bytes": len(message.to_bytes()),  # 40
+        "result_bytes": len(message.to_bytes()) + len(second.to_bytes()),  # 90
+        "largest_result_bytes": len(second.to_bytes()),  # 50
         "total_seconds": 2.875,  # the parts below, two publishes and a commit taking 0.75
         "execute_seconds": 2.0,
         "backoff_seconds": 0.0,
@@ -4684,16 +4681,23 @@ def test_logs_one_handled_line_for_every_counted_delivery_whatever_its_outcome(
         ("dead_lettered", "malformed", "invalid", 1),
         ("moved_to_retry", None, "flaky", 3),
     ]
+    # The size of every body, also of one that could not be decoded
+    assert [v["input_bytes"] for v in values] == [
+        len(SampleMessage(message_id="ok", text="ok").to_bytes()),
+        len(b"not json"),
+        len(SampleMessage(message_id="invalid", text="invalid").to_bytes()),
+        len(SampleMessage(message_id="flaky", text="flaky").to_bytes()),
+    ]
+    # A terminator has no results
+    assert {(v["results"], v["result_bytes"], v["largest_result_bytes"]) for v in values} == {
+        (0, 0, 0)
+    }
     assert executor.get_info().counts == ExecutorCounts(
         completed=1, dead_lettered=DeadLetterCounts(malformed=2), moved_to_retry=1
     )
     for record, value in zip(records, values, strict=True):
         # The text holds the same values as the kicak attribute, durations to the millisecond
-        assert logged_pairs(record) == {
-            name: f"{item:.3f}" if name.endswith("_seconds") and item is not None else str(item)
-            for name, item in value.items()
-            if name != "event"
-        }
+        assert logged_pairs(record) == expected_pairs(value)
         # Measured with the real clock: the parts never exceed the whole
         parts = [value[f"{part}_seconds"] for part in ("execute", "backoff", "publish", "held")]
         assert all(seconds >= 0 for seconds in [*parts, value["settle_seconds"]])
@@ -5030,3 +5034,16 @@ def test_results_are_stamped_with_the_time_they_were_published(config, clock):
     # When the executor published the result, not when its input was published or received
     [result] = channel.published_messages
     assert result.properties.headers["x-kicak-published-at"] == "2026-10-01T12:00:05+00:00"
+
+
+def test_handled_line_has_no_input_size_for_a_delivery_without_body(config, caplog):
+    caplog.set_level("INFO", logger="pykicak.executor")
+    channel = FakeChannel()
+    channel.queue_deliveries(None)
+    executor = make_executor(config, channel)
+
+    run_until_stopped(executor)
+
+    [record] = handled_records(caplog)
+    assert kicak_values(record)["input_bytes"] is None
+    assert " input_bytes=None " in record.message

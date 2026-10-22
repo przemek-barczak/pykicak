@@ -1250,6 +1250,28 @@ def test_injector_run_publishes_on_a_short_lived_connection(config, topology):
     assert injector._connection is None
 
 
+def test_statistics_lines_of_an_injection_and_its_delivery_agree(config, topology, caplog):
+    caplog.set_level("INFO", logger="pykicak")
+    inject_exchange = topology.exchange("inject")
+    names = topology.executor_topology("source", inject_exchange)
+    message = IntegrationMessage(message_id="measured", payload="measured")
+
+    with RecordingTerminator(config, **names) as executor:
+        OneShotInjector(config, inject_exchange, message).run()
+        executor.handle_next_delivery(names["source_queue"])
+
+    [injected] = [vars(r)["kicak"] for r in caplog.records if r.message.startswith("Message inj")]
+    [handled] = [vars(r)["kicak"] for r in caplog.records if r.message.startswith("Message hand")]
+    assert (injected["outcome"], injected["attempts"]) == ("injected", 1)
+    assert injected["connect_seconds"] > 0  # a real connection, opened for this injection
+    assert injected["publish_seconds"] > 0  # until RabbitMQ confirmed it
+    assert handled["outcome"] == "completed"
+    # The body crossed the broker unchanged, and its publish time came with it
+    assert handled["input_bytes"] == injected["message_bytes"] == len(message.to_bytes())
+    assert handled["queued_seconds"] is not None
+    assert -1 < handled["queued_seconds"] < 60  # both stamps come from this host's clock
+
+
 def test_injector_run_raises_after_closing_when_no_queue_is_bound(config, topology):
     injector = OneShotInjector(
         config, topology.exchange("unbound"), IntegrationMessage(message_id="lost", payload="lost")

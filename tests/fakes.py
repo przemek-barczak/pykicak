@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import dataclasses
+import logging
 import time
 from collections.abc import Callable
+from typing import Any
 
 import pika
 from pika.exceptions import ChannelClosedByBroker
@@ -310,3 +312,43 @@ class FakeConnection:
 
     def close(self) -> None:
         self.is_open = False
+
+
+class FakeStopwatch:
+    """Stands in for `_monotonic()`, the clock of durations; tests move it forward explicitly.
+
+    Its steps are binary fractions, so the durations computed from it are exact.
+    """
+
+    def __init__(self) -> None:
+        self.current = 100.0
+
+    def advance(self, seconds: float) -> None:
+        self.current += seconds
+
+    def __call__(self) -> float:
+        return self.current
+
+
+def kicak_values(record: logging.LogRecord) -> dict[str, Any]:
+    """The values a statistics line carries, typed, as its record's `kicak` attribute."""
+    values: dict[str, Any] = vars(record)["kicak"]
+    return values
+
+
+def logged_pairs(record: logging.LogRecord) -> dict[str, str]:
+    """The key=value pairs of a record's text."""
+    return dict(token.split("=", 1) for token in record.getMessage().split() if "=" in token)
+
+
+def expected_pairs(values: dict[str, Any]) -> dict[str, str]:
+    """The key=value pairs a statistics line's text shows for `values`, its `kicak` attribute.
+
+    Durations to the millisecond, everything else as `str()` shows it; `event` names the line
+    and is not in its text.
+    """
+    return {
+        name: f"{value:.3f}" if name.endswith("_seconds") and value is not None else str(value)
+        for name, value in values.items()
+        if name != "event"
+    }

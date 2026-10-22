@@ -7,6 +7,7 @@ import logging
 import os
 import socket
 import ssl
+import time
 import types
 import typing
 from collections.abc import Callable
@@ -46,6 +47,32 @@ _PUBLISHED_AT_HEADER = "x-kicak-published-at"
 def _now() -> datetime:
     """The current time, timezone-aware in UTC."""
     return datetime.now(UTC)
+
+
+def _monotonic() -> float:
+    """Seconds of a clock for durations, which, unlike `_now()`'s, is never set back or forward."""
+    return time.perf_counter()
+
+
+def _logged_text(value: object) -> str:
+    """Return a value of a statistics line as its text shows it: seconds to the millisecond."""
+    return f"{value:.3f}" if isinstance(value, float) else str(value)
+
+
+def _log_values(log: logging.Logger, title: str, event: str, values: dict[str, object]) -> None:
+    """Log a statistics line at INFO: `title`, then `values` as `key=value` pairs.
+
+    The record also carries the values, typed, as its `kicak` attribute, with `event` naming the
+    line, for structured (e.g. JSON) log handlers; built from the same values, the text and the
+    attribute cannot disagree. The record names the caller as where it was logged.
+    """
+    log.info(
+        "%s %s",
+        title,
+        " ".join(f"{name}={_logged_text(value)}" for name, value in values.items()),
+        extra={"kicak": {"event": event, **values}},
+        stacklevel=2,
+    )
 
 
 def _check_name(argument: str, name: object, *, suffix: str = "") -> None:

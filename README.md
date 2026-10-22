@@ -1130,7 +1130,7 @@ For each message the status goes from `"WAITING_FOR_MESSAGE"` to `"PROCESSING"`,
 `"SENDING_RESULT"` if it has results, and back. The first attempt to connect or to verify the
 topology keeps the current status; only a failed attempt enters a recovery status, and the
 Executor logs a `WARNING` when it enters one and an `INFO` when it leaves it, which tells how long
-it lasted (see [Durations in the logs](#durations-in-the-logs)). A lost connection is
+it lasted (see [Statistics in the logs](#statistics-in-the-logs)). A lost connection is
 `"UPSTREAM_RECOVER"` even when it is noticed while sending results, because the message is executed
 again after reconnecting. The recovery statuses last however long the recovery takes (see
 [Retries and logging](#retries-and-logging)).
@@ -1184,7 +1184,7 @@ A growing `abandoned` usually means that processing outlasts `heartbeat_seconds`
 `consumer_timeout`, so messages are executed again (see
 [Long-running `execute()`](#long-running-execute)). A delivery received after `stop()` is not
 processed, and not counted. How long the deliveries took is in the logs: see
-[Durations in the logs](#durations-in-the-logs).
+[Statistics in the logs](#statistics-in-the-logs).
 
 ```python
 from datetime import timedelta
@@ -1390,7 +1390,7 @@ keeps the time of the message it copies (see [Dead-letter queue](#dead-letter-qu
 
 The Executor that receives the message compares that time with its own clock to tell how long the
 message waited in its queue, `queued_seconds` in its log (see
-[Durations in the logs](#durations-in-the-logs)). The header is not verified by RabbitMQ, like
+[Statistics in the logs](#statistics-in-the-logs)). The header is not verified by RabbitMQ, like
 `x-kicak-original-publisher`, and a message that another client published without it has no
 `queued_seconds`.
 
@@ -1439,14 +1439,14 @@ import logging
 logging.basicConfig(level=logging.INFO)
 ```
 
-### Durations in the logs
+### Statistics in the logs
 
 Every delivery an Executor takes ends with one `INFO` line, whatever its outcome, telling how long
-each part of its handling took, so that statistics such as averages and percentiles can be
-computed outside the library:
+each part of its handling took and how large its message and results were, so that statistics
+such as averages and percentiles can be computed outside the library:
 
 ```text
-Message handled outcome=completed reason=None type=Chunk id=doc-17 queue=chunker delivery_tag=42 redelivered=False retry_round=0 attempts=1 results=3 total_seconds=1.284 execute_seconds=1.201 backoff_seconds=0.000 publish_seconds=0.071 held_seconds=0.000 settle_seconds=0.001 queued_seconds=0.350
+Message handled outcome=completed reason=None type=Chunk id=doc-17 queue=chunker delivery_tag=42 redelivered=False retry_round=0 attempts=1 results=3 input_bytes=2048 result_bytes=6144 largest_result_bytes=2560 total_seconds=1.284 execute_seconds=1.201 backoff_seconds=0.000 publish_seconds=0.071 held_seconds=0.000 settle_seconds=0.001 queued_seconds=0.350
 ```
 
 | Key | Value |
@@ -1458,6 +1458,9 @@ Message handled outcome=completed reason=None type=Chunk id=doc-17 queue=chunker
 | `redelivered`, `retry_round` | RabbitMQ's redelivered flag, and how often the message was moved to the retry queue before (see [Status information](#status-information)) |
 | `attempts` | the calls of `execute()`; 0 for a delivery that could not be decoded |
 | `results` | the results `execute()` returned, once validated and serialized; they are published only when the outcome is `completed` |
+| `input_bytes` | the size of the delivery's body, also of one that could not be decoded; `None` for a delivery without a body |
+| `result_bytes` | the size of all the results' bodies together; 0 without results |
+| `largest_result_bytes` | the size of the largest result's body; 0 without results |
 | `total_seconds` | from taking the delivery until it was settled or left to RabbitMQ |
 | `execute_seconds` | in `execute()`, all its calls together |
 | `backoff_seconds` | waiting between the calls retried after `TransientProcessingError` |
@@ -1469,6 +1472,12 @@ Message handled outcome=completed reason=None type=Chunk id=doc-17 queue=chunker
 The parts do not overlap, and what `total_seconds` has beyond them is decoding the delivery,
 serializing the results, and logging. Durations are seconds, three decimals in the text, measured
 with a monotonic clock (`time.perf_counter()`), so setting the system clock does not affect them.
+
+Sizes are bytes of the bodies, the messages as JSON, without headers and properties. RabbitMQ's
+`max_message_size` (16 MiB by default) limits the body of each message, so a
+`largest_result_bytes` growing towards it warns before inputs are dead-lettered as
+`result-too-large`; the line of such an input carries the sizes of the results it could not
+publish.
 
 `queued_seconds` is the exception: it comes before the delivery was taken, outside
 `total_seconds`, and compares the clocks of two hosts, the publisher's and the Executor's. Keep them
@@ -1526,6 +1535,34 @@ Executor for queue chunker stopped on request stop_seconds=4.210
   reconnecting` when the stop ended a reconnection (`event` `"stopped"`, with `queue` and
   `stop_seconds`). It helps size the time a platform gives the process to stop, such as Kubernetes'
   `terminationGracePeriodSeconds`.
+
+An Injector logs one `INFO` line for every message it tries to publish, from `run()` and from
+`publish()`, whether or not the message was injected:
+
+```text
+Message injected outcome=injected error=None type=Order id=order-17 exchange=orders attempts=1 message_bytes=412 total_seconds=0.083 generate_seconds=0.012 connect_seconds=0.061 publish_seconds=0.009 backoff_seconds=0.000
+```
+
+| Key | Value |
+| --- | --- |
+| `outcome` | `injected`, or `failed`: the Injector raised `InjectionError`, or was interrupted, e.g. by `KeyboardInterrupt` |
+| `error` | for `failed`, the class of the error that ended the last attempt, e.g. `UnroutableError`, `NackError`, or `StreamLostError`, the `__cause__` of the `InjectionError`; otherwise `None` |
+| `type`, `id`, `exchange` | the message's class and `message_id`, and the exchange |
+| `attempts` | the attempts to connect and publish, at most 3 |
+| `message_bytes` | the size of the message's body |
+| `total_seconds` | for `run()`, from calling `generate()` until the connection was closed; for `publish()`, the call |
+| `generate_seconds` | in `generate()`; `None` for `publish()`, whose caller made the message |
+| `connect_seconds` | opening a connection and declaring the exchange, all attempts together; 0 for a `publish()` on an open connection |
+| `publish_seconds` | publishing the message and waiting for RabbitMQ's confirmation, all attempts together |
+| `backoff_seconds` | between the attempts: discarding the failed connection and waiting before retrying (1 second, then 2) |
+
+A message that never reaches RabbitMQ has no line: when `generate()` returns `None` or raises, or
+the message cannot be serialized or is of another class than the declared one. What
+`total_seconds` has beyond the parts is serializing the message, closing the connection of `run()`,
+and logging, and the `event` of the line's `kicak` attribute is `"message_injected"`. With `run()`,
+every injection opens a connection of its own: a `connect_seconds` much larger than
+`publish_seconds` shows an Injector that would gain from keeping one connection open, with
+`connect()` and `publish()`.
 
 ### Connection names
 
