@@ -82,6 +82,7 @@ class NackedDelivery:
 @dataclasses.dataclass
 class ConsumedMethod:
     delivery_tag: int
+    redelivered: bool = False
 
 
 class FakeChannelImpl:
@@ -120,7 +121,7 @@ class FakeChannel:
         self.before_delivery: Callable[[int], None] | None = None
         self.on_idle: Callable[[], None] | None = None
         self._impl = FakeChannelImpl()
-        self._pending_deliveries: list[tuple[bytes | None, pika.BasicProperties]] = []
+        self._pending_deliveries: list[tuple[bytes | None, pika.BasicProperties, bool]] = []
         self._delivered_delivery_tags: set[int] = set()
         self.transactional = False
         self.tx_select_calls = 0
@@ -239,14 +240,18 @@ class FakeChannel:
             callback(object())
 
     def queue_deliveries(
-        self, *bodies: bytes | None, properties: pika.BasicProperties | None = None
+        self,
+        *bodies: bytes | None,
+        properties: pika.BasicProperties | None = None,
+        redelivered: bool = False,
     ) -> None:
         """Test helper: queue up message bodies, with `properties`, for consume() to yield.
 
-        Without `properties`, each delivery has only the `type` property SAMPLE_TYPE.
+        Without `properties`, each delivery has only the `type` property SAMPLE_TYPE. With
+        `redelivered`, RabbitMQ flags them as delivered before.
         """
         delivered = properties if properties is not None else pika.BasicProperties(type=SAMPLE_TYPE)
-        self._pending_deliveries.extend((body, delivered) for body in bodies)
+        self._pending_deliveries.extend((body, delivered, redelivered) for body in bodies)
 
     def consume(self, queue: str, inactivity_timeout: float | None = None):
         """Yield the queued deliveries, then end the test with StopConsuming.
@@ -257,11 +262,11 @@ class FakeChannel:
         """
         self.prefetch_count_when_consuming = self.prefetch_count
         self.inactivity_timeout = inactivity_timeout
-        for index, (body, properties) in enumerate(self._pending_deliveries, start=1):
+        for index, (body, properties, redelivered) in enumerate(self._pending_deliveries, start=1):
             if self.before_delivery is not None:
                 self.before_delivery(index)
             self._delivered_delivery_tags.add(index)
-            yield ConsumedMethod(delivery_tag=index), properties, body
+            yield ConsumedMethod(delivery_tag=index, redelivered=redelivered), properties, body
         if self.on_idle is not None:
             for _ in range(1000):
                 self.on_idle()

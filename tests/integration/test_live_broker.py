@@ -32,6 +32,8 @@ from pika.spec import Basic
 from pykicak.abstracts import _tls_options
 from pykicak.config import KicakConfig
 from pykicak.executor import (
+    DeadLetterCounts,
+    ExecutorCounts,
     KicakExecutorAbstract,
     MalformedMessageError,
     QueueType,
@@ -106,7 +108,7 @@ class RecordingAgent[M: KicakMessage, R: KicakMessage | None](KicakExecutorAbstr
         )
         assert method is not None, f"No delivery on {queue} within {_DELIVERY_TIMEOUT_SECONDS}s"
         self._last_properties = properties
-        assert self._handle_delivery(method.delivery_tag, properties, body)
+        assert self._handle_delivery(method.delivery_tag, method.redelivered, properties, body)
         return method
 
 
@@ -340,6 +342,7 @@ def test_executor_dead_letters_undecodable_message(config, topology, queue_type)
         properties, body = _get_dead_letter(executor.channel, _dead_letter_queue(names))
 
     assert executor.received == []
+    assert executor.get_info().counts == ExecutorCounts(dead_lettered=DeadLetterCounts(malformed=1))
     assert body == b"not json"
     headers = properties.headers
     assert "x-death" not in headers  # the executor's copy: RabbitMQ did not dead-letter it
@@ -434,6 +437,7 @@ def test_executor_retries_a_transient_failure_through_its_retry_queue(config, to
         dead_letter = executor.channel.basic_get(_dead_letter_queue(names), auto_ack=True)
 
     assert executor.received == [flaky, behind, flaky]
+    assert executor.get_info().counts == ExecutorCounts(completed=2, moved_to_retry=1)
     assert returned_after >= 0.9
     assert returned.headers["x-kicak-retry-round"] == 1
     assert returned.expiration is None  # RabbitMQ removes it on the way back
@@ -979,11 +983,13 @@ class TimedOutTerminator(RecordingTerminator):
     def __init__(self, config: KicakConfig, **topology) -> None:
         super().__init__(config, **topology)
         self._test_config = config
+        self.redelivered: list[bool | None] = []  # as get_info() reports it for each execution
 
     def _declare_input_queue(self, channel, queue_name: str) -> None:
         super()._declare_input_queue(_ConsumerTimeoutChannel(channel), queue_name)
 
     def execute(self, message: IntegrationMessage) -> None:
+        self.redelivered.append(self.get_info().redelivered)
         if not self.received:
             _wait_until_unconsumed(self._test_config, self._source_queue)
         else:
@@ -1067,7 +1073,10 @@ def test_terminator_reconnects_when_its_delivery_outlasts_the_consumer_timeout(
         assert "cancelled the consumer" in warning.getMessage()
     # ...so the executor reconnected and executed the redelivered message again
     assert executor.received == [message, message]
-    assert executor.get_info().status == "STOPPED"
+    assert executor.redelivered == [False, True]
+    info = executor.get_info()
+    assert info.status == "STOPPED"
+    assert info.counts == ExecutorCounts(completed=1, abandoned=1)
     assert _ready_message_count(config, names["source_queue"]) == (0, 0)
 
 

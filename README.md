@@ -1103,6 +1103,10 @@ moment:
 | `stop_requested` | Whether `stop()` has been called; it stays `True` after the stop. |
 | `stop_requested_at` | When `stop()` was first called, or `None`. |
 | `message` | The input message being processed, or `None`. |
+| `attempt` | Which call of `execute()` for `message` is under way, from 1 to `max_processing_attempts`, or `None`. |
+| `redelivered` | Whether RabbitMQ delivered `message` before without it being settled, or `None`. |
+| `retry_round` | How often `message` was moved to the retry queue before, 0 if never, or `None`. |
+| `counts` | How the deliveries the Executor took so far have ended: an `ExecutorCounts`. |
 
 The times are timezone-aware `datetime` objects in UTC, so a monitor can compare and subtract them
 directly, for example to alert when a recovery lasts too long. For text, such as a REST endpoint's
@@ -1140,6 +1144,44 @@ it shows the message being finished, if any. It is the same object `execute()` r
 as read-only: lists and dicts inside it are shared with `execute()`. The snapshot's `repr()` shows
 the message only by its type and `message_id`, never its contents, so the snapshot can be logged.
 
+`attempt`, `redelivered`, and `retry_round` describe the delivery of `message`, and are `None`
+exactly when it is:
+
+- `attempt` counts the calls of `execute()` for this delivery: it grows while `execute()` raises
+  `TransientProcessingError`, and starts at 1 again for every delivery, also when the message is
+  delivered again or comes back from the retry queue. A long `"PROCESSING"` with `attempt` 3 of 3
+  is a message whose last attempt is under way.
+- `redelivered` is RabbitMQ's redelivered flag: `True` when the message was delivered before and
+  not settled, after a lost connection, a crash, a requeue, or an expired `consumer_timeout`. When
+  instances keep crashing or losing their connection, a message that keeps arriving redelivered
+  may be the cause. A message back from the retry queue is a new delivery, so it is not
+  redelivered.
+- `retry_round` is the message's `x-kicak-retry-round` header (see [Retry queue](#retry-queue)):
+  how often it was moved to the retry queue before, 0 for a message that never was.
+
+`counts` tells how every delivery the Executor started to process has ended. Each one counts
+once, when it is settled or left to RabbitMQ:
+
+| `counts.` | Deliveries that were… |
+| --- | --- |
+| `completed` | executed, their results published, if any, and acknowledged |
+| `dead_lettered.malformed` | dead-lettered for a `MalformedMessageError` (see [Dead-letter queue](#dead-letter-queue)) |
+| `dead_lettered.result_too_large` | dead-lettered because RabbitMQ refused one of their results as too large |
+| `dead_lettered.unexpected_error` | dead-lettered for any other exception, each of which also stopped the Executor |
+| `dead_lettered.total` | dead-lettered, for any of the three reasons |
+| `moved_to_retry` | moved to the retry queue after `TransientProcessingError` persisted |
+| `requeued` | returned to the queue by the Executor: RabbitMQ did not take their copy for the retry queue or the dead-letter queue, or `stop()` ended a hold of their unroutable results |
+| `abandoned` | left to RabbitMQ, which delivers them again: the connection was lost, `consumer_timeout` expired, or `run()` ended by raising an exception while processing them |
+
+The counts start at zero when the Executor is created and only grow, also across a `run()` called
+again after `"CRASHED"`, so they map directly onto monitoring counters, such as Prometheus counters
+read on every scrape; like those, they start again with the process. They count deliveries, not
+messages: a message delivered twice counts twice, and every count describes this instance only.
+A growing `abandoned` usually means that processing outlasts `heartbeat_seconds` or
+`consumer_timeout`, so messages are executed again (see
+[Long-running `execute()`](#long-running-execute)). A delivery received after `stop()` is not
+processed, and not counted.
+
 ```python
 from datetime import timedelta
 
@@ -1149,6 +1191,9 @@ info.status_changed_at  # e.g. datetime(2026, 10, 1, 17, 5, 42, 123456, tzinfo=U
 info.status_checked_at  # e.g. datetime(2026, 10, 1, 17, 5, 44, 987654, tzinfo=UTC)
 info.stop_requested  # False
 info.message  # e.g. MyMessage(message_id="...", ...), or None
+info.attempt  # e.g. 2: the second call of execute() for it
+info.counts.completed  # e.g. 1250
+info.counts.dead_lettered.total  # e.g. 3
 
 recovering = info.status in ("UPSTREAM_RECOVER", "DOWNSTREAM_RECOVER")
 if recovering and info.status_checked_at - info.status_changed_at > timedelta(minutes=5):
@@ -1391,9 +1436,10 @@ apart, for example to find the instance that holds a message unacknowledged or k
 
 ## Public API
 
-`pykicak` exports `ExecutorInfo`, `ExecutorStatus`, `InjectionError`, `KicakConfig`,
-`KicakConfigError`, `KicakExecutorAbstract`, `KicakInjectorAbstract`, `KicakMessage`,
-`MalformedMessageError`, `QueueType`, `TransientProcessingError`, and `__version__`. Build agents by
+`pykicak` exports `DeadLetterCounts`, `ExecutorCounts`, `ExecutorInfo`, `ExecutorStatus`,
+`InjectionError`, `KicakConfig`, `KicakConfigError`, `KicakExecutorAbstract`,
+`KicakInjectorAbstract`, `KicakMessage`, `MalformedMessageError`, `QueueType`,
+`TransientProcessingError`, and `__version__`. Build agents by
 subclassing `KicakInjectorAbstract` or `KicakExecutorAbstract`; their shared base class is internal.
 
 ## Proof of concept

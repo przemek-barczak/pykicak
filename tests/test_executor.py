@@ -22,6 +22,8 @@ from pika.exceptions import (
 import pykicak.executor as executor_module
 from pykicak.config import KicakConfig
 from pykicak.executor import (
+    DeadLetterCounts,
+    ExecutorCounts,
     ExecutorInfo,
     ExecutorStatus,
     KicakExecutorAbstract,
@@ -1262,7 +1264,11 @@ class SameNameAsChunkV1(KicakMessage):
     text: str
 
 
-def delivery_of(message: KicakMessage) -> dict[str, object]:
+class DeliveryArguments(TypedDict):
+    properties: pika.BasicProperties
+
+
+def delivery_of(message: KicakMessage) -> DeliveryArguments:
     """Keyword arguments of queue_deliveries() for `message`, sent as a pykicak agent sends it."""
     return {
         "properties": pika.BasicProperties(
@@ -1825,6 +1831,7 @@ def test_run_requeues_the_message_when_rabbitmq_does_not_take_its_retry_copy(
 
     assert channel.nacked_deliveries == [NackedDelivery(delivery_tag=1, requeue=True)]
     assert channel.acked_delivery_tags == []
+    assert executor.get_info().counts == ExecutorCounts(requeued=1)
     errors = [r for r in caplog.records if "could not be moved to retry queue" in r.message]
     assert [record.levelname for record in errors] == ["ERROR"]
 
@@ -2143,6 +2150,7 @@ def test_run_requeues_the_message_when_rabbitmq_does_not_take_its_dead_letter_co
     # Never rejected without requeueing, which RabbitMQ may drop when no queue takes it
     assert channel.nacked_deliveries == [NackedDelivery(delivery_tag=1, requeue=True)]
     assert channel.acked_delivery_tags == []
+    assert executor.get_info().counts == ExecutorCounts(requeued=1)
     errors = [r for r in caplog.records if "could not be dead-lettered to" in r.message]
     assert [record.levelname for record in errors] == ["ERROR"]
 
@@ -2239,6 +2247,9 @@ def test_run_dead_letters_and_raises_on_unexpected_processing_error(config, capl
     assert dead_lettered(channel) == [1]
     assert len(executor.processed_messages) == 1
     assert channel.is_open is False
+    assert executor.get_info().counts == ExecutorCounts(
+        dead_lettered=DeadLetterCounts(unexpected_error=1)
+    )
     assert "failed unexpectedly type=SampleMessage id=input" in caplog.text
     assert "stopping the executor" in caplog.text
 
@@ -2651,6 +2662,7 @@ def test_stop_while_holding_results_requeues_the_input_and_returns(config, monke
     assert channel.nacked_deliveries == [NackedDelivery(delivery_tag=1, requeue=True)]
     assert channel.acked_delivery_tags == []
     assert executor.get_info().status == ExecutorStatus.STOPPED
+    assert executor.get_info().counts == ExecutorCounts(requeued=1)
     assert "Stop requested while holding the results of message id=input" in caplog.text
     assert "stopped on request" in caplog.text
 
@@ -3065,6 +3077,10 @@ def test_info_after_creation(config, clock):
         stop_requested=False,
         stop_requested_at=None,
         message=None,
+        attempt=None,
+        redelivered=None,
+        retry_round=None,
+        counts=ExecutorCounts(),
     )
     assert type(info.status) is ExecutorStatus
     assert info.status == "CREATED"
@@ -3084,7 +3100,10 @@ def test_info_repr_lists_every_field(config, clock):
         "ExecutorInfo(status=<ExecutorStatus.CREATED: 'CREATED'>, "
         "status_changed_at=datetime.datetime(2026, 10, 1, 12, 0, tzinfo=datetime.timezone.utc), "
         "status_checked_at=datetime.datetime(2026, 10, 1, 12, 0, tzinfo=datetime.timezone.utc), "
-        "stop_requested=False, stop_requested_at=None, message=None)"
+        "stop_requested=False, stop_requested_at=None, message=None, attempt=None, "
+        "redelivered=None, retry_round=None, counts=ExecutorCounts(completed=0, "
+        "dead_lettered=DeadLetterCounts(malformed=0, result_too_large=0, unexpected_error=0), "
+        "moved_to_retry=0, requeued=0, abandoned=0))"
     )
 
 
@@ -3430,7 +3449,7 @@ def test_status_is_crashed_when_run_raises(config, failure, caplog):
 
     info = executor.get_info()
     assert (info.status, info.stop_requested, info.message) == ("CRASHED", False, None)
-    assert executor._activity[2] is None  # the message is not kept after the crash
+    assert executor._activity.delivery is None  # the message is not kept after the crash
     assert f"crashed with {type(failure).__name__}" in caplog.text
 
 
@@ -3472,6 +3491,10 @@ def test_status_is_upstream_recover_when_run_follows_a_crash(config, monkeypatch
     run_until_stopped(executor)  # consumes the queued delivery again
 
     assert statuses == ["connecting: UPSTREAM_RECOVER", "PROCESSING"]
+    # Counted across both runs
+    assert executor.get_info().counts == ExecutorCounts(
+        completed=1, dead_lettered=DeadLetterCounts(unexpected_error=1)
+    )
 
 
 def test_info_can_be_read_from_another_thread_while_running(config):
@@ -3543,6 +3566,254 @@ def test_repeated_stop_keeps_the_first_stop_time(config, clock):
     info = executor.get_info()
     assert info.status_changed_at == first_stop_at
     assert info.stop_requested_at == first_stop_at
+
+
+# --- counts and the delivery in progress (get_info) -----------------------------------------
+
+
+def test_counts_record_how_each_delivery_ended(config, sleeps):
+    def handle(message):
+        if message.message_id == "flaky":
+            raise TransientProcessingError("service unavailable")
+        if message.message_id == "invalid":
+            raise MalformedMessageError("fails application validation")
+        return None
+
+    channel = FakeChannel()
+    executor = make_executor(config, channel, handler=handle)
+    channel.queue_deliveries(
+        SampleMessage(message_id="ok", text="ok").to_bytes(),
+        b"not json",
+        SampleMessage(message_id="invalid", text="invalid").to_bytes(),
+        SampleMessage(message_id="flaky", text="flaky").to_bytes(),
+        SampleMessage(message_id="also-ok", text="also ok").to_bytes(),
+    )
+
+    run_until_stopped(executor)
+
+    assert executor.get_info().counts == ExecutorCounts(
+        completed=2, dead_lettered=DeadLetterCounts(malformed=2), moved_to_retry=1
+    )
+
+
+def test_dead_letter_counts_add_up_to_their_total():
+    counts = DeadLetterCounts(malformed=3, result_too_large=2, unexpected_error=1)
+
+    assert counts.total == 6
+    assert DeadLetterCounts().total == 0
+
+
+def test_counts_a_delivery_abandoned_by_a_hard_stop(config):
+    def interrupted(_message):
+        raise KeyboardInterrupt
+
+    channel = FakeChannel()
+    executor = make_executor(config, channel, handler=interrupted)
+    channel.queue_deliveries(SampleMessage(message_id="input", text="input").to_bytes())
+
+    with pytest.raises(KeyboardInterrupt):
+        executor.run()
+
+    assert executor.get_info().counts == ExecutorCounts(abandoned=1)
+
+
+def test_counts_a_delivery_whose_results_were_lost_with_the_connection(config, monkeypatch):
+    channel = FakeChannel()
+    channel.queue_deliveries(SampleMessage(message_id="input", text="input").to_bytes())
+    replacement_channel = FakeChannel()
+    replacement_channel.queue_deliveries(  # RabbitMQ's redelivery
+        SampleMessage(message_id="input", text="input").to_bytes(), redelivered=True
+    )
+    executor = reconnecting_executor(
+        config,
+        monkeypatch,
+        [
+            (channel, FailingResultsChannel("commit", StreamLostError("connection lost"))),
+            (replacement_channel, FakeChannel()),
+        ],
+        lambda received: received,
+    )
+
+    run_until_stopped(executor)
+
+    assert executor.get_info().counts == ExecutorCounts(completed=1, abandoned=1)
+
+
+def test_counts_nothing_for_a_delivery_received_after_stop(config):
+    channel = FakeChannel()
+    executor = make_executor(config, channel)
+    channel.queue_deliveries(SampleMessage(message_id="input", text="input").to_bytes())
+    channel.before_delivery = lambda _tag: executor.stop()
+
+    executor.run()
+
+    assert executor.processed_messages == []
+    assert executor.get_info().counts == ExecutorCounts()
+
+
+class InfoRecordingChannel(FakeChannel):
+    """Records the executor's get_info() just before each acknowledgement, and while idle."""
+
+    def __init__(self, executor_holder: list[ProcessingExecutor[Any, Any]]) -> None:
+        super().__init__()
+        self._executor_holder = executor_holder
+        self.reported: list[ExecutorInfo[Any]] = []
+        self.on_idle = self._record
+
+    def _record(self) -> None:
+        self.reported.append(self._executor_holder[0].get_info())
+
+    def basic_ack(self, delivery_tag: int) -> None:
+        self._record()
+        super().basic_ack(delivery_tag)
+
+
+def test_a_delivery_is_counted_when_it_is_no_longer_reported(config):
+    executor_holder: list[ProcessingExecutor[Any, Any]] = []
+    channel = InfoRecordingChannel(executor_holder)
+    executor = make_executor(config, channel)
+    executor_holder.append(executor)
+    channel.queue_deliveries(SampleMessage(message_id="input", text="input").to_bytes())
+
+    run_until_stopped(executor)
+
+    acknowledging, waiting = channel.reported[:2]
+    # While it is acknowledged, the message is reported and not yet counted; then the reverse
+    assert acknowledging.message is not None and acknowledging.counts.completed == 0
+    assert waiting.message is None and waiting.counts.completed == 1
+
+
+def test_info_reports_which_call_of_execute_is_under_way(config, sleeps):
+    executor_holder: list[ProcessingExecutor[Any, Any]] = []
+    attempts: list[int | None] = []
+
+    def fail_twice(_message):
+        attempts.append(executor_holder[0].get_info().attempt)
+        if len(attempts) < 3:
+            raise TransientProcessingError("service unavailable")
+
+    channel = FakeChannel()
+    executor = make_executor(config, channel, handler=fail_twice)
+    executor_holder.append(executor)
+    channel.queue_deliveries(SampleMessage(message_id="input", text="input").to_bytes())
+
+    run_until_stopped(executor)
+
+    assert attempts == [1, 2, 3]
+    assert executor.get_info().counts == ExecutorCounts(completed=1)
+
+
+def test_info_attempts_start_again_for_every_delivery(config, sleeps):
+    executor_holder: list[ProcessingExecutor[Any, Any]] = []
+    attempts: list[int | None] = []
+
+    def record_attempt(_message):
+        attempts.append(executor_holder[0].get_info().attempt)
+
+    channel = FakeChannel()
+    executor = make_executor(config, channel, handler=record_attempt)
+    executor_holder.append(executor)
+    channel.queue_deliveries(
+        SampleMessage(message_id="first", text="first").to_bytes(),
+        SampleMessage(message_id="second", text="second").to_bytes(),
+    )
+
+    run_until_stopped(executor)
+
+    assert attempts == [1, 1]
+
+
+def test_info_reports_whether_the_delivery_was_redelivered(config):
+    executor_holder: list[ProcessingExecutor[Any, Any]] = []
+    reported: list[bool | None] = []
+    channel = FakeChannel()
+    executor = make_executor(
+        config,
+        channel,
+        handler=lambda _message: reported.append(executor_holder[0].get_info().redelivered),
+    )
+    executor_holder.append(executor)
+    channel.queue_deliveries(
+        SampleMessage(message_id="again", text="again").to_bytes(), redelivered=True
+    )
+    channel.queue_deliveries(SampleMessage(message_id="first", text="first").to_bytes())
+
+    run_until_stopped(executor)
+
+    assert reported == [True, False]
+
+
+@pytest.mark.parametrize(
+    ("headers", "retry_round"),
+    [
+        (None, 0),
+        ({"x-kicak-retry-round": 3}, 3),
+        ({"x-kicak-retry-round": 0}, 0),
+        ({"x-kicak-retry-round": "3"}, 0),
+        ({"x-kicak-retry-round": -1}, 0),
+        ({"x-kicak-retry-round": True}, 0),
+    ],
+    ids=["never-retried", "third-round", "zero", "text", "negative", "bool"],
+)
+def test_info_reports_the_retry_round_of_the_message(config, headers, retry_round):
+    executor_holder: list[ProcessingExecutor[Any, Any]] = []
+    reported: list[int | None] = []
+    channel = FakeChannel()
+    executor = make_executor(
+        config,
+        channel,
+        handler=lambda _message: reported.append(executor_holder[0].get_info().retry_round),
+    )
+    executor_holder.append(executor)
+    channel.queue_deliveries(
+        SampleMessage(message_id="input", text="input").to_bytes(),
+        properties=pika.BasicProperties(type=SAMPLE_TYPE, headers=headers),
+    )
+
+    run_until_stopped(executor)
+
+    assert reported == [retry_round]
+
+
+def test_info_reports_no_delivery_context_without_a_message(config):
+    executor_holder: list[ProcessingExecutor[Any, Any]] = []
+    channel = InfoRecordingChannel(executor_holder)
+    executor = make_executor(config, channel)
+    executor_holder.append(executor)
+    channel.queue_deliveries(b"not json", redelivered=True)
+
+    run_until_stopped(executor)
+
+    # Dead-lettering an undecodable delivery, then waiting: no delivery is reported
+    assert [
+        (info.message, info.attempt, info.redelivered, info.retry_round)
+        for info in channel.reported[:2]
+    ] == [(None, None, None, None)] * 2
+
+
+def test_info_drops_the_delivery_context_once_run_has_ended(config):
+    executor_holder: list[ProcessingExecutor[Any, Any]] = []
+    channel = FakeChannel()
+
+    def crash(_message):
+        raise ZeroDivisionError("bug in application code")
+
+    executor = make_executor(config, channel, handler=crash)
+    executor_holder.append(executor)
+    channel.queue_deliveries(
+        SampleMessage(message_id="input", text="input").to_bytes(), redelivered=True
+    )
+
+    with pytest.raises(ZeroDivisionError):
+        executor.run()
+
+    info = executor.get_info()
+    assert (info.message, info.attempt, info.redelivered, info.retry_round) == (
+        None,
+        None,
+        None,
+        None,
+    )
 
 
 # --- connection failures --------------------------------------------------------------------
@@ -4006,6 +4277,9 @@ def test_run_dead_letters_input_whose_result_is_too_large_and_continues(
     ]
     assert channel.published_messages[1].body == small.to_bytes()
     assert channel.acked_delivery_tags == [1, 2]
+    assert executor.get_info().counts == ExecutorCounts(
+        completed=1, dead_lettered=DeadLetterCounts(result_too_large=1)
+    )
     records = [
         r for r in caplog.records if "Message dead-lettered type=SampleMessage id=huge" in r.message
     ]
@@ -4112,6 +4386,9 @@ def test_run_reconnects_when_connection_is_lost_while_settling(
     assert replacement_channel.acked_delivery_tags == [1]
     if settled == "dead-letter":
         assert dead_lettered(replacement_channel) == [1]
+    counts = executor.get_info().counts
+    assert counts.abandoned == 1
+    assert counts.completed + counts.dead_lettered.total + counts.moved_to_retry == 1
     assert replacement_channel.prefetch_count_when_consuming == 1
     warnings = [
         r for r in caplog.records if f"Connection or channel lost while {action}" in r.message

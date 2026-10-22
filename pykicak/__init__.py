@@ -8,6 +8,8 @@ import logging
 
 from pykicak.config import KicakConfig, KicakConfigError
 from pykicak.executor import (
+    DeadLetterCounts,
+    ExecutorCounts,
     ExecutorInfo,
     ExecutorStatus,
     KicakExecutorAbstract,
@@ -23,6 +25,8 @@ __version__ = "0.3.0"  # the only place the version is set; pyproject.toml reads
 logging.getLogger(__name__).addHandler(logging.NullHandler())
 
 __all__ = [
+    "DeadLetterCounts",
+    "ExecutorCounts",
     "ExecutorInfo",
     "ExecutorStatus",
     "InjectionError",

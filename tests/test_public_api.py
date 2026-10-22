@@ -6,6 +6,8 @@ import pykicak
 from pykicak.abstracts import KicakAbstract
 
 PUBLIC_API = [
+    "DeadLetterCounts",
+    "ExecutorCounts",
     "ExecutorInfo",
     "ExecutorStatus",
     "InjectionError",
