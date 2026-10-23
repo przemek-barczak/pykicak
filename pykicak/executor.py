@@ -435,7 +435,7 @@ def _counted(counts: ExecutorCounts, outcome: _Outcome | _DeadLetterReason) -> E
             dead_lettered = replace(
                 dead_lettered, unexpected_error=dead_lettered.unexpected_error + 1
             )
-        case _:
+        case _:  # pragma: no cover - every outcome has a case above, as type checkers verify
             assert_never(outcome)
     return replace(counts, dead_lettered=dead_lettered)
 
@@ -1469,7 +1469,7 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
     def _set_attempt(self, attempt: int) -> None:
         """Record which call of `execute()` for the delivery being processed is under way."""
         activity = self._activity
-        if activity.delivery is not None:
+        if activity.delivery is not None:  # pragma: no branch - set before every attempt
             self._activity = replace(activity, delivery=replace(activity.delivery, attempt=attempt))
 
     def _finish_delivery(self, outcome: _Outcome | _DeadLetterReason) -> None:
@@ -2293,7 +2293,8 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
                 )
                 with self._handling.timing(_TimedPart.BACKOFF):
                     time.sleep(delay_seconds)
-        raise RuntimeError("Processing retry loop exited unexpectedly")
+        # Unreachable: the last attempt returns or raises
+        raise RuntimeError("Processing retry loop exited unexpectedly")  # pragma: no cover
 
     def _prepare_publications(self, results: object) -> list[tuple[str, KicakMessage, bytes]]:
         """Validate and serialize every result before anything is published or acknowledged.
@@ -2453,7 +2454,7 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
         ):
             return channel
         connection = self._connection
-        if connection is None:
+        if connection is None:  # pragma: no cover - called only while publishing, when connected
             raise RuntimeError("Not connected. Call connect() first.")
         logger.debug("Opening the transactional channel for results")
         channel = connection.channel()

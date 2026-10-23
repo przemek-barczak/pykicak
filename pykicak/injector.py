@@ -250,7 +250,8 @@ class KicakInjectorAbstract[M: KicakMessage](KicakAbstract, abc.ABC):
                     "Waiting %.1f seconds before retrying %s", delay_seconds, operation_name
                 )
                 time.sleep(delay_seconds)
-        raise RuntimeError("RabbitMQ retry loop exited unexpectedly")
+        # Unreachable: the last attempt returns or raises
+        raise RuntimeError("RabbitMQ retry loop exited unexpectedly")  # pragma: no cover
 
     @abc.abstractmethod
     def generate(self) -> M | None:
