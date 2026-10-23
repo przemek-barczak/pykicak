@@ -131,13 +131,25 @@ def replay_dead_letters(
 
 def _connect(config: KicakConfig, queue: str) -> pika.BlockingConnection:
     """Connect as `config` says, with TLS if it asks for it, verifying the broker's certificate."""
+    tls_files = {
+        "RABBIT_MQ_CA_FILE": config.rabbitmq_ca_file,
+        "RABBIT_MQ_CERT_FILE": config.rabbitmq_cert_file,
+        "RABBIT_MQ_KEY_FILE": config.rabbitmq_key_file,
+    }
     ssl_options = None
     if config.rabbitmq_tls:
-        context = ssl.create_default_context(cafile=config.rabbitmq_ca_file)
+        context = ssl.create_default_context(cafile=tls_files["RABBIT_MQ_CA_FILE"])
+        if tls_files["RABBIT_MQ_CERT_FILE"] is not None:
+            # The client certificate, for a broker that verifies its clients (mutual TLS)
+            context.load_cert_chain(
+                tls_files["RABBIT_MQ_CERT_FILE"], tls_files["RABBIT_MQ_KEY_FILE"]
+            )
         ssl_options = pika.SSLOptions(context, server_hostname=config.rabbitmq_host)
-    elif config.rabbitmq_ca_file is not None:
-        # A CA file shows that TLS was intended: never send the credentials unencrypted then
-        raise KicakConfigError("RABBIT_MQ_CA_FILE is given, but RABBIT_MQ_TLS is false")
+    else:
+        for key, path in tls_files.items():
+            if path is not None:
+                # A TLS file shows that TLS was intended: never send the credentials unencrypted
+                raise KicakConfigError(f"{key} is given, but RABBIT_MQ_TLS is false")
     parameters = pika.ConnectionParameters(
         host=config.rabbitmq_host,
         port=config.rabbitmq_port,

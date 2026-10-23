@@ -24,6 +24,8 @@ _CONNECTION_KEYS = (
     "RABBIT_MQ_VIRTUAL_HOST",
     "RABBIT_MQ_TLS",
     "RABBIT_MQ_CA_FILE",
+    "RABBIT_MQ_CERT_FILE",
+    "RABBIT_MQ_KEY_FILE",
 )
 
 
@@ -129,7 +131,7 @@ class KicakConfig:
     def from_env(cls) -> Self:
         """Read the connection keys from the environment variables of the same names.
 
-        Only the keys the library reads, RABBIT_MQ_USERNAME to RABBIT_MQ_CA_FILE, are taken, not
+        Only the keys the library reads, RABBIT_MQ_USERNAME to RABBIT_MQ_KEY_FILE, are taken, not
         the rest of the environment. Values are stripped of surrounding whitespace, as in a .kicak
         file. A variable that is not set leaves its key missing, which raises KicakConfigError when
         the key is read, as for a file. A value that is not valid UTF-8 raises KicakConfigError.
@@ -218,14 +220,34 @@ class KicakConfig:
         With TLS, the broker's certificate must then be issued by one of these CAs instead of one
         the system trusts. An empty value raises `KicakConfigError`: remove the key instead.
         """
-        ca_file = self.get("RABBIT_MQ_CA_FILE")
-        if ca_file == "":
-            logger.error("Invalid Kicak config key RABBIT_MQ_CA_FILE")
-            raise KicakConfigError(
-                "RABBIT_MQ_CA_FILE must not be empty; remove it to trust the system's CA "
-                "certificates"
-            )
-        return ca_file
+        return self._optional_file("RABBIT_MQ_CA_FILE", "to trust the system's CA certificates")
+
+    @property
+    def rabbitmq_cert_file(self) -> str | None:
+        """The optional RABBIT_MQ_CERT_FILE value: the client certificate, or None if unset.
+
+        A PEM file with the certificate agents present to a broker that asks for one (mutual TLS),
+        optionally followed by its intermediate CA certificates. With TLS only, and together with
+        RABBIT_MQ_KEY_FILE. An empty value raises `KicakConfigError`: remove the key instead.
+        """
+        return self._optional_file("RABBIT_MQ_CERT_FILE", "to connect without a client certificate")
+
+    @property
+    def rabbitmq_key_file(self) -> str | None:
+        """The optional RABBIT_MQ_KEY_FILE value: the client certificate's key, or None if unset.
+
+        A PEM file with the unencrypted private key of the certificate in RABBIT_MQ_CERT_FILE. An
+        empty value raises `KicakConfigError`: remove the key instead.
+        """
+        return self._optional_file("RABBIT_MQ_KEY_FILE", "to connect without a client certificate")
+
+    def _optional_file(self, key: str, without_it: str) -> str | None:
+        """Return the path in `key`, None if it is not set, or raise if it is empty."""
+        path = self.get(key)
+        if path == "":
+            logger.error("Invalid Kicak config key %s", key)
+            raise KicakConfigError(f"{key} must not be empty; remove it {without_it}")
+        return path
 
 
 def _is_valid_utf8(value: str) -> bool:

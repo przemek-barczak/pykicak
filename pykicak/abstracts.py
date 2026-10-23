@@ -185,18 +185,32 @@ def _unaliased(argument: object) -> object:
 def _tls_options(config: KicakConfig) -> pika.SSLOptions | None:
     """Return pika's TLS options for a connection configured by `config`, or None without TLS.
 
-    Raises `KicakConfigError` for a RABBIT_MQ_CA_FILE given with RABBIT_MQ_TLS=false: the file
-    shows that TLS was intended, so connecting without it would send the credentials and messages
-    unencrypted.
+    Raises `KicakConfigError` for a RABBIT_MQ_CA_FILE, RABBIT_MQ_CERT_FILE, or RABBIT_MQ_KEY_FILE
+    given with RABBIT_MQ_TLS=false: the file shows that TLS was intended, so connecting without it
+    would send the credentials and messages unencrypted. Also for a client certificate without its
+    key, or a key without its certificate.
     """
-    ca_file = config.rabbitmq_ca_file
+    files = {
+        "RABBIT_MQ_CA_FILE": config.rabbitmq_ca_file,
+        "RABBIT_MQ_CERT_FILE": config.rabbitmq_cert_file,
+        "RABBIT_MQ_KEY_FILE": config.rabbitmq_key_file,
+    }
     if not config.rabbitmq_tls:
-        if ca_file is not None:
-            logger.error("Invalid Kicak config: RABBIT_MQ_CA_FILE requires RABBIT_MQ_TLS=true")
-            raise KicakConfigError("RABBIT_MQ_CA_FILE requires RABBIT_MQ_TLS=true")
+        for key, path in files.items():
+            if path is not None:
+                logger.error("Invalid Kicak config: %s requires RABBIT_MQ_TLS=true", key)
+                raise KicakConfigError(f"{key} requires RABBIT_MQ_TLS=true")
         return None
+    cert_file, key_file = files["RABBIT_MQ_CERT_FILE"], files["RABBIT_MQ_KEY_FILE"]
+    if (cert_file is None) != (key_file is None):
+        problem = "RABBIT_MQ_CERT_FILE and RABBIT_MQ_KEY_FILE must be given together"
+        logger.error("Invalid Kicak config: %s", problem)
+        raise KicakConfigError(problem)
+    context = _tls_context(files["RABBIT_MQ_CA_FILE"])
+    if cert_file is not None and key_file is not None:
+        _load_client_certificate(context, cert_file, key_file)
     # The host name is also what the broker's certificate must name
-    return pika.SSLOptions(_tls_context(ca_file), server_hostname=config.rabbitmq_host)
+    return pika.SSLOptions(context, server_hostname=config.rabbitmq_host)
 
 
 def _tls_context(ca_file: str | None) -> ssl.SSLContext:
@@ -229,8 +243,69 @@ def _context_trusting(ca_file: str) -> ssl.SSLContext:
     except OSError as error:
         problem = f"cannot be read: {error.strerror}"
     # Raised outside the except blocks, so the error carries no context naming the file
-    logger.error("Invalid Kicak config key RABBIT_MQ_CA_FILE: the file %s", problem)
-    raise KicakConfigError(f"RABBIT_MQ_CA_FILE {problem}")
+    raise _file_error("RABBIT_MQ_CA_FILE", problem)
+
+
+class _EncryptedKeyError(Exception):
+    """Raised by `_refuse_key_password()`: the client certificate's key is encrypted."""
+
+
+def _refuse_key_password() -> str:
+    """The password callback of `load_cert_chain()`, which OpenSSL calls for an encrypted key.
+
+    Without a callback, OpenSSL would ask for the password on the terminal, blocking the agent.
+    """
+    raise _EncryptedKeyError
+
+
+def _load_client_certificate(context: ssl.SSLContext, cert_file: str, key_file: str) -> None:
+    """Make `context` present the certificate in `cert_file`, with the private key in `key_file`.
+
+    The broker asks for it when it verifies its clients (mutual TLS). A file that cannot be read,
+    a certificate file without a PEM certificate, and a key file without the certificate's
+    unencrypted PEM private key raise `KicakConfigError` naming the config key, never the path.
+    """
+    for key, path in (("RABBIT_MQ_CERT_FILE", cert_file), ("RABBIT_MQ_KEY_FILE", key_file)):
+        _check_readable(key, path)
+    key = "RABBIT_MQ_KEY_FILE"
+    try:
+        context.load_cert_chain(cert_file, key_file, password=_refuse_key_password)
+        return
+    except _EncryptedKeyError:
+        problem = "holds an encrypted private key, which is not supported"
+    except ssl.SSLError:
+        # OpenSSL's errors do not tell which file is at fault, so the certificate is checked alone
+        if _holds_certificate(cert_file):
+            problem = "does not contain the PEM private key of RABBIT_MQ_CERT_FILE"
+        else:
+            key, problem = "RABBIT_MQ_CERT_FILE", "does not contain any PEM certificate"
+    # Raised outside the except blocks, so the error carries no context naming the file
+    raise _file_error(key, problem)
+
+
+def _check_readable(key: str, path: str) -> None:
+    """Raise `KicakConfigError` naming `key` if the file at `path` cannot be opened."""
+    try:
+        with open(path, "rb"):
+            return
+    except OSError as error:
+        problem = f"cannot be read: {error.strerror}"
+    raise _file_error(key, problem)
+
+
+def _holds_certificate(path: str) -> bool:
+    """Return whether the file at `path` holds a PEM certificate."""
+    try:
+        ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT).load_verify_locations(cafile=path)
+    except ssl.SSLError:
+        return False
+    return True
+
+
+def _file_error(key: str, problem: str) -> KicakConfigError:
+    """Log and return the error for an unusable file named by `key`, e.g. RABBIT_MQ_CA_FILE."""
+    logger.error("Invalid Kicak config key %s: the file %s", key, problem)
+    return KicakConfigError(f"{key} {problem}")
 
 
 class KicakAbstract(abc.ABC):

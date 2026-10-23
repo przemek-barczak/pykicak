@@ -125,7 +125,7 @@ jobs:
           if sys.argv[1] not in ("latest", installed):
               sys.exit(f"expected pika {sys.argv[1]}, but pika {installed} is installed")
           EOF
-      - name: Write a test CA and the broker's TLS certificate and configuration
+      - name: Write a test CA, the broker's and a client's TLS certificates, and the configuration
         run: python -m tests.integration.tls_broker_files "$RUNNER_TEMP/rabbitmq-tls"
       - name: Write the broker's advanced configuration
         # RabbitMQ checks consumer timeouts on each channel's tick, once a minute by default, so the
@@ -173,7 +173,9 @@ jobs:
             RABBIT_MQ_PORT=5671 \
             RABBIT_MQ_VIRTUAL_HOST=/ \
             RABBIT_MQ_TLS=true \
-            "RABBIT_MQ_CA_FILE=$RUNNER_TEMP/rabbitmq-tls/ca.pem" > .kicak.tls
+            "RABBIT_MQ_CA_FILE=$RUNNER_TEMP/rabbitmq-tls/ca.pem" \
+            "RABBIT_MQ_CERT_FILE=$RUNNER_TEMP/rabbitmq-tls/client.pem" \
+            "RABBIT_MQ_KEY_FILE=$RUNNER_TEMP/rabbitmq-tls/client.key" > .kicak.tls
       - run: pytest -m integration -rs
         env:
           KICAK_TLS_CONFIG_PATH: .kicak.tls

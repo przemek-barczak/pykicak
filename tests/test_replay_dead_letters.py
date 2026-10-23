@@ -298,11 +298,39 @@ def test_connection_uses_tls_with_the_ca_file(monkeypatch, tmp_path):
     assert opened[0].ssl_options.server_hostname == "localhost"
 
 
-def test_connection_refuses_a_ca_file_without_tls(monkeypatch):
-    monkeypatch.setattr(pika, "BlockingConnection", pytest.fail)
-    config = KicakConfig(values={**CONNECTION_VALUES, "RABBIT_MQ_CA_FILE": "ca.pem"})
+def test_connection_presents_the_client_certificate(monkeypatch):
+    opened: list[pika.ConnectionParameters] = []
+    monkeypatch.setattr(pika, "BlockingConnection", opened.append)
+    loaded: list[tuple[str, str | None]] = []
 
-    with pytest.raises(KicakConfigError, match="RABBIT_MQ_TLS is false"):
+    class RecordingContext(ssl.SSLContext):
+        def load_cert_chain(self, certfile, keyfile=None, password=None) -> None:
+            loaded.append((certfile, keyfile))
+
+    monkeypatch.setattr(
+        ssl, "create_default_context", lambda cafile=None: RecordingContext(ssl.PROTOCOL_TLS_CLIENT)
+    )
+    config = KicakConfig(
+        values={
+            **CONNECTION_VALUES,
+            "RABBIT_MQ_TLS": "true",
+            "RABBIT_MQ_CERT_FILE": "agent.pem",
+            "RABBIT_MQ_KEY_FILE": "agent.key",
+        }
+    )
+
+    tool._connect(config, "classifier")
+
+    assert loaded == [("agent.pem", "agent.key")]
+    assert isinstance(opened[0].ssl_options.context, RecordingContext)
+
+
+@pytest.mark.parametrize("key", ["RABBIT_MQ_CA_FILE", "RABBIT_MQ_CERT_FILE", "RABBIT_MQ_KEY_FILE"])
+def test_connection_refuses_a_tls_file_without_tls(monkeypatch, key):
+    monkeypatch.setattr(pika, "BlockingConnection", pytest.fail)
+    config = KicakConfig(values={**CONNECTION_VALUES, key: "file.pem"})
+
+    with pytest.raises(KicakConfigError, match=f"^{key} is given, but RABBIT_MQ_TLS is false$"):
         tool._connect(config, "classifier")
 
 

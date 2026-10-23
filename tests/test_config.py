@@ -97,6 +97,8 @@ def test_rabbitmq_typed_accessors():
             "RABBIT_MQ_VIRTUAL_HOST": "/",
             "RABBIT_MQ_TLS": "true",
             "RABBIT_MQ_CA_FILE": "/etc/pykicak/ca.pem",
+            "RABBIT_MQ_CERT_FILE": "/etc/pykicak/agent.pem",
+            "RABBIT_MQ_KEY_FILE": "/etc/pykicak/agent.key",
         }
     )
 
@@ -107,6 +109,8 @@ def test_rabbitmq_typed_accessors():
     assert config.rabbitmq_virtual_host == "/"
     assert config.rabbitmq_tls is True
     assert config.rabbitmq_ca_file == "/etc/pykicak/ca.pem"
+    assert config.rabbitmq_cert_file == "/etc/pykicak/agent.pem"
+    assert config.rabbitmq_key_file == "/etc/pykicak/agent.key"
 
 
 @pytest.mark.parametrize(
@@ -139,15 +143,28 @@ def test_rabbitmq_tls_rejects_other_values_without_echoing_them(value, caplog):
         assert value not in caplog.text
 
 
-def test_rabbitmq_ca_file_is_optional():
-    assert KicakConfig(values={}).rabbitmq_ca_file is None
+@pytest.mark.parametrize(
+    "accessor", ["rabbitmq_ca_file", "rabbitmq_cert_file", "rabbitmq_key_file"]
+)
+def test_rabbitmq_tls_files_are_optional(accessor):
+    assert getattr(KicakConfig(values={}), accessor) is None
 
 
-def test_rabbitmq_ca_file_rejects_an_empty_value():
-    config = KicakConfig(values={"RABBIT_MQ_CA_FILE": ""})
+@pytest.mark.parametrize(
+    ("key", "accessor", "remedy"),
+    [
+        ("RABBIT_MQ_CA_FILE", "rabbitmq_ca_file", "to trust the system's CA certificates"),
+        ("RABBIT_MQ_CERT_FILE", "rabbitmq_cert_file", "to connect without a client certificate"),
+        ("RABBIT_MQ_KEY_FILE", "rabbitmq_key_file", "to connect without a client certificate"),
+    ],
+)
+def test_rabbitmq_tls_files_reject_an_empty_value(key, accessor, remedy):
+    config = KicakConfig(values={key: ""})
 
-    with pytest.raises(KicakConfigError, match="RABBIT_MQ_CA_FILE must not be empty"):
-        _ = config.rabbitmq_ca_file
+    with pytest.raises(KicakConfigError) as exc_info:
+        getattr(config, accessor)
+
+    assert str(exc_info.value) == f"{key} must not be empty; remove it {remedy}"
 
 
 def test_malformed_line_error_does_not_echo_the_line(tmp_path, caplog):
@@ -311,6 +328,8 @@ _CONNECTION_KEYS = (
     "RABBIT_MQ_VIRTUAL_HOST",
     "RABBIT_MQ_TLS",
     "RABBIT_MQ_CA_FILE",
+    "RABBIT_MQ_CERT_FILE",
+    "RABBIT_MQ_KEY_FILE",
 )
 
 
@@ -331,6 +350,8 @@ def test_from_env_reads_every_connection_key(environment):
         "RABBIT_MQ_VIRTUAL_HOST": "/",
         "RABBIT_MQ_TLS": "true",
         "RABBIT_MQ_CA_FILE": "/etc/pykicak/ca.pem",
+        "RABBIT_MQ_CERT_FILE": "/etc/pykicak/agent.pem",
+        "RABBIT_MQ_KEY_FILE": "/etc/pykicak/agent.key",
     }
     for key, value in values.items():
         environment.setenv(key, value)

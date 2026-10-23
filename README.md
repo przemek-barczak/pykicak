@@ -115,12 +115,15 @@ application calls `from_file()` or `from_env()`.
 | `RABBIT_MQ_VIRTUAL_HOST` | RabbitMQ virtual host |
 | `RABBIT_MQ_TLS` | `true` to connect with TLS (usually port 5671), `false` for plain, unencrypted AMQP (see [TLS](#tls)) |
 | `RABBIT_MQ_CA_FILE` | Optional, TLS only: a file of PEM CA certificates, the only CAs trusted to have issued the broker's certificate (see [TLS](#tls)) |
+| `RABBIT_MQ_CERT_FILE` | Optional, TLS only: the PEM client certificate agents present to a broker that verifies its clients (see [Client certificates](#client-certificates-mutual-tls)) |
+| `RABBIT_MQ_KEY_FILE` | Optional, with `RABBIT_MQ_CERT_FILE` only: the client certificate's unencrypted PEM private key |
 
-Every key except `RABBIT_MQ_CA_FILE` is required. Whatever the source, keys are checked when they
-are read, that is when an agent connects: a missing required key raises `KicakConfigError` (from an
-Injector's `run()` or `publish()`, as the cause of `InjectionError`), and so does a port that is
-not an integer from 1 to 65535, a `RABBIT_MQ_TLS` other than `true` or `false` (in any letter
-case), and an empty `RABBIT_MQ_CA_FILE`.
+Every key except `RABBIT_MQ_CA_FILE`, `RABBIT_MQ_CERT_FILE`, and `RABBIT_MQ_KEY_FILE` is required.
+Whatever the source, keys are checked when they are read, that is when an agent connects: a missing
+required key raises `KicakConfigError` (from an Injector's `run()` or `publish()`, as the cause of
+`InjectionError`), and so does a port that is not an integer from 1 to 65535, a `RABBIT_MQ_TLS`
+other than `true` or `false` (in any letter case), and an empty `RABBIT_MQ_CA_FILE`,
+`RABBIT_MQ_CERT_FILE`, or `RABBIT_MQ_KEY_FILE`.
 
 `KicakConfig` keeps values out of its `repr()` and its errors, so they do not reach logs or crash
 reporters: the repr lists only the keys (`KicakConfig(keys=['RABBIT_MQ_HOST', ...])`), and a
@@ -201,8 +204,8 @@ certificate in `RABBIT_MQ_CA_FILE` instead. Certificates are also checked strict
 checks on Python 3.12, so a certificate is accepted or refused alike on every supported version. A
 private CA made with an old tool may therefore be refused, for example one whose Basic Constraints
 extension is not marked critical; issue it again with a current tool rather than relaxing the
-check. Client certificates (mutual TLS) are not supported: agents log in with the
-username and password, protected by the encryption.
+check. Agents log in with the username and password, protected by the encryption; a broker that
+also requires a client certificate needs [two more keys](#client-certificates-mutual-tls).
 
 When TLS fails:
 
@@ -218,6 +221,50 @@ When TLS fails:
 - Other TLS errors, for example a handshake cut off, are retried like other connection errors. That
   includes a port that does not speak TLS, such as 5672 with `RABBIT_MQ_TLS=true` (see
   [Retries and logging](#retries-and-logging)).
+
+#### Client certificates (mutual TLS)
+
+Most brokers do not need this. A broker configured to verify its clients
+(`ssl_options.verify = verify_peer` with `ssl_options.fail_if_no_peer_cert = true` in
+`rabbitmq.conf`) accepts only clients that present a certificate issued by a CA it trusts. Give
+agents theirs with two keys, always together:
+
+```text
+RABBIT_MQ_TLS=true
+RABBIT_MQ_CERT_FILE=/etc/orders/tls/agent.pem
+RABBIT_MQ_KEY_FILE=/etc/orders/tls/agent.key
+```
+
+- `RABBIT_MQ_CERT_FILE` holds the agent's certificate, in PEM. If the broker does not trust its
+  issuer directly, add the intermediate CA certificates after it, so that the broker gets the chain
+  up to a CA it trusts.
+- `RABBIT_MQ_KEY_FILE` holds the certificate's private key, in PEM and unencrypted. Encrypted keys
+  are not supported: an agent runs unattended, so the key's password would have to be stored next
+  to the key, which protects nothing. Protect the key file as you protect the password, for example
+  with file permissions or a secret mounted into the container, and decrypt an encrypted key once,
+  for example with `openssl pkey -in encrypted.key -out agent.key`. A single file holding both the
+  certificate and the key can be given as both keys.
+
+The client certificate is checked in addition to the username and password, not instead of them:
+agents still log in with `RABBIT_MQ_USERNAME` and `RABBIT_MQ_PASSWORD`. RabbitMQ's login by
+certificate alone (the `EXTERNAL` mechanism of the `rabbitmq_auth_mechanism_ssl` plugin) is not
+supported. Both files are read again for every connection, so a certificate renewed on disk, for
+example by a certificate manager, is used from the agent's next connection, without a restart.
+
+When a client certificate fails:
+
+- A certificate or key file that is missing or unreadable, a certificate file without a PEM
+  certificate, and a key file without the certificate's unencrypted PEM private key raise
+  `KicakConfigError` when connecting, as does one of the two keys without the other, or either one
+  with `RABBIT_MQ_TLS=false`. The error names the key, never the path.
+- A certificate the broker refuses (issued by a CA it does not trust, or expired), and a missing one
+  when the broker requires it, are retried like other connection errors: pika does not report the
+  broker's refusal as a certificate error, only as a connection lost during the TLS handshake or
+  right after it (`IncompatibleProtocolError` or `ssl.SSLError` naming the broker's TLS alert, such
+  as `unknown ca` or `certificate required`). An Executor therefore keeps reconnecting, with the
+  status `"UPSTREAM_RECOVER"`, until the certificate is renewed (see
+  [Retries and logging](#retries-and-logging)), and an Injector raises `InjectionError` after three
+  attempts. Monitor the expiry date of client certificates as you monitor the broker's.
 
 ## RabbitMQ topology
 
@@ -1481,7 +1528,8 @@ reconnects and receives it again.
 An Executor cannot tell a broker that is down from a connection setting that will never work, so it
 also retries indefinitely when the host name does not resolve, nothing listens on the port, or the
 port does not speak what `RABBIT_MQ_TLS` selects (for example the TLS port 5671 with
-`RABBIT_MQ_TLS=false`, the plain port 5672 with `true`, or the management port). Its status is
+`RABBIT_MQ_TLS=false`, the plain port 5672 with `true`, or the management port), or the broker
+refuses its [client certificate](#client-certificates-mutual-tls). Its status is
 `"UPSTREAM_RECOVER"` meanwhile (`"CREATED"` during the very first attempt), and it logs a `WARNING`
 for every failed attempt; alert on a status that stays `"UPSTREAM_RECOVER"`, on those warnings, or
 on the queue having no consumer.
@@ -1740,10 +1788,12 @@ about 15 seconds whatever the interval.
 
 The TLS integration tests also need a broker with a TLS listener, and the path of a `.kicak` file
 for it, with `RABBIT_MQ_TLS=true` and `RABBIT_MQ_CA_FILE`, in the `KICAK_TLS_CONFIG_PATH`
-environment variable; without it they are skipped. `python -m tests.integration.tls_broker_files
-<directory>` writes a test CA, a broker certificate for `localhost`, and the broker's TLS
-configuration; the integration job in `.github/workflows/ci.yml` shows how to start RabbitMQ with
-them.
+environment variable; without it they are skipped. The client certificate tests also need
+`RABBIT_MQ_CERT_FILE` and `RABBIT_MQ_KEY_FILE` in that file, and a broker that verifies the
+certificate of a client that presents one but also accepts clients without one; without the keys
+they are skipped. `python -m tests.integration.tls_broker_files <directory>` writes a test CA, a
+broker certificate for `localhost`, a client certificate, and such a broker's TLS configuration;
+the integration job in `.github/workflows/ci.yml` shows how to start RabbitMQ with them.
 
 ### CI and releases
 

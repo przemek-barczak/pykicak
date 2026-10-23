@@ -13,6 +13,7 @@ import socket
 import ssl
 import threading
 from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
 import trustme
@@ -20,6 +21,7 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
+from pika.exceptions import AMQPConnectionError
 
 from pykicak.abstracts import KicakAbstract
 from pykicak.config import KicakConfig, KicakConfigError
@@ -41,6 +43,7 @@ class TlsServer:
         self._listener.settimeout(0.05)
         self.port: int = self._listener.getsockname()[1]
         self._handshakes: list[bool] = []
+        self._client_certificates: list[dict[str, object]] = []
         self._handshake_done = threading.Condition()
         self._stopped = threading.Event()
         self._thread = threading.Thread(target=self._serve, daemon=True)
@@ -54,13 +57,17 @@ class TlsServer:
                 continue
             with connection:
                 connection.settimeout(5)
+                client_certificate: dict[str, object] = {}
                 try:
-                    with self._context.wrap_socket(connection, server_side=True):
+                    with self._context.wrap_socket(connection, server_side=True) as tls_connection:
                         succeeded = True
-                except OSError:  # ssl.SSLError included: the client refused the certificate
+                        client_certificate = dict(tls_connection.getpeercert() or {})
+                except OSError:  # ssl.SSLError included: one side refused the other's certificate
                     succeeded = False
                 with self._handshake_done:
                     self._handshakes.append(succeeded)
+                    if succeeded:
+                        self._client_certificates.append(client_certificate)
                     self._handshake_done.notify_all()
 
     def handshakes(self, count: int) -> list[bool]:
@@ -72,11 +79,29 @@ class TlsServer:
             self._handshake_done.wait_for(lambda: len(self._handshakes) >= count, timeout=5)
             return list(self._handshakes)
 
+    def client_certificates(self) -> list[dict[str, object]]:
+        """Return the certificate each client presented in a successful handshake, so far.
+
+        Empty for a client that presented none; call `handshakes()` first to wait for them.
+        """
+        with self._handshake_done:
+            return list(self._client_certificates)
+
     @classmethod
     def issued_by(cls, ca: trustme.CA, *identities: str) -> TlsServer:
         """A server whose certificate `ca` issued for `identities`, sent with its CA chain."""
         context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
         ca.issue_cert(*identities).configure_cert(context)
+        return cls(context)
+
+    @classmethod
+    def verifying_clients(cls, ca: trustme.CA, client_ca: trustme.CA) -> TlsServer:
+        """A server for 127.0.0.1, its certificate issued by `ca`, that requires every client to
+        present a certificate issued by `client_ca` (mutual TLS)."""
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ca.issue_cert("127.0.0.1").configure_cert(context)
+        client_ca.configure_trust(context)
+        context.verify_mode = ssl.CERT_REQUIRED
         return cls(context)
 
     def close(self) -> None:
@@ -168,6 +193,17 @@ def write_ca_file(ca: trustme.CA, tmp_path) -> str:
     path = tmp_path / "ca.pem"
     ca.cert_pem.write_to_path(str(path))
     return str(path)
+
+
+def write_client_certificate(ca: trustme.CA, tmp_path, *, chain: bool = False) -> dict[str, str]:
+    """Write a client certificate `ca` issued for `agent.example`, and its private key; return
+    the config values naming them. With `chain`, the certificate file also holds its CA chain."""
+    leaf = ca.issue_cert("agent.example")
+    cert_file, key_file = tmp_path / "client.pem", tmp_path / "client.key"
+    pems = leaf.cert_chain_pems if chain else leaf.cert_chain_pems[:1]
+    cert_file.write_bytes(b"".join(pem.bytes() for pem in pems))
+    leaf.private_key_pem.write_to_path(str(key_file))
+    return {"RABBIT_MQ_CERT_FILE": str(cert_file), "RABBIT_MQ_KEY_FILE": str(key_file)}
 
 
 def tls_config(port: int = 5671, /, **values: str) -> KicakConfig:
@@ -447,3 +483,254 @@ def test_injector_raises_on_the_first_attempt_when_the_certificate_is_refused(
 
     assert isinstance(exc_info.value.__cause__, ssl.SSLCertVerificationError)
     assert server.handshakes(1) == [False]
+
+
+# --- client certificates (mutual TLS) -------------------------------------------------------
+
+
+@pytest.fixture
+def client_ca() -> trustme.CA:
+    """The CA the `verifying_server` fixture trusts to have issued client certificates."""
+    return trustme.CA()
+
+
+@pytest.fixture
+def verifying_server(server_ca, client_ca) -> Iterator[TlsServer]:
+    """A TLS server for 127.0.0.1 that requires a client certificate `client_ca` issued."""
+    tls_server = TlsServer.verifying_clients(server_ca, client_ca)
+    yield tls_server
+    tls_server.close()
+
+
+def connect_once(agent: KicakAbstract) -> None:
+    """Open one connection as `agent` does, expecting the server to close it after TLS."""
+    # The server closes the connection after the handshake, before any AMQP is exchanged
+    with pytest.raises(Exception) as exc_info:
+        KicakAbstract._create_connection(agent)
+
+    assert not isinstance(exc_info.value, ssl.SSLError)
+
+
+def test_client_certificate_is_presented_to_a_server_that_requires_one(
+    verifying_server, server_ca, client_ca, tmp_path
+):
+    executor = TlsExecutor(
+        tls_config(
+            verifying_server.port,
+            RABBIT_MQ_CA_FILE=write_ca_file(server_ca, tmp_path),
+            **write_client_certificate(client_ca, tmp_path),
+        )
+    )
+
+    connect_once(executor)
+
+    assert verifying_server.handshakes(1) == [True]
+    [client_certificate] = verifying_server.client_certificates()
+    assert client_certificate["subjectAltName"] == (("DNS", "agent.example"),)
+
+
+def test_client_certificate_file_may_hold_the_intermediate_ca(server_ca, tmp_path):
+    # The server trusts only the root CA, so the client must send the intermediate CA too
+    root_ca = trustme.CA()
+    verifying_server = TlsServer.verifying_clients(server_ca, root_ca)
+    try:
+        executor = TlsExecutor(
+            tls_config(
+                verifying_server.port,
+                RABBIT_MQ_CA_FILE=write_ca_file(server_ca, tmp_path),
+                **write_client_certificate(root_ca.create_child_ca(), tmp_path, chain=True),
+            )
+        )
+
+        connect_once(executor)
+    finally:
+        verifying_server.close()
+
+    assert verifying_server.handshakes(1) == [True]
+
+
+def test_certificate_and_key_may_be_one_file(verifying_server, server_ca, client_ca, tmp_path):
+    files = write_client_certificate(client_ca, tmp_path)
+    combined = tmp_path / "client-and-key.pem"
+    combined.write_bytes(
+        Path(files["RABBIT_MQ_CERT_FILE"]).read_bytes()
+        + Path(files["RABBIT_MQ_KEY_FILE"]).read_bytes()
+    )
+    executor = TlsExecutor(
+        tls_config(
+            verifying_server.port,
+            RABBIT_MQ_CA_FILE=write_ca_file(server_ca, tmp_path),
+            RABBIT_MQ_CERT_FILE=str(combined),
+            RABBIT_MQ_KEY_FILE=str(combined),
+        )
+    )
+
+    connect_once(executor)
+
+    assert verifying_server.handshakes(1) == [True]
+
+
+def test_client_certificate_is_read_again_for_every_connection(
+    verifying_server, server_ca, client_ca, tmp_path
+):
+    # e.g. a certificate renewed on disk while the agent runs is used from its next connection
+    files = write_client_certificate(trustme.CA(), tmp_path)  # refused: another CA issued it
+    executor = TlsExecutor(
+        tls_config(
+            verifying_server.port, RABBIT_MQ_CA_FILE=write_ca_file(server_ca, tmp_path), **files
+        )
+    )
+    # pika reports the refusal as an ssl.SSLError (TLS 1.2) or a lost connection (TLS 1.3)
+    with pytest.raises((AMQPConnectionError, OSError)):
+        KicakAbstract._create_connection(executor)
+    verifying_server.handshakes(1)
+
+    write_client_certificate(client_ca, tmp_path)  # overwrites both files
+    connect_once(executor)
+
+    assert verifying_server.handshakes(2) == [False, True]
+
+
+def test_injector_retries_when_the_server_refuses_its_client_certificate(
+    verifying_server, server_ca, tmp_path, monkeypatch
+):
+    # The refusal reaches pika as a lost or failed connection, like an unreachable broker
+    monkeypatch.setattr("pykicak.injector.time.sleep", lambda _seconds: None)
+    injector = TlsInjector(
+        tls_config(
+            verifying_server.port,
+            RABBIT_MQ_CA_FILE=write_ca_file(server_ca, tmp_path),
+            **write_client_certificate(trustme.CA(), tmp_path),
+        )
+    )
+
+    with pytest.raises(InjectionError):
+        injector.run()
+
+    assert verifying_server.handshakes(3) == [False, False, False]
+
+
+def test_executor_keeps_retrying_when_the_server_requires_a_client_certificate(
+    verifying_server, server_ca, tmp_path, monkeypatch
+):
+    executor = TlsExecutor(
+        tls_config(verifying_server.port, RABBIT_MQ_CA_FILE=write_ca_file(server_ca, tmp_path))
+    )
+    statuses: list[ExecutorStatus] = []
+
+    def stop_instead_of_waiting(_seconds: float) -> bool:
+        statuses.append(executor.get_info().status)
+        executor.stop()
+        return False
+
+    monkeypatch.setattr(executor, "_sleep_unless_stopped", stop_instead_of_waiting)
+
+    executor.run()
+
+    assert statuses == [ExecutorStatus.UPSTREAM_RECOVER]
+    assert executor.get_info().status == ExecutorStatus.STOPPED
+    assert verifying_server.handshakes(1) == [False]
+
+
+@pytest.mark.parametrize("key", ["RABBIT_MQ_CERT_FILE", "RABBIT_MQ_KEY_FILE"])
+def test_client_certificate_without_tls_raises_config_error(monkeypatch, tmp_path, key):
+    files = write_client_certificate(trustme.CA(), tmp_path)
+    config = KicakConfig(values={**CONNECTION_VALUES, key: files[key]})
+
+    with pytest.raises(KicakConfigError, match=f"^{key} requires RABBIT_MQ_TLS=true$"):
+        captured_connection_parameters(TlsExecutor(config), monkeypatch)
+
+
+@pytest.mark.parametrize("key", ["RABBIT_MQ_CERT_FILE", "RABBIT_MQ_KEY_FILE"])
+def test_client_certificate_and_key_must_be_given_together(monkeypatch, tmp_path, key):
+    files = write_client_certificate(trustme.CA(), tmp_path)
+    executor = TlsExecutor(tls_config(**{key: files[key]}))
+
+    with pytest.raises(
+        KicakConfigError,
+        match="^RABBIT_MQ_CERT_FILE and RABBIT_MQ_KEY_FILE must be given together$",
+    ):
+        captured_connection_parameters(executor, monkeypatch)
+
+
+def encrypted(key_pem: bytes) -> bytes:
+    """Return the PEM private key `key_pem`, encrypted with a password."""
+    key = serialization.load_pem_private_key(key_pem, password=None)
+    return key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.BestAvailableEncryption(b"key-password"),
+    )
+
+
+_OTHER_KEY = trustme.CA().issue_cert("other.example").private_key_pem.bytes()
+
+
+@pytest.mark.parametrize(
+    ("key", "change", "problem"),
+    [
+        ("RABBIT_MQ_CERT_FILE", None, "cannot be read: No such file or directory"),
+        ("RABBIT_MQ_KEY_FILE", None, "cannot be read: No such file or directory"),
+        ("RABBIT_MQ_CERT_FILE", "directory", "cannot be read: Is a directory"),
+        ("RABBIT_MQ_CERT_FILE", b"", "does not contain any PEM certificate"),
+        ("RABBIT_MQ_CERT_FILE", b"not a certificate\n", "does not contain any PEM certificate"),
+        ("RABBIT_MQ_CERT_FILE", "key", "does not contain any PEM certificate"),
+        (
+            "RABBIT_MQ_KEY_FILE",
+            b"not a key\n",
+            "does not contain the PEM private key of RABBIT_MQ_CERT_FILE",
+        ),
+        (
+            "RABBIT_MQ_KEY_FILE",
+            "certificate",
+            "does not contain the PEM private key of RABBIT_MQ_CERT_FILE",
+        ),
+        (
+            "RABBIT_MQ_KEY_FILE",
+            _OTHER_KEY,
+            "does not contain the PEM private key of RABBIT_MQ_CERT_FILE",
+        ),
+        (
+            "RABBIT_MQ_KEY_FILE",
+            "encrypted",
+            "holds an encrypted private key, which is not supported",
+        ),
+    ],
+    ids=[
+        "missing-certificate",
+        "missing-key",
+        "directory",
+        "empty-certificate",
+        "not-pem-certificate",
+        "key-as-certificate",
+        "not-pem-key",
+        "certificate-as-key",
+        "key-of-another-certificate",
+        "encrypted-key",
+    ],
+)
+def test_unusable_client_certificate_raises_config_error_without_naming_the_file(
+    monkeypatch, tmp_path, caplog, key, change, problem
+):
+    files = write_client_certificate(trustme.CA(), tmp_path)
+    secret_path = tmp_path / "secret-name.pem"
+    if change == "directory":
+        secret_path.mkdir()
+    elif change == "key":
+        secret_path.write_bytes(Path(files["RABBIT_MQ_KEY_FILE"]).read_bytes())
+    elif change == "certificate":
+        secret_path.write_bytes(Path(files["RABBIT_MQ_CERT_FILE"]).read_bytes())
+    elif change == "encrypted":
+        secret_path.write_bytes(encrypted(Path(files["RABBIT_MQ_KEY_FILE"]).read_bytes()))
+    elif change is not None:
+        secret_path.write_bytes(change)
+    executor = TlsExecutor(tls_config(**{**files, key: str(secret_path)}))
+
+    with pytest.raises(KicakConfigError) as exc_info:
+        captured_connection_parameters(executor, monkeypatch)
+
+    assert str(exc_info.value) == f"{key} {problem}"
+    assert exc_info.value.__context__ is None
+    assert exc_info.value.__cause__ is None
+    assert "secret-name" not in caplog.text
+    assert f"Invalid Kicak config key {key}: the file {problem}" in caplog.text
