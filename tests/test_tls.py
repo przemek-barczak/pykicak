@@ -273,23 +273,41 @@ def test_connection_with_tls_verifies_the_certificate_and_the_host_name(monkeypa
     assert context.minimum_version >= ssl.TLSVersion.TLSv1_2
 
 
-@pytest.mark.parametrize("ca_file", [False, True], ids=["system-cas", "ca-file"])
-def test_connection_requires_tls_1_2_whatever_python_defaults_to(monkeypatch, tmp_path, ca_file):
+def python_defaults_to_minimum(monkeypatch, minimum: ssl.TLSVersion) -> None:
+    """Make Python's default TLS context start with `minimum`, which depends on how Python and
+    OpenSSL were built, so a test covers the same code on every build."""
     create_default_context = ssl.create_default_context
 
-    def permissive_default_context(*args, **kwargs) -> ssl.SSLContext:
-        # As some builds do: the minimum is left to OpenSSL
+    def default_context(*args, **kwargs) -> ssl.SSLContext:
         context = create_default_context(*args, **kwargs)
-        context.minimum_version = ssl.TLSVersion.MINIMUM_SUPPORTED
+        context.minimum_version = minimum
         return context
 
-    monkeypatch.setattr("pykicak.abstracts.ssl.create_default_context", permissive_default_context)
+    monkeypatch.setattr("pykicak.abstracts.ssl.create_default_context", default_context)
+
+
+@pytest.mark.parametrize("ca_file", [False, True], ids=["system-cas", "ca-file"])
+def test_connection_requires_tls_1_2_whatever_python_defaults_to(monkeypatch, tmp_path, ca_file):
+    # As some builds do, e.g. Ubuntu's Python 3.14: the minimum is left to OpenSSL
+    python_defaults_to_minimum(monkeypatch, ssl.TLSVersion.MINIMUM_SUPPORTED)
     values = {"RABBIT_MQ_CA_FILE": write_ca_file(trustme.CA(), tmp_path)} if ca_file else {}
     executor = TlsExecutor(tls_config(**values))
 
     context = captured_connection_parameters(executor, monkeypatch).ssl_options.context
 
     assert context.minimum_version == ssl.TLSVersion.TLSv1_2
+
+
+@pytest.mark.parametrize("ca_file", [False, True], ids=["system-cas", "ca-file"])
+def test_connection_keeps_a_stricter_minimum_python_defaults_to(monkeypatch, tmp_path, ca_file):
+    # TLS 1.2 is only the floor: a Python that already requires TLS 1.3 is not lowered to 1.2
+    python_defaults_to_minimum(monkeypatch, ssl.TLSVersion.TLSv1_3)
+    values = {"RABBIT_MQ_CA_FILE": write_ca_file(trustme.CA(), tmp_path)} if ca_file else {}
+    executor = TlsExecutor(tls_config(**values))
+
+    context = captured_connection_parameters(executor, monkeypatch).ssl_options.context
+
+    assert context.minimum_version == ssl.TLSVersion.TLSv1_3
 
 
 @pytest.mark.parametrize("ca_file", [False, True], ids=["system-cas", "ca-file"])
