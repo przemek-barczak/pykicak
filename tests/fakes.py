@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import sys
 import time
 from collections.abc import Callable
 from typing import Any
 
 import pika
+import pytest
 from pika.exceptions import ChannelClosedByBroker
 
 from pykicak.abstracts import KicakAbstract
@@ -312,6 +314,18 @@ class FakeConnection:
 
     def close(self) -> None:
         self.is_open = False
+
+
+def replace_in_pykicak(monkeypatch: pytest.MonkeyPatch, name: str, replacement: object) -> None:
+    """Replace `name`, e.g. the clock `_now`, in every pykicak module that defines or imported it.
+
+    A module that imported a function holds its own reference to it, so replacing it where it is
+    defined is not enough; this finds every holder, wherever the code using it lives.
+    """
+    for module_name, module in list(sys.modules.items()):
+        in_pykicak = module_name == "pykicak" or module_name.startswith("pykicak.")
+        if in_pykicak and hasattr(module, name):
+            monkeypatch.setattr(module, name, replacement)
 
 
 class FakeStopwatch:

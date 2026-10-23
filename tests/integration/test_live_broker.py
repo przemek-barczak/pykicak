@@ -30,6 +30,7 @@ from pika.exceptions import UnroutableError
 from pika.spec import Basic
 
 from examples.replay_dead_letters import replay_dead_letters
+from pykicak._executor.topology import _ExecutorTopology
 from pykicak.abstracts import _tls_options
 from pykicak.config import KicakConfig
 from pykicak.executor import (
@@ -106,7 +107,7 @@ class RecordingAgent[M: KicakMessage, R: KicakMessage | None](KicakExecutorAbstr
         if payload == "unavailable":
             raise TransientProcessingError("service unavailable")
         # Only the forwarding RecordingExecutor has a destination, and it publishes what it accepts
-        return cast(R, message) if self._destination_exchange is not None else None
+        return cast(R, message) if self._topology.destination_exchange is not None else None
 
     def handle_next_delivery(self, queue: str) -> Basic.Deliver:
         """Handle one delivery through the executor's real decode/execute/settle path."""
@@ -746,6 +747,29 @@ def test_executor_recreates_a_deleted_downstream_queue_as_its_own_executor_decla
     assert [m.message_id for m in downstream_executor.received] == ["hello"]
 
 
+def _as_topology_class[T: _ExecutorTopology](
+    topology: _ExecutorTopology, topology_class: type[T]
+) -> T:
+    """Return `topology` as an instance of `topology_class`, which changes how it is declared."""
+    fields = {field.name: getattr(topology, field.name) for field in dataclasses.fields(topology)}
+    return topology_class(**fields)
+
+
+class _RacingTopology(_ExecutorTopology):
+    """Loses the downstream bindings right after declaring the output side the second time."""
+
+    output_declarations = 0
+
+    def declare_output_side(self, channel) -> None:
+        super().declare_output_side(channel)
+        # The topology is a frozen dataclass, whose __setattr__ fails for a subclass on Python
+        # 3.12 when it is slotted
+        object.__setattr__(self, "output_declarations", self.output_declarations + 1)
+        if self.output_declarations == 2:  # 1 is on connecting, 2 right before publishing
+            for queue in self.destination_queues:
+                channel.queue_unbind(queue=queue, exchange=self.destination_exchange)
+
+
 class BindingRaceExecutor(RecordingExecutor):
     """Loses its downstream bindings right after verifying the output side the first time.
 
@@ -755,14 +779,12 @@ class BindingRaceExecutor(RecordingExecutor):
 
     def __init__(self, config: KicakConfig, **topology) -> None:
         super().__init__(config, **topology)
-        self.output_verifications = 0
+        self._topology = _as_topology_class(self._topology, _RacingTopology)
 
-    def _declare_output_side(self, channel) -> None:
-        super()._declare_output_side(channel)
-        self.output_verifications += 1
-        if self.output_verifications == 2:  # 1 is on connecting, 2 right before publishing
-            for queue in self._destination_queues:
-                channel.queue_unbind(queue=queue, exchange=self._destination_exchange)
+    @property
+    def output_verifications(self) -> int:
+        """How often it declared its output side."""
+        return cast(_RacingTopology, self._topology).output_declarations
 
 
 def test_executor_holds_unroutable_results_and_publishes_them_without_executing_again(
@@ -1086,6 +1108,18 @@ class _ConsumerTimeoutChannel:
         return self._channel.queue_declare(arguments={**arguments, **timeout}, **parameters)
 
 
+class _TimingOutTopology(_ExecutorTopology):
+    """Declares the source queue with a short `x-consumer-timeout`, and every other one as usual.
+
+    The other queues, e.g. a destination queue, are declared as their own consumers declare them.
+    """
+
+    def declare_input_queue(self, channel, queue_name: str) -> None:
+        if queue_name == self.source_queue:
+            channel = _ConsumerTimeoutChannel(channel)
+        super().declare_input_queue(channel, queue_name)
+
+
 class TimedOutTerminator(RecordingTerminator):
     """Holds its first message until RabbitMQ's consumer timeout takes it back, then stops after
     executing the redelivery.
@@ -1098,16 +1132,14 @@ class TimedOutTerminator(RecordingTerminator):
 
     def __init__(self, config: KicakConfig, **topology) -> None:
         super().__init__(config, **topology)
+        self._topology = _as_topology_class(self._topology, _TimingOutTopology)
         self._test_config = config
         self.redelivered: list[bool | None] = []  # as get_info() reports it for each execution
-
-    def _declare_input_queue(self, channel, queue_name: str) -> None:
-        super()._declare_input_queue(_ConsumerTimeoutChannel(channel), queue_name)
 
     def execute(self, message: IntegrationMessage) -> None:
         self.redelivered.append(self.get_info().redelivered)
         if not self.received:
-            _wait_until_unconsumed(self._test_config, self._source_queue)
+            _wait_until_unconsumed(self._test_config, self._topology.source_queue)
         else:
             self.stop()
         super().execute(message)
@@ -1122,18 +1154,14 @@ class TimedOutExecutor(RecordingExecutor):
 
     def __init__(self, config: KicakConfig, **topology) -> None:
         super().__init__(config, **topology)
+        self._topology = _as_topology_class(self._topology, _TimingOutTopology)
         self._test_config = config
-
-    def _declare_input_queue(self, channel, queue_name: str) -> None:
-        if queue_name == self._source_queue:
-            channel = _ConsumerTimeoutChannel(channel)
-        super()._declare_input_queue(channel, queue_name)
 
     def execute(
         self, message: IntegrationMessage
     ) -> IntegrationMessage | Sequence[IntegrationMessage] | None:
         if not self.received:
-            _wait_until_unconsumed(self._test_config, self._source_queue)
+            _wait_until_unconsumed(self._test_config, self._topology.source_queue)
         else:
             self.stop()
         return super().execute(message)

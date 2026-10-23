@@ -102,7 +102,9 @@ show_missing = true
 line-length = 100
 
 [tool.ruff.lint]
-select = ["E4", "E7", "E9", "F", "W", "I", "B", "UP"]
+# C90 and the PLR rules keep functions small: at most a McCabe complexity of 10, 6 returns,
+# 12 branches, and 50 statements
+select = ["E4", "E7", "E9", "F", "W", "I", "B", "UP", "C90", "PLR0911", "PLR0912", "PLR0915"]
 
 [tool.mypy]
 python_version = "3.12"
