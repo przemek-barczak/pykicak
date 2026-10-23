@@ -3,104 +3,24 @@
 from __future__ import annotations
 
 import abc
-import logging
-import math
 import time
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager
-from dataclasses import dataclass, field
-from enum import StrEnum
+from collections.abc import Callable
 from typing import cast
 
-from pika.exchange_type import ExchangeType
-
-from pykicak.abstracts import (
-    KicakAbstract,
-    _check_name,
-    _log_values,
-    _monotonic,
-    _type_arguments,
-    _union_members,
+from pykicak._injector import logger
+from pykicak._injector.message_type import _declared_message_type, _serialized
+from pykicak._injector.settings import (
+    _DEFAULT_BLOCKED_TIMEOUT_SECONDS,
+    _MAX_RABBITMQ_ATTEMPTS,
+    _check_interval_seconds,
+    _checked_blocked_timeout_seconds,
+    _retry_delay_seconds,
 )
+from pykicak._injector.statistics import _Injection, _TimedPart
+from pykicak._injector.topology import _InjectorTopology
+from pykicak.abstracts import KicakAbstract, _monotonic
 from pykicak.config import KicakConfig
-from pykicak.messages import KicakMessage, _type_name_of
-
-logger = logging.getLogger(__name__)
-
-_MAX_RABBITMQ_ATTEMPTS = 3
-_INITIAL_RETRY_DELAY_SECONDS = 1.0  # attempts: immediately, after 1 second, after 2 more seconds
-_DEFAULT_BLOCKED_TIMEOUT_SECONDS = 60.0
-
-
-_INJECTOR_TYPE_USAGE = "KicakInjectorAbstract[MyMessage]"
-
-
-class _TimedPart(StrEnum):
-    """A part of an injection whose duration the `Message injected` line reports."""
-
-    CONNECT = "connect"
-    """Opening a connection and declaring the exchange, when the attempt needs a connection."""
-
-    PUBLISH = "publish"
-    """Publishing the message and waiting for RabbitMQ's confirmation."""
-
-    BACKOFF = "backoff"
-    """The time between two attempts: discarding the failed connection and waiting to retry."""
-
-
-@dataclass(slots=True)
-class _Injection:
-    """How the injection of one message goes, for the `Message injected` line logged at its end.
-
-    Times are of `_monotonic()`, durations in seconds.
-    """
-
-    message: KicakMessage
-    body: bytes
-    started_at: float
-    generate_seconds: float | None
-    """How long `generate()` took, or None for a message given to `publish()`."""
-
-    attempts: int = 0
-    seconds: dict[_TimedPart, float] = field(default_factory=lambda: dict.fromkeys(_TimedPart, 0.0))
-    attempt_ended_at: float = 0.0
-    error: BaseException | None = None
-    """What ended the last attempt, if the message was not injected."""
-
-    @contextmanager
-    def timing(self, part: _TimedPart) -> Iterator[None]:
-        """Add how long the `with` block takes to the duration of `part`, also if it raises."""
-        started_at = _monotonic()
-        try:
-            yield
-        finally:
-            self.seconds[part] += _monotonic() - started_at
-
-    @contextmanager
-    def attempt(self) -> Iterator[None]:
-        """Count an attempt, adding the time since the previous one ended to the backoff."""
-        if self.attempts:
-            self.seconds[_TimedPart.BACKOFF] += _monotonic() - self.attempt_ended_at
-        self.attempts += 1
-        try:
-            yield
-        finally:
-            self.attempt_ended_at = _monotonic()
-
-
-def _declared_message_type(injector_class: type) -> type[KicakMessage]:
-    """Return the message type an Injector class declares in its class header.
-
-    Raises `TypeError` unless it is one message class that declares its own `kicak_type`.
-    """
-    (argument,) = _type_arguments(injector_class, KicakInjectorAbstract, usage=_INJECTOR_TYPE_USAGE)
-    members = _union_members(argument)
-    if len(members) > 1:
-        raise TypeError(
-            f"{injector_class.__name__} must declare one message type, got {argument!r}"
-        )
-    _type_name_of(members[0])
-    return cast(type[KicakMessage], members[0])
+from pykicak.messages import KicakMessage
 
 
 class InjectionError(Exception):
@@ -187,30 +107,23 @@ class KicakInjectorAbstract[M: KicakMessage](KicakAbstract, abc.ABC):
         `ValueError` is raised. An injector always gives up eventually, so there is no value for
         waiting until the alarm clears.
         """
-        self._message_type = cast(type[M], _declared_message_type(type(self)))
-        _check_name("exchange_name", exchange_name)
-        if isinstance(blocked_timeout_seconds, bool) or not isinstance(
-            blocked_timeout_seconds, int | float
-        ):
-            raise TypeError("blocked_timeout_seconds must be a number")
-        if not math.isfinite(blocked_timeout_seconds) or blocked_timeout_seconds <= 0:
-            raise ValueError("blocked_timeout_seconds must be a finite number greater than 0")
+        self._message_type = cast(
+            type[M], _declared_message_type(type(self), KicakInjectorAbstract)
+        )
+        self._topology = _InjectorTopology.checked(exchange_name=exchange_name)
+        blocked_timeout = _checked_blocked_timeout_seconds(blocked_timeout_seconds)
         super().__init__(config)
-        self._exchange_name = exchange_name
         # A memory or disk alarm blocks publishing connections; without a timeout, a publish
         # would wait for its confirmation until the alarm clears. The Executor keeps waiting.
-        self._blocked_connection_timeout_seconds = float(blocked_timeout_seconds)
+        self._blocked_connection_timeout_seconds = blocked_timeout
 
     def _connection_label(self) -> str:
         """Name the injector's role and exchange in its connection name."""
-        return f"injector exchange={self._exchange_name}"
+        return f"injector exchange={self._topology.exchange_name}"
 
     def _declare_topology(self) -> None:
         """Idempotently declare the exchange as durable."""
-        logger.debug("Declaring exchange %s", self._exchange_name)
-        self.channel.exchange_declare(
-            exchange=self._exchange_name, exchange_type=ExchangeType.fanout, durable=True
-        )
+        self._topology.declare(self.channel)
 
     def _retry_rabbitmq_operation[T](self, operation: Callable[[], T], operation_name: str) -> T:
         """Try a RabbitMQ operation up to three times: now, after 1 second, after 2 more seconds.
@@ -245,7 +158,7 @@ class KicakInjectorAbstract[M: KicakMessage](KicakAbstract, abc.ABC):
                     _MAX_RABBITMQ_ATTEMPTS,
                     error,
                 )
-                delay_seconds = _INITIAL_RETRY_DELAY_SECONDS * 2 ** (attempt - 1)
+                delay_seconds = _retry_delay_seconds(attempt)
                 logger.debug(
                     "Waiting %.1f seconds before retrying %s", delay_seconds, operation_name
                 )
@@ -287,7 +200,7 @@ class KicakInjectorAbstract[M: KicakMessage](KicakAbstract, abc.ABC):
         try:
             self._publish_with_retries(injection)
         finally:
-            self._log_injected(injection)
+            injection.log_injected(self._topology.exchange_name)
 
     def _serialize(self, message: KicakMessage) -> bytes:
         """Check `message`'s class and serialize it, logging a failure at ERROR and raising it.
@@ -295,27 +208,12 @@ class KicakInjectorAbstract[M: KicakMessage](KicakAbstract, abc.ABC):
         A message of another class than the declared one raises `TypeError`: exactly that class,
         because a subclass would be sent with its own type name.
         """
-        if type(message) is not self._message_type:
-            logger.error(
-                "Message refused type=%s exchange=%s: %s declares its messages as %s",
-                type(message).__name__,
-                self._exchange_name,
-                type(self).__name__,
-                self._message_type.__name__,
-            )
-            raise TypeError(
-                f"{type(self).__name__} declares its messages as {self._message_type.__name__}, "
-                f"got {type(message).__name__}"
-            )
-        try:
-            return message.to_bytes()
-        except Exception:
-            logger.exception(
-                "Failed to serialize message type=%s exchange=%s",
-                type(message).__name__,
-                self._exchange_name,
-            )
-            raise
+        return _serialized(
+            message,
+            self._message_type,
+            injector_name=type(self).__name__,
+            exchange_name=self._topology.exchange_name,
+        )
 
     def _publish_with_retries(self, injection: _Injection) -> None:
         """Connect if needed and publish, up to three attempts; raise InjectionError on failure.
@@ -324,13 +222,14 @@ class KicakInjectorAbstract[M: KicakMessage](KicakAbstract, abc.ABC):
         `injection`.
         """
         message = injection.message
+        exchange_name = self._topology.exchange_name
 
         def connect_and_publish() -> None:
             with injection.attempt():
                 with injection.timing(_TimedPart.CONNECT):
                     self._ensure_connection_once()
                 with injection.timing(_TimedPart.PUBLISH):
-                    self._publish_serialized(self._exchange_name, message, injection.body)
+                    self._publish_serialized(exchange_name, message, injection.body)
 
         try:
             self._retry_rabbitmq_operation(
@@ -340,41 +239,8 @@ class KicakInjectorAbstract[M: KicakMessage](KicakAbstract, abc.ABC):
         except BaseException as error:
             injection.error = error
             if isinstance(error, Exception):
-                raise InjectionError(message, self._exchange_name) from error
+                raise InjectionError(message, exchange_name) from error
             raise  # e.g. KeyboardInterrupt, which is not an injection failure to wrap
-
-    def _log_injected(self, injection: _Injection) -> None:
-        """Log the `Message injected` line: whether the message was injected, and what it took.
-
-        One line at `INFO` for every message handed to RabbitMQ, by `run()` or `publish()`,
-        whatever the outcome, so that statistics can be computed from the logs; nothing is
-        logged for a message that was never published, e.g. because `generate()` returned None
-        or raised. The record also carries the values, typed, as its `kicak` attribute.
-        """
-        if not logger.isEnabledFor(logging.INFO):
-            return
-        message = injection.message
-        error = injection.error
-        seconds = injection.seconds
-        _log_values(
-            logger,
-            "Message injected",
-            "message_injected",
-            {
-                "outcome": "injected" if error is None else "failed",
-                "error": None if error is None else type(error).__name__,
-                "type": type(message).__name__,
-                "id": message.message_id,
-                "exchange": self._exchange_name,
-                "attempts": injection.attempts,
-                "message_bytes": len(injection.body),
-                "total_seconds": _monotonic() - injection.started_at,
-                "generate_seconds": injection.generate_seconds,
-                "connect_seconds": seconds[_TimedPart.CONNECT],
-                "publish_seconds": seconds[_TimedPart.PUBLISH],
-                "backoff_seconds": seconds[_TimedPart.BACKOFF],
-            },
-        )
 
     def run(self, interval_seconds: float = 0) -> None:
         """Inject one generated message on a short-lived connection, or repeat it at an interval.
@@ -406,13 +272,10 @@ class KicakInjectorAbstract[M: KicakMessage](KicakAbstract, abc.ABC):
         A retried attempt publishes the message again, and RabbitMQ may already have accepted
         the earlier one, so it can arrive twice; the consuming agents must be idempotent.
         """
-        if isinstance(interval_seconds, bool) or not isinstance(interval_seconds, int | float):
-            raise TypeError("interval_seconds must be a number")
-        if not math.isfinite(interval_seconds):
-            raise ValueError("interval_seconds must be a finite number")
+        _check_interval_seconds(interval_seconds)
         logger.debug(
             "Starting Injector run exchange=%s interval_seconds=%s",
-            self._exchange_name,
+            self._topology.exchange_name,
             interval_seconds,
         )
         if interval_seconds <= 0:
@@ -425,13 +288,12 @@ class KicakInjectorAbstract[M: KicakMessage](KicakAbstract, abc.ABC):
 
     def _inject(self) -> None:
         """Generate one message and publish it on a connection that is closed afterwards."""
+        exchange_name = self._topology.exchange_name
         started_at = _monotonic()
         try:
             message = self.generate()
         except Exception:
-            logger.exception(
-                "%s.generate() failed exchange=%s", type(self).__name__, self._exchange_name
-            )
+            logger.exception("%s.generate() failed exchange=%s", type(self).__name__, exchange_name)
             raise
         generate_seconds = _monotonic() - started_at
         if message is None:
@@ -443,4 +305,4 @@ class KicakInjectorAbstract[M: KicakMessage](KicakAbstract, abc.ABC):
             self._publish_with_retries(injection)
         finally:
             self._discard_connection()  # short-lived: no connection is kept between injections
-            self._log_injected(injection)  # its total includes closing the connection
+            injection.log_injected(exchange_name)  # its total includes closing the connection
