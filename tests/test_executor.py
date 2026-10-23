@@ -72,11 +72,21 @@ class ValidatedMessage(KicakMessage):
 
 
 class Topology(TypedDict):
+    """The arguments every Executor requires: its source and `max_retry_rounds`."""
+
     source_queue: str
     source_exchange: str
+    max_retry_rounds: int
 
 
-TOPOLOGY: Topology = {"source_queue": "input-queue", "source_exchange": "input-exchange"}
+MAX_RETRY_ROUNDS = 10
+"""The `max_retry_rounds` of the default TOPOLOGY, above the rounds the other tests use."""
+
+TOPOLOGY: Topology = {
+    "source_queue": "input-queue",
+    "source_exchange": "input-exchange",
+    "max_retry_rounds": MAX_RETRY_ROUNDS,
+}
 
 DESTINATION_QUEUES = ("output-queue",)
 """Default `destination_queues` of make_executor() when a test gives a destination_exchange."""
@@ -506,6 +516,33 @@ def test_init_rejects_non_positive_max_processing_attempts(config):
 def test_init_rejects_non_integer_max_processing_attempts(config, max_processing_attempts):
     with pytest.raises(TypeError, match="max_processing_attempts must be an int"):
         make_executor(config, FakeChannel(), max_processing_attempts=max_processing_attempts)
+
+
+def test_init_requires_max_retry_rounds(config):
+    # No default: every agent decides how long a failure may keep a message going round
+    with pytest.raises(TypeError, match="max_retry_rounds"):
+        SampleTerminator(
+            config, FakeChannel(), source_queue="input-queue", source_exchange="input-exchange"
+        )
+
+
+@pytest.mark.parametrize("max_retry_rounds", [0, 1, 1000])
+def test_init_stores_max_retry_rounds(config, max_retry_rounds):
+    executor = make_executor(config, FakeChannel(), max_retry_rounds=max_retry_rounds)
+
+    assert executor._max_retry_rounds == max_retry_rounds
+
+
+def test_init_rejects_negative_max_retry_rounds(config):
+    with pytest.raises(ValueError, match="max_retry_rounds must be 0 or more"):
+        make_executor(config, FakeChannel(), max_retry_rounds=-1)
+
+
+@pytest.mark.parametrize("max_retry_rounds", [2.5, True, "3", None])
+def test_init_rejects_non_integer_max_retry_rounds(config, max_retry_rounds):
+    # None would mean no limit: a failure that never clears would keep the message going forever
+    with pytest.raises(TypeError, match="max_retry_rounds must be an int"):
+        make_executor(config, FakeChannel(), max_retry_rounds=max_retry_rounds)
 
 
 def test_subclass_parameterized_with_its_message_type_receives_that_type(config):
@@ -1286,12 +1323,20 @@ class Open[M: KicakMessage](ProcessingExecutor[M, None]):
     """A generic executor class that leaves its input type open."""
 
 
+class Unparameterized(KicakExecutorAbstract):  # type: ignore[type-arg]
+    """An application's base class that forgot the message types; its subclasses inherit that."""
+
+    def execute(self, message):
+        return None
+
+
 @pytest.mark.parametrize(
     ("declaration", "error", "match"),
     [
         (lambda: KicakExecutorAbstract, TypeError, "must declare its message types"),
         (lambda: ProcessingExecutor, TypeError, "must declare its message types"),
         (lambda: Open, TypeError, "must declare its message types"),
+        (lambda: Unparameterized, TypeError, "must declare its message types"),
         (lambda: ProcessingExecutor[UnnamedSample, None], TypeError, "its own kicak_type"),
         (lambda: ProcessingExecutor[KicakMessage, None], TypeError, "KicakMessage subclass"),
         (
@@ -1311,6 +1356,7 @@ class Open[M: KicakMessage](ProcessingExecutor[M, None]):
         "unparameterized",
         "unparameterized-generic-subclass",
         "open-type-parameter",
+        "subclass-of-an-unparameterized-subclass",
         "inherited-type-name",
         "base-message-class",
         "none-accepted",
@@ -1363,6 +1409,12 @@ def test_message_types_are_resolved_through_subclasses_and_generic_classes(confi
     class Inherited(SampleTerminator):
         pass
 
+    class LoggingMixin:
+        """A base that is no agent, listed before the agent base."""
+
+    class Mixed(LoggingMixin, ProcessingExecutor[ChunkV1, None]):
+        pass
+
     assert Concrete(config, FakeChannel(), **TOPOLOGY)._accepted_types == {
         "chunk.v1": ChunkV1,
         "chunk.v2": ChunkV2,
@@ -1374,6 +1426,9 @@ def test_message_types_are_resolved_through_subclasses_and_generic_classes(confi
     inherited = Inherited(config, FakeChannel(), **TOPOLOGY)
     assert inherited._accepted_types == {SAMPLE_TYPE: SampleMessage}
     assert inherited._result_type is None
+    mixed = Mixed(config, FakeChannel(), **TOPOLOGY)
+    assert mixed._accepted_types == {"chunk.v1": ChunkV1}
+    assert mixed._result_type is None
 
 
 type AnyChunk = ChunkV1 | ChunkV2
@@ -1674,9 +1729,11 @@ def test_run_moves_message_to_retry_queue_after_exhausting_transient_retries(
     assert channel.nacked_deliveries == []
     moved = [r for r in caplog.records if "Message moved to retry queue" in r.message]
     assert [record.levelname for record in moved] == ["WARNING", "WARNING"]
-    assert "id=input queue=input-queue retry_queue=input-queue.retry retry_round=1" in (
-        moved[0].message
-    )
+    assert (
+        "id=input queue=input-queue retry_queue=input-queue.retry retry_round=1 "
+        "max_retry_rounds=10 retrying_since=2026-10-01T12:00:00+00:00 retry_in=10.0s: "
+        "service unavailable"
+    ) in moved[0].message
 
 
 def test_run_moves_to_retry_queue_without_retrying_when_one_attempt_is_allowed(config, sleeps):
@@ -1803,6 +1860,230 @@ def test_invalid_retry_headers_start_again(config, sleeps, clock, headers, expec
     copy_headers = retry_copies(channel)[0].properties.headers
     name = next(iter(headers))
     assert copy_headers[name] == expected
+
+
+# --- retry limit: dead-letter once max_retry_rounds are used up -----------------------------
+
+
+def in_retry_round(retry_round: int, **headers: object) -> pika.BasicProperties:
+    """Properties of a delivery back from the retry queue after `retry_round` moves."""
+    return pika.BasicProperties(
+        type=SAMPLE_TYPE,
+        headers={
+            "x-kicak-retry-round": retry_round,
+            "x-kicak-retrying-since": "2026-09-30T08:00:00+00:00",
+            **headers,
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    ("max_retry_rounds", "retry_round", "moved"),
+    [(2, 0, True), (2, 1, True), (2, 2, False), (2, 5, False), (0, 0, False)],
+    ids=["first-failure", "below-the-limit", "at-the-limit", "above-the-limit", "no-rounds"],
+)
+def test_transient_failure_moves_a_message_until_its_retry_rounds_are_used_up(
+    config, sleeps, max_retry_rounds, retry_round, moved
+):
+    channel = FakeChannel()
+    executor = make_executor(
+        config, channel, handler=unavailable, max_retry_rounds=max_retry_rounds
+    )
+    channel.queue_deliveries(
+        SampleMessage(message_id="input", text="input").to_bytes(),
+        properties=in_retry_round(retry_round),
+    )
+
+    run_until_stopped(executor)
+
+    # Every round, the last one included, calls execute() max_processing_attempts times
+    assert len(executor.processed_messages) == 3
+    assert sleeps == [0.5, 1.0]
+    assert len(retry_copies(channel)) == (1 if moved else 0)
+    assert dead_lettered(channel) == ([] if moved else [1])
+    assert channel.acked_delivery_tags == [1]
+    assert channel.nacked_deliveries == []
+
+
+def test_message_that_used_up_its_retry_rounds_is_dead_lettered_saying_why(
+    config, sleeps, clock, caplog
+):
+    caplog.set_level("INFO", logger="pykicak.executor")
+    channel = FakeChannel()
+    executor = make_executor(config, channel, handler=unavailable, max_retry_rounds=2)
+    body = SampleMessage(message_id="input", text="input").to_bytes()
+    later = SampleMessage(message_id="later", text="later")
+    channel.queue_deliveries(body, properties=in_retry_round(2, tenant="acme"))
+    channel.queue_deliveries(later.to_bytes())
+
+    run_until_stopped(executor)
+
+    [copy] = dead_letter_copies(channel)
+    assert copy.body == body
+    assert copy.properties.expiration is None
+    assert copy.properties.headers == {
+        "tenant": "acme",
+        # Its history: all the rounds it had
+        "x-kicak-retry-round": 2,
+        "x-kicak-retrying-since": "2026-09-30T08:00:00+00:00",
+        "x-kicak-dead-letter-reason": "retries-exhausted",
+        # The failure of its last attempt
+        "x-kicak-error-type": "pykicak.executor.TransientProcessingError",
+        "x-kicak-error-message": "service unavailable",
+        "x-kicak-dead-lettered-at": "2026-10-01T12:00:00+00:00",
+        "x-kicak-dead-lettered-from": "input-queue",
+    }
+    # The executor continues: the next message is executed, and moved to the retry queue
+    assert executor.processed_messages[-1] == later
+    assert [copy.properties.message_id for copy in retry_copies(channel)] == ["later"]
+    assert executor.get_info().counts == ExecutorCounts(
+        dead_lettered=DeadLetterCounts(retries_exhausted=1), moved_to_retry=1
+    )
+    dead_letter_records = [r for r in caplog.records if "Message dead-lettered" in r.message]
+    assert [record.levelname for record in dead_letter_records] == ["ERROR"]
+    assert dead_letter_records[0].message == (
+        "Message dead-lettered type=SampleMessage id=input queue=input-queue delivery_tag=1 "
+        "dead_letter_exchange=input-queue.dlx retry_round=2 "
+        "retrying_since=2026-09-30T08:00:00+00:00: still failing after 3 processing attempts, "
+        "and max_retry_rounds=2 allows no more moves to the retry queue: service unavailable"
+    )
+    handled = kicak_values(handled_records(caplog)[0])
+    assert (handled["outcome"], handled["reason"], handled["retry_round"]) == (
+        "dead_lettered",
+        "retries-exhausted",
+        2,
+    )
+
+
+def test_application_subclass_of_the_transient_error_is_named_in_the_dead_letter_copy(
+    config, sleeps
+):
+    class ServiceUnavailableError(TransientProcessingError):
+        pass
+
+    channel = FakeChannel()
+    executor = make_executor(
+        config,
+        channel,
+        handler=raise_error(ServiceUnavailableError("summarizer down")),
+        max_retry_rounds=0,
+    )
+    channel.queue_deliveries(SampleMessage(message_id="input", text="input").to_bytes())
+
+    run_until_stopped(executor)
+
+    headers = dead_letter_copies(channel)[0].properties.headers
+    assert headers["x-kicak-dead-letter-reason"] == "retries-exhausted"
+    assert headers["x-kicak-error-type"] == (
+        "tests.test_executor."
+        "test_application_subclass_of_the_transient_error_is_named_in_the_dead_letter_copy."
+        "<locals>.ServiceUnavailableError"
+    )
+    assert headers["x-kicak-error-message"] == "summarizer down"
+
+
+def test_no_retry_rounds_dead_letters_a_message_after_its_first_attempts(config, sleeps, clock):
+    channel = FakeChannel()
+    executor = make_executor(config, channel, handler=unavailable, max_retry_rounds=0)
+    channel.queue_deliveries(SampleMessage(message_id="input", text="input").to_bytes())
+
+    run_until_stopped(executor)
+
+    assert len(executor.processed_messages) == 3
+    assert retry_copies(channel) == []
+    [copy] = dead_letter_copies(channel)
+    # Never moved, so it has no retry headers
+    assert copy.properties.headers == {
+        "x-kicak-dead-letter-reason": "retries-exhausted",
+        "x-kicak-error-type": "pykicak.executor.TransientProcessingError",
+        "x-kicak-error-message": "service unavailable",
+        "x-kicak-dead-lettered-at": "2026-10-01T12:00:00+00:00",
+        "x-kicak-dead-lettered-from": "input-queue",
+    }
+
+
+def dead_letter_headers(reason: str = "retries-exhausted") -> dict[str, object]:
+    """The headers a dead-letter copy carries, as a message sent back from the `.dlq` keeps them."""
+    return {
+        "x-kicak-dead-letter-reason": reason,
+        "x-kicak-error-type": "pykicak.executor.TransientProcessingError",
+        "x-kicak-error-message": "service unavailable",
+        "x-kicak-dead-lettered-at": "2026-09-30T20:00:00+00:00",
+        "x-kicak-dead-lettered-from": "input-queue",
+    }
+
+
+def test_message_sent_back_from_the_dead_letter_queue_gets_its_retry_rounds_again(
+    config, sleeps, clock, caplog
+):
+    caplog.set_level("INFO", logger="pykicak.executor")
+    reported: list[int | None] = []
+    executor_holder: list[KicakExecutorAbstract[Any, Any]] = []
+
+    def unavailable_reporting(_message):
+        reported.append(executor_holder[0].get_info().retry_round)
+        raise TransientProcessingError("service unavailable")
+
+    channel = FakeChannel()
+    executor = make_executor(config, channel, handler=unavailable_reporting, max_retry_rounds=2)
+    executor_holder.append(executor)
+    # Dead-lettered after its last round, then sent back by an operator
+    channel.queue_deliveries(
+        SampleMessage(message_id="input", text="input").to_bytes(),
+        properties=in_retry_round(2, **dead_letter_headers()),
+    )
+
+    run_until_stopped(executor)
+
+    assert dead_letter_copies(channel) == []
+    [copy] = retry_copies(channel)
+    assert copy.properties.headers == {
+        "x-kicak-retry-round": 1,
+        "x-kicak-retrying-since": "2026-10-01T12:00:00+00:00",
+        "x-kicak-published-at": "2026-10-01T12:00:00+00:00",
+    }
+    assert reported == [0, 0, 0]
+    assert kicak_values(handled_records(caplog)[0])["retry_round"] == 0
+
+
+@pytest.mark.parametrize("reason", ["retries-exhausted", "malformed", "unexpected-error"])
+def test_dead_letter_copy_of_a_message_sent_back_carries_no_stale_rounds(
+    config, sleeps, clock, caplog, reason
+):
+    channel = FakeChannel()
+    executor = make_executor(config, channel, handler=unavailable, max_retry_rounds=0)
+    channel.queue_deliveries(
+        SampleMessage(message_id="input", text="input").to_bytes(),
+        properties=in_retry_round(4, **dead_letter_headers(reason)),
+    )
+
+    run_until_stopped(executor)
+
+    # Its rounds started again, and it had none before it was dead-lettered again
+    [copy] = dead_letter_copies(channel)
+    assert copy.properties.headers == {
+        "x-kicak-dead-letter-reason": "retries-exhausted",
+        "x-kicak-error-type": "pykicak.executor.TransientProcessingError",
+        "x-kicak-error-message": "service unavailable",
+        "x-kicak-dead-lettered-at": "2026-10-01T12:00:00+00:00",
+        "x-kicak-dead-lettered-from": "input-queue",
+    }
+    [record] = [r for r in caplog.records if "Message dead-lettered" in r.message]
+    assert "retry_round=0 retrying_since=None:" in record.message
+
+
+def test_message_that_used_up_its_retry_rounds_is_requeued_if_its_copy_is_refused(config, sleeps):
+    channel = CopyRefusingChannel(NackError([]), target="input-queue.dlx")
+    executor = make_executor(config, channel, handler=unavailable, max_retry_rounds=0)
+    channel.queue_deliveries(SampleMessage(message_id="input", text="input").to_bytes())
+
+    run_until_stopped(executor)
+
+    # Never acknowledged without its copy, and never moved to the retry queue instead
+    assert channel.acked_delivery_tags == []
+    assert channel.nacked_deliveries == [NackedDelivery(delivery_tag=1, requeue=True)]
+    assert retry_copies(channel) == []
+    assert executor.get_info().counts == ExecutorCounts(requeued=1)
 
 
 class CopyRefusingChannel(FakeChannel):
@@ -2126,6 +2407,9 @@ def test_retry_copy_of_a_replayed_message_drops_its_dead_letter_headers(config, 
         type=SAMPLE_TYPE,
         headers={
             "tenant": "acme",
+            # Its rounds before it was dead-lettered, which start again
+            "x-kicak-retry-round": 7,
+            "x-kicak-retrying-since": "2026-09-29T08:00:00+00:00",
             "x-kicak-dead-letter-reason": "unexpected-error",
             "x-kicak-error-type": "KeyError",
             "x-kicak-error-message": "'text'",
@@ -3120,8 +3404,8 @@ def test_info_repr_lists_every_field(config, clock):
         "status_checked_at=datetime.datetime(2026, 10, 1, 12, 0, tzinfo=datetime.timezone.utc), "
         "stop_requested=False, stop_requested_at=None, message=None, attempt=None, "
         "redelivered=None, retry_round=None, counts=ExecutorCounts(completed=0, "
-        "dead_lettered=DeadLetterCounts(malformed=0, result_too_large=0, unexpected_error=0), "
-        "moved_to_retry=0, requeued=0, abandoned=0))"
+        "dead_lettered=DeadLetterCounts(malformed=0, retries_exhausted=0, result_too_large=0, "
+        "unexpected_error=0), moved_to_retry=0, requeued=0, abandoned=0))"
     )
 
 
@@ -3487,6 +3771,40 @@ def test_stop_after_crash_keeps_crashed_status_and_its_change_time(config, clock
     assert (info.stop_requested, info.stop_requested_at) == (True, stop_at)
 
 
+def test_run_after_a_crash_and_stop_keeps_crashed_and_does_not_connect(config, clock, monkeypatch):
+    channel = FakeChannel()
+    executor = make_executor(config, channel, handler=crash_on_first_call([], []))
+    channel.queue_deliveries(SampleMessage(message_id="input", text="input").to_bytes())
+    crashed_at = clock.advance()
+    with pytest.raises(ZeroDivisionError):
+        executor.run()
+    executor.stop()
+
+    def unexpected_connection():
+        raise AssertionError("a stopped executor must not connect")
+
+    monkeypatch.setattr(executor, "_create_connection", unexpected_connection)
+    clock.advance()
+
+    executor.run()
+
+    info = executor.get_info()
+    assert (info.status, info.status_changed_at) == ("CRASHED", crashed_at)
+
+
+def test_run_again_after_a_graceful_stop_keeps_the_time_it_stopped(config, clock):
+    executor = make_executor(config, FakeChannel())
+    executor.stop()
+    stopped_at = clock.advance()
+    executor.run()
+    clock.advance()
+
+    executor.run()
+
+    info = executor.get_info()
+    assert (info.status, info.status_changed_at) == ("STOPPED", stopped_at)
+
+
 def test_status_is_upstream_recover_when_run_follows_a_crash(config, monkeypatch):
     executor_holder: list[ProcessingExecutor[Any, Any]] = []
     statuses: list[str] = []
@@ -3615,9 +3933,11 @@ def test_counts_record_how_each_delivery_ended(config, sleeps):
 
 
 def test_dead_letter_counts_add_up_to_their_total():
-    counts = DeadLetterCounts(malformed=3, result_too_large=2, unexpected_error=1)
+    counts = DeadLetterCounts(
+        malformed=3, retries_exhausted=4, result_too_large=2, unexpected_error=1
+    )
 
-    assert counts.total == 6
+    assert counts.total == 10
     assert DeadLetterCounts().total == 0
 
 
@@ -3770,8 +4090,9 @@ def test_info_reports_whether_the_delivery_was_redelivered(config):
         ({"x-kicak-retry-round": "3"}, 0),
         ({"x-kicak-retry-round": -1}, 0),
         ({"x-kicak-retry-round": True}, 0),
+        ({"x-kicak-retry-round": 3, "x-kicak-dead-letter-reason": "retries-exhausted"}, 0),
     ],
-    ids=["never-retried", "third-round", "zero", "text", "negative", "bool"],
+    ids=["never-retried", "third-round", "zero", "text", "negative", "bool", "sent-back"],
 )
 def test_info_reports_the_retry_round_of_the_message(config, headers, retry_round):
     executor_holder: list[ProcessingExecutor[Any, Any]] = []

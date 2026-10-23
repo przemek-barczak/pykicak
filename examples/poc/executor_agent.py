@@ -8,7 +8,7 @@ This demonstrates both executor roles from the PoC topology (see examples.poc.me
 Every role also declares its input queue's dead-letter exchange and queue, `<queue>.dlx` and
 `<queue>.dlq`, which retain the deliveries that role dead-letters, and its retry queue
 `<queue>.retry`, where a message that keeps failing transiently waits before it is executed
-again. Each executor takes its topology from examples.poc.messaging, the single place where the
+again, up to `max_retry_rounds` times. Each executor takes its topology from examples.poc.messaging, the single place where the
 PoC's queue, exchange, and binding names are defined.
 
 The class headers declare which heartbeat versions each role accepts and publishes, the contract
@@ -40,6 +40,11 @@ from examples.poc.messaging.queues import (
     HEARTBEAT_TERMINATOR_QUEUE_2,
 )
 from pykicak import KicakConfig, KicakExecutorAbstract
+
+# How often a heartbeat that keeps failing transiently may wait in the retry queue before it is
+# dead-lettered: with the default retry delay of 10 seconds, it keeps going round for at least
+# five minutes. The PoC never fails transiently; a real agent sizes it to the outage it outlasts.
+_MAX_RETRY_ROUNDS = 30
 
 
 class HeartbeatForwarder(
@@ -99,6 +104,7 @@ def _build_executor(config: KicakConfig, role: str) -> HeartbeatForwarder | Hear
             destination_exchange=HEARTBEAT_FANOUT_EXCHANGE,
             destination_queues=queues_bound_to(HEARTBEAT_FANOUT_EXCHANGE),
             queue_type=HEARTBEAT_QUEUE_TYPE,
+            max_retry_rounds=_MAX_RETRY_ROUNDS,
         )
     terminator_queues = {
         "terminator1": HEARTBEAT_TERMINATOR_QUEUE_1,
@@ -111,6 +117,7 @@ def _build_executor(config: KicakConfig, role: str) -> HeartbeatForwarder | Hear
             source_queue=source_queue,
             source_exchange=QUEUE_BINDINGS[source_queue],
             queue_type=HEARTBEAT_QUEUE_TYPE,
+            max_retry_rounds=_MAX_RETRY_ROUNDS,
         )
     raise ValueError(f"Unknown POC_EXECUTOR_ROLE: {role!r}")
 

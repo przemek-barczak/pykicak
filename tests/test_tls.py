@@ -189,7 +189,9 @@ class TlsMessage(KicakMessage):
 
 class TlsExecutor(KicakExecutorAbstract[TlsMessage, None]):
     def __init__(self, config: KicakConfig) -> None:
-        super().__init__(config, source_queue="input-queue", source_exchange="input-exchange")
+        super().__init__(
+            config, source_queue="input-queue", source_exchange="input-exchange", max_retry_rounds=3
+        )
 
     def execute(self, message: TlsMessage) -> None:
         return None

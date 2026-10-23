@@ -29,6 +29,7 @@ import pytest
 from pika.exceptions import UnroutableError
 from pika.spec import Basic
 
+from examples.replay_dead_letters import replay_dead_letters
 from pykicak.abstracts import _tls_options
 from pykicak.config import KicakConfig
 from pykicak.executor import (
@@ -78,9 +79,13 @@ class OneShotInjectorV2(OneShot[IntegrationMessageV2]):
 
 
 class RecordingAgent[M: KicakMessage, R: KicakMessage | None](KicakExecutorAbstract[M, R]):
-    """Forwards messages if it has a destination; payloads "reject"/"flaky" exercise failures."""
+    """Forwards messages if it has a destination; some payloads exercise failures.
+
+    "reject" is malformed, "flaky" fails transiently once, and "unavailable" always.
+    """
 
     def __init__(self, config: KicakConfig, **topology) -> None:
+        topology.setdefault("max_retry_rounds", 10)  # more than any test uses up
         super().__init__(config, **topology)
         self.received: list[M] = []
         self._last_properties: pika.BasicProperties | None = None
@@ -98,6 +103,8 @@ class RecordingAgent[M: KicakMessage, R: KicakMessage | None](KicakExecutorAbstr
             raise MalformedMessageError("rejected by the test")
         if payload == "flaky" and len(self.received) == 1:
             raise TransientProcessingError("first attempt fails")
+        if payload == "unavailable":
+            raise TransientProcessingError("service unavailable")
         # Only the forwarding RecordingExecutor has a destination, and it publishes what it accepts
         return cast(R, message) if self._destination_exchange is not None else None
 
@@ -463,6 +470,98 @@ def test_executor_retries_a_transient_failure_through_its_retry_queue(config, to
     assert returned.headers["x-kicak-original-publisher"] == config.rabbitmq_username
     assert dead_letter[0] is None
     assert _ready_message_count(config, f"{names['source_queue']}.retry") == (0, 0)
+
+
+@pytest.mark.parametrize("queue_type", list(QueueType))
+def test_executor_dead_letters_a_message_that_used_up_its_retry_rounds(
+    config, topology, queue_type
+):
+    inject_exchange = topology.exchange("inject")
+    names = topology.executor_topology("source", inject_exchange)
+    message = IntegrationMessage(message_id="unavailable", payload="unavailable")
+
+    with RecordingTerminator(
+        config,
+        queue_type=queue_type,
+        max_processing_attempts=1,
+        max_retry_rounds=1,
+        retry_delay_seconds=0.2,
+        **names,
+    ) as executor:
+        with OneShotInjector(config, inject_exchange, message) as injector:
+            injector.publish(message)
+        executor.handle_next_delivery(names["source_queue"])  # fails: moved to the retry queue
+        executor.handle_next_delivery(names["source_queue"])  # fails again: no rounds left
+        properties, body = _get_dead_letter(executor.channel, _dead_letter_queue(names))
+
+    assert executor.received == [message, message]
+    assert executor.get_info().counts == ExecutorCounts(
+        dead_lettered=DeadLetterCounts(retries_exhausted=1), moved_to_retry=1
+    )
+    assert IntegrationMessage.from_bytes(body) == message
+    headers = properties.headers
+    assert headers["x-kicak-dead-letter-reason"] == "retries-exhausted"
+    assert headers["x-kicak-error-type"] == "pykicak.executor.TransientProcessingError"
+    assert headers["x-kicak-error-message"] == "service unavailable"
+    assert headers["x-kicak-retry-round"] == 1
+    assert datetime.fromisoformat(headers["x-kicak-retrying-since"]).tzinfo is not None
+    assert _ready_message_count(config, f"{names['source_queue']}.retry") == (0, 0)
+
+
+@pytest.mark.parametrize("queue_type", list(QueueType))
+def test_dead_letters_sent_back_by_the_example_tool_get_their_retry_rounds_again(
+    config, topology, queue_type
+):
+    inject_exchange = topology.exchange("inject")
+    names = topology.executor_topology("source", inject_exchange)
+    source_queue = names["source_queue"]
+    unavailable = IntegrationMessage(message_id="unavailable", payload="unavailable")
+    rejected = IntegrationMessage(message_id="reject", payload="reject")
+
+    with RecordingTerminator(
+        config,
+        queue_type=queue_type,
+        max_processing_attempts=1,
+        max_retry_rounds=1,
+        retry_delay_seconds=0.2,
+        **names,
+    ) as executor:
+        with OneShotInjector(config, inject_exchange, unavailable) as injector:
+            injector.publish(unavailable)
+            injector.publish(rejected)
+        executor.handle_next_delivery(source_queue)  # unavailable: moved to the retry queue
+        executor.handle_next_delivery(source_queue)  # rejected: dead-lettered as malformed
+        executor.handle_next_delivery(source_queue)  # unavailable again: dead-lettered
+        _wait_for_ready_messages(config, _dead_letter_queue(names), 2)
+
+        dry_run = replay_dead_letters(config, source_queue, {"retries-exhausted"}, dry_run=True)
+        assert _ready_message_count(config, _dead_letter_queue(names)) == (2, 0)
+        report = replay_dead_letters(config, source_queue, {"retries-exhausted"})
+
+        # The malformed message stays in the dead-letter queue
+        assert _ready_message_count(config, _dead_letter_queue(names)) == (1, 0)
+        executor.handle_next_delivery(source_queue)  # sent back: its rounds start again
+        sent_back = executor.last_properties
+        executor.handle_next_delivery(source_queue)  # back from the retry queue: no rounds left
+        properties, _body = _get_dead_letter(executor.channel, _dead_letter_queue(names))
+        if properties.headers["x-kicak-dead-letter-reason"] == "malformed":
+            properties, _body = _get_dead_letter(executor.channel, _dead_letter_queue(names))
+
+    assert dry_run.sent_back == {"retries-exhausted": 1}
+    assert report.sent_back == {"retries-exhausted": 1}
+    assert report.left == {"malformed": 1}
+    # Sent back as it was dead-lettered, by the tool's own (verified) user
+    assert sent_back.message_id == "unavailable"
+    assert sent_back.type == IntegrationMessage.kicak_type
+    assert sent_back.user_id == config.rabbitmq_username
+    assert sent_back.headers["x-kicak-dead-letter-reason"] == "retries-exhausted"
+    assert sent_back.headers["x-kicak-original-publisher"] == config.rabbitmq_username
+    # It was moved to the retry queue once more, as round 1, then dead-lettered again
+    assert executor.get_info().counts == ExecutorCounts(
+        dead_lettered=DeadLetterCounts(malformed=1, retries_exhausted=2), moved_to_retry=2
+    )
+    assert properties.headers["x-kicak-dead-letter-reason"] == "retries-exhausted"
+    assert properties.headers["x-kicak-retry-round"] == 1
 
 
 @pytest.mark.parametrize(

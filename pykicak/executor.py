@@ -59,6 +59,7 @@ _LONGEST_QUEUE_NAME_SUFFIX = max(
 )
 _RETRY_ROUND_HEADER = "x-kicak-retry-round"
 _RETRYING_SINCE_HEADER = "x-kicak-retrying-since"
+_RETRY_HEADERS = frozenset({_RETRY_ROUND_HEADER, _RETRYING_SINCE_HEADER})
 # Why and when a copy in the dead-letter queue was dead-lettered, and from which queue
 _DEAD_LETTER_REASON_HEADER = "x-kicak-dead-letter-reason"
 _ERROR_TYPE_HEADER = "x-kicak-error-type"
@@ -149,6 +150,9 @@ class DeadLetterCounts:
     malformed: int = 0
     """`MalformedMessageError`: from `execute()`, or for a delivery or results that are invalid."""
 
+    retries_exhausted: int = 0
+    """`TransientProcessingError` persisted after `max_retry_rounds` rounds in the retry queue."""
+
     result_too_large: int = 0
     """RabbitMQ refused one of the delivery's results as larger than its `max_message_size`."""
 
@@ -158,7 +162,9 @@ class DeadLetterCounts:
     @property
     def total(self) -> int:
         """All dead-lettered deliveries, whatever the reason."""
-        return self.malformed + self.result_too_large + self.unexpected_error
+        return (
+            self.malformed + self.retries_exhausted + self.result_too_large + self.unexpected_error
+        )
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -334,7 +340,8 @@ class ExecutorInfo[Accepted: KicakMessage]:
     retry_round: int | None
     """How often `message` was moved to the retry queue before: its `x-kicak-retry-round` header.
 
-    0 for a message that never was. None when `message` is None.
+    0 for a message that never was, and for one sent back from the dead-letter queue, which
+    starts its rounds again. None when `message` is None.
     """
 
     counts: ExecutorCounts
@@ -382,6 +389,9 @@ class _DeadLetterReason(StrEnum):
     MALFORMED = "malformed"
     """`MalformedMessageError`: the delivery, or the results `execute()` returned, are invalid."""
 
+    RETRIES_EXHAUSTED = "retries-exhausted"
+    """`TransientProcessingError` persisted after `max_retry_rounds` rounds in the retry queue."""
+
     RESULT_TOO_LARGE = "result-too-large"
     """RabbitMQ refused one of its results as larger than its `max_message_size`."""
 
@@ -413,6 +423,10 @@ def _counted(counts: ExecutorCounts, outcome: _Outcome | _DeadLetterReason) -> E
             return replace(counts, abandoned=counts.abandoned + 1)
         case _DeadLetterReason.MALFORMED:
             dead_lettered = replace(dead_lettered, malformed=dead_lettered.malformed + 1)
+        case _DeadLetterReason.RETRIES_EXHAUSTED:
+            dead_lettered = replace(
+                dead_lettered, retries_exhausted=dead_lettered.retries_exhausted + 1
+            )
         case _DeadLetterReason.RESULT_TOO_LARGE:
             dead_lettered = replace(
                 dead_lettered, result_too_large=dead_lettered.result_too_large + 1
@@ -478,8 +492,9 @@ class TransientProcessingError(Exception):
     Raise it from `execute()`, typically from an error of a service it calls, such as a timeout.
     The Executor calls `execute()` again, up to `max_processing_attempts` times, and if the
     failure persists it moves the message to its retry queue `<source_queue>.retry`, which
-    returns it to the back of the source queue after `retry_delay_seconds`, to be executed again;
-    it is never dead-lettered for it. The Executor continues with the next message.
+    returns it to the back of the source queue after `retry_delay_seconds`, to be executed again,
+    up to `max_retry_rounds` times. A message still failing after that is dead-lettered, with the
+    reason `retries-exhausted`. The Executor continues with the next message.
     """
 
 
@@ -571,30 +586,63 @@ def _checked_retry_delay_milliseconds(retry_delay_seconds: float) -> int:
     return milliseconds
 
 
+def _was_dead_lettered(headers: Mapping[str, object] | None) -> bool:
+    """Return whether a delivery carries the headers of a dead-lettering by an Executor.
+
+    Only a message sent back from a dead-letter queue does: every copy an Executor makes drops
+    them (see `_copied_headers()`).
+    """
+    return not _DEAD_LETTER_HEADERS.isdisjoint(headers or {})
+
+
 def _copied_headers(headers: Mapping[str, object] | None) -> dict[str, object]:
     """Return the headers of a delivery that a copy the executor publishes of it keeps.
 
     RabbitMQ's own headers are dropped, and so are the reasons of an earlier dead-lettering, which
-    a message replayed from a dead-letter queue still carries.
+    a message sent back from a dead-letter queue still carries, together with its retry headers,
+    because its retry rounds start again (see `_retry_round_of()`).
     """
+    dropped = _DEAD_LETTER_HEADERS
+    if _was_dead_lettered(headers):
+        dropped |= _RETRY_HEADERS
     return {
         name: value
         for name, value in (headers or {}).items()
         if name not in _BROKER_HEADERS
         and not name.startswith(_BROKER_HEADER_PREFIXES)
-        and name not in _DEAD_LETTER_HEADERS
+        and name not in dropped
     }
 
 
 def _retry_round_of(headers: Mapping[str, object] | None) -> int:
     """Return how often a delivery was moved to the retry queue: its retry round, or 0.
 
-    A missing or invalid `x-kicak-retry-round` header counts as 0, so the rounds start again.
+    A missing or invalid `x-kicak-retry-round` header counts as 0, so the rounds start again. So
+    does a message sent back from a dead-letter queue, which still carries the retry headers of
+    its earlier rounds, so that it gets `max_retry_rounds` rounds again.
     """
+    if _was_dead_lettered(headers):
+        return 0
     retry_round = (headers or {}).get(_RETRY_ROUND_HEADER)
     if isinstance(retry_round, int) and not isinstance(retry_round, bool) and retry_round >= 0:
         return retry_round
     return 0
+
+
+def _retrying_since_of(headers: Mapping[str, object] | None) -> str | None:
+    """Return when a delivery was first moved to the retry queue, in ISO 8601, or None.
+
+    None for a missing or invalid `x-kicak-retrying-since` header, and for a message sent back
+    from a dead-letter queue, whose rounds start again (see `_retry_round_of()`).
+    """
+    if _was_dead_lettered(headers):
+        return None
+    since = (headers or {}).get(_RETRYING_SINCE_HEADER)
+    if isinstance(since, bytes):
+        since = since.decode("utf-8", errors="replace")
+    if isinstance(since, str) and _is_iso_datetime(since):
+        return since
+    return None
 
 
 def _retry_headers(headers: Mapping[str, object] | None, now: datetime) -> dict[str, object]:
@@ -602,19 +650,14 @@ def _retry_headers(headers: Mapping[str, object] | None, now: datetime) -> dict[
 
     The application's headers are kept, and RabbitMQ's own ones dropped (see `_copied_headers()`).
     The round counts the moves into the retry queue, and `x-kicak-retrying-since` keeps the time
-    of the first one; a missing or invalid value starts them again. The copy is published anew,
-    so `x-kicak-published-at` becomes `now`, and the `queued_seconds` of its return to the source
-    queue includes the retry delay.
+    of the first one; a missing or invalid value starts them again, and so does a message sent
+    back from a dead-letter queue. The copy is published anew, so `x-kicak-published-at` becomes
+    `now`, and the `queued_seconds` of its return to the source queue includes the retry delay.
     """
     kept = _copied_headers(headers)
     kept[_PUBLISHED_AT_HEADER] = now.isoformat()
-    kept[_RETRY_ROUND_HEADER] = _retry_round_of(kept) + 1
-    since = kept.get(_RETRYING_SINCE_HEADER)
-    if isinstance(since, bytes):
-        since = since.decode("utf-8", errors="replace")
-    if not (isinstance(since, str) and _is_iso_datetime(since)):
-        since = now.isoformat()
-    kept[_RETRYING_SINCE_HEADER] = since
+    kept[_RETRY_ROUND_HEADER] = _retry_round_of(headers) + 1
+    kept[_RETRYING_SINCE_HEADER] = _retrying_since_of(headers) or now.isoformat()
     return kept
 
 
@@ -628,7 +671,8 @@ def _dead_letter_headers(
     """Return the headers of a message's copy for the dead-letter queue: why it is there.
 
     The application's headers and the retry headers, its history, are kept, and RabbitMQ's own
-    ones dropped (see `_copied_headers()`).
+    ones dropped, and so are the retry headers of a message sent back from a dead-letter queue,
+    whose rounds started again (see `_copied_headers()`).
     """
     kept = _copied_headers(headers)
     kept[_DEAD_LETTER_REASON_HEADER] = reason.value
@@ -694,7 +738,7 @@ def _sent_type(properties: pika.BasicProperties | None) -> str | None:
     return None if properties is None else _text_property(properties.type)
 
 
-def _original_publisher_of(properties: pika.BasicProperties | None) -> str | None:
+def _original_publisher_of(properties: pika.BasicProperties) -> str | None:
     """Return the user of the agent that created a delivered message, if known.
 
     The `x-kicak-original-publisher` header, which every pykicak agent sets on the messages it
@@ -702,8 +746,6 @@ def _original_publisher_of(properties: pika.BasicProperties | None) -> str | Non
     header, published by another client, was created by its publisher, so its `user_id` names
     it when the client set one. Otherwise the creator is unknown: None.
     """
-    if properties is None:
-        return None
     header = (properties.headers or {}).get(_ORIGINAL_PUBLISHER_HEADER)
     if isinstance(header, bytes):
         header = header.decode("utf-8", errors="replace")
@@ -859,7 +901,8 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
       unroutable or refuses it, the delivery is requeued instead.
     - Transient failure (`TransientProcessingError`): `execute()` is retried, and if the failure
       persists the message is moved to the retry queue, which returns it to the back of the
-      source queue after `retry_delay_seconds`. It is never dead-lettered for it.
+      source queue after `retry_delay_seconds`, up to `max_retry_rounds` times. Once it has had
+      all its rounds, it is dead-lettered as above, with the reason `retries-exhausted`.
     - Any other error is unexpected: the delivery is dead-lettered as above, then the error is
       raised, stopping the executor.
     - Results returned by RabbitMQ as unroutable (`UnroutableError`: no queue was bound to the
@@ -912,6 +955,7 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
         destination_queues: Sequence[str] | None = None,
         queue_type: QueueType | str = QueueType.CLASSIC,
         max_processing_attempts: int = 3,
+        max_retry_rounds: int,
         heartbeat_seconds: int = _DEFAULT_HEARTBEAT_SECONDS,
         input_check_seconds: float = _DEFAULT_INPUT_CHECK_SECONDS,
         retry_delay_seconds: float = _DEFAULT_RETRY_DELAY_SECONDS,
@@ -967,10 +1011,18 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
         moved to the retry queue `<source_queue>.retry`. That queue, owned and declared only by
         this executor, holds the message for `retry_delay_seconds` (default 10, at most about
         49.7 days; 0 returns it at once) and then returns it to the back of the source queue,
-        where it is executed again, with another `max_processing_attempts` calls. There is no
-        limit on the number of such rounds: the message's headers `x-kicak-retry-round` and
-        `x-kicak-retrying-since`, and the warning logged for every move, show a message that
-        keeps failing.
+        where it is executed again, with another `max_processing_attempts` calls.
+
+        `max_retry_rounds` (required, an int, 0 or more) is how many times a message may be
+        moved to the retry queue. A message whose last round fails too is dead-lettered instead,
+        with the reason `retries-exhausted`, so `execute()` is called at most
+        `(max_retry_rounds + 1) * max_processing_attempts` times for it, and it is dead-lettered no
+        sooner than `max_retry_rounds * retry_delay_seconds` after its first move. With 0, it is
+        never moved: a message still failing after its first `max_processing_attempts` calls is
+        dead-lettered. The rounds are counted in the message's `x-kicak-retry-round` header, which
+        any instance can read, and start again for a message sent back from the dead-letter
+        queue. There is deliberately no default: how long a failing service may stay down, and
+        how much retrying it may cost, depends on the agent.
 
         `heartbeat_seconds` (an int from 1 to 65535, default 600) is the AMQP heartbeat timeout of
         this executor's connections. Set it above the longest time processing one message can
@@ -1044,6 +1096,10 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
             raise TypeError("max_processing_attempts must be an int")
         if max_processing_attempts < 1:
             raise ValueError("max_processing_attempts must be at least 1")
+        if isinstance(max_retry_rounds, bool) or not isinstance(max_retry_rounds, int):
+            raise TypeError("max_retry_rounds must be an int")
+        if max_retry_rounds < 0:
+            raise ValueError("max_retry_rounds must be 0 or more")
         # The base class also accepts None, the broker's proposal; the range is checked there
         if isinstance(heartbeat_seconds, bool) or not isinstance(heartbeat_seconds, int):
             raise TypeError("heartbeat_seconds must be an int")
@@ -1078,6 +1134,7 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
         self._destination_queues = queues
         self._queue_type = queue_type
         self._max_processing_attempts = max_processing_attempts
+        self._max_retry_rounds = max_retry_rounds
         self._input_check_seconds = input_check_seconds
         self._input_checked_at = 0.0  # time.monotonic() of the last verification of the input side
         # Transactional channel for results, opened on first use for each connection
@@ -1277,8 +1334,8 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
 
         - `TransientProcessingError`, for a failure that may clear, e.g. a service that is down:
           `execute()` is called again, and if the failure persists the message waits in the
-          retry queue for `retry_delay_seconds` and is then executed again, without limit. The
-          executor continues.
+          retry queue for `retry_delay_seconds` and is then executed again, up to
+          `max_retry_rounds` times; then it is dead-lettered. The executor continues.
         - `MalformedMessageError`, for a message that can never succeed: it is dead-lettered. The
           executor continues.
         - Any other exception, including one from a library it calls, is treated as a bug: the
@@ -1764,6 +1821,33 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
             )
         except TransientProcessingError as error:
             # Only execute() raises it, so the body was decoded, and message_id is the body's
+            headers = None if properties is None else properties.headers
+            retry_round = _retry_round_of(headers)
+            if retry_round >= self._max_retry_rounds:
+                logger.error(
+                    "Message dead-lettered type=%s id=%s queue=%s delivery_tag=%i "
+                    "dead_letter_exchange=%s retry_round=%i retrying_since=%s: still failing "
+                    "after %d processing attempts, and max_retry_rounds=%i allows no more moves "
+                    "to the retry queue: %s",
+                    type_name,
+                    message_id,
+                    self._source_queue,
+                    delivery_tag,
+                    self._dead_letter_exchange,
+                    retry_round,
+                    _retrying_since_of(headers),
+                    self._max_processing_attempts,
+                    self._max_retry_rounds,
+                    error,
+                )
+                return self._dead_letter(
+                    delivery_tag,
+                    properties,
+                    body,
+                    message_id,
+                    _DeadLetterReason.RETRIES_EXHAUSTED,
+                    error,
+                )
             return self._move_to_retry_queue(
                 delivery_tag, properties, cast(bytes, body), cast(str, message_id), error
             )
@@ -1927,12 +2011,14 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
             return False
         logger.warning(
             "Message moved to retry queue after %d failed processing attempts id=%s queue=%s "
-            "retry_queue=%s retry_round=%s retrying_since=%s retry_in=%.1fs: %s",
+            "retry_queue=%s retry_round=%s max_retry_rounds=%i retrying_since=%s retry_in=%.1fs: "
+            "%s",
             self._max_processing_attempts,
             message_id,
             self._source_queue,
             self._retry_queue,
             headers[_RETRY_ROUND_HEADER],
+            self._max_retry_rounds,
             headers[_RETRYING_SINCE_HEADER],
             self._retry_delay_milliseconds / 1000,
             error,

@@ -569,6 +569,10 @@ def test_injection_error_keeps_message_and_exchange_and_survives_pickling():
     restored = pickle.loads(pickle.dumps(error))
 
     assert (restored.message, restored.exchange_name) == (message, "my-exchange")
+    # Pickling keeps no __cause__, so the text ends without one
+    assert str(restored) == (
+        "IdentifiedMessage message id=m-1 was not injected into exchange 'my-exchange'"
+    )
 
 
 def test_run_logs_and_does_not_wrap_errors_from_generate(config, monkeypatch, caplog):

@@ -39,9 +39,12 @@ A message is processed more than once when:
   [Long-running `execute()`](#long-running-execute));
 - `execute()` raises `TransientProcessingError`, so it is called again, and after
   `max_processing_attempts` failed calls the message waits in the retry queue and is executed again,
-  as often as the failure lasts; if the Executor loses its connection between putting the message
+  up to `max_retry_rounds` times; if the Executor loses its connection between putting the message
   into the retry queue and acknowledging it, it is executed once more on top (see
   [Retry queue](#retry-queue));
+- a dead-lettered message is sent back from the dead-letter queue, for example once a service that
+  was down is back, so it is executed again; if the connection is lost while it is sent back, it can
+  be sent back, and executed, twice (see [Sending dead letters back](#sending-dead-letters-back));
 - an Executor dead-letters a message, and loses its connection, or `consumer_timeout` takes the
   message back, between putting a copy of it into the dead-letter queue and acknowledging it, so
   the message is executed again: it may be dead-lettered a second time, or succeed and be in the
@@ -235,6 +238,7 @@ for a worked example.
 | `destination_queues` | `KicakExecutorAbstract` (required with `destination_exchange`) | Every queue that must receive the results, at least one; the Executor declares and binds each of them before publishing (see [Topology verification](#topology-verification)) |
 | `queue_type` | `KicakExecutorAbstract` (optional, default `QueueType.CLASSIC`) | RabbitMQ type of every queue the Executor declares: `QueueType.CLASSIC` or `QueueType.QUORUM` (see [Queue type](#queue-type)) |
 | `max_processing_attempts` | `KicakExecutorAbstract` (optional, default 3) | How many times `execute()` is called for one delivery, one call after the other, while it raises `TransientProcessingError`, before the message is moved to the retry queue (see [Retry queue](#retry-queue)) |
+| `max_retry_rounds` | `KicakExecutorAbstract` (required) | How many times a message that keeps raising `TransientProcessingError` may be moved to the retry queue before it is dead-lettered; an int, 0 or more, where 0 dead-letters it after its first `max_processing_attempts` calls (see [Retry queue](#retry-queue)) |
 | `retry_delay_seconds` | `KicakExecutorAbstract` (optional, default 10) | How long a message waits in the retry queue `<queue>.retry` before it returns to the back of the input queue; from 0 to 4294967.295 (about 49.7 days) (see [Retry queue](#retry-queue)) |
 | `heartbeat_seconds` | `KicakExecutorAbstract` (optional, default 600) | AMQP heartbeat timeout of the Executor's connections, an int from 1 to 65535; set it above the longest processing of one message, retries of `execute()` included (see [Long-running `execute()`](#long-running-execute)) |
 | `input_check_seconds` | `KicakExecutorAbstract` (optional, default 10) | How often the input side is verified while the Executor waits for a message; 0 verifies it on every wakeup, about once a second (see [Topology verification](#topology-verification)) |
@@ -404,8 +408,8 @@ Quorum queues count the deliveries of each message. On RabbitMQ 4.0 and newer th
 delivery limit of 20: a message delivered 21 times is dead-lettered with the `x-death` reason
 `delivery_limit` instead of being delivered again. Every requeue counts, for example after a lost
 connection or a hard stop. A message that comes back from the retry queue arrives as a new message,
-so its count starts again: the limit never ends the retries of `TransientProcessingError` (see
-[Retry queue](#retry-queue)). A classic queue has no such limit and requeues a message indefinitely.
+so its count starts again: the delivery limit never ends the retries of `TransientProcessingError`,
+which only `max_retry_rounds` bounds (see [Retry queue](#retry-queue)). A classic queue has no such limit and requeues a message indefinitely.
 The limit can be changed with a RabbitMQ policy (`delivery-limit`).
 
 ## Message types
@@ -630,6 +634,7 @@ executor = SaveToDbExecutor(
     config,
     source_queue="db-writer",  # dead-letters to db-writer.dlx, retained in db-writer.dlq
     source_exchange="items.classified",
+    max_retry_rounds=360,  # 360 rounds of 10 seconds: waits out a database down for an hour
 )
 executor.run()
 ```
@@ -725,6 +730,7 @@ executor = ClassifyingExecutor(
     source_exchange="items.inbox",
     destination_exchange="items.classified",
     destination_queues=["db-writer", "quality-checker"],  # every queue bound to items.classified
+    max_retry_rounds=0,  # its execute() never raises TransientProcessingError
 )
 executor.run()
 ```
@@ -755,7 +761,7 @@ that decides what happens to the message and to the Executor:
 | `execute()` | The message | The Executor |
 | --- | --- | --- |
 | returns | its results are published, then it is acknowledged | continues |
-| raises `TransientProcessingError`: the failure may clear, e.g. a service is down, times out, or limits your rate | `execute()` is called again, up to `max_processing_attempts` times; if it still fails, the message is moved to the **retry queue**, not dead-lettered, and executed again after `retry_delay_seconds` (10 by default), as often as needed (see [Retry queue](#retry-queue)) | continues |
+| raises `TransientProcessingError`: the failure may clear, e.g. a service is down, times out, or limits your rate | `execute()` is called again, up to `max_processing_attempts` times; if it still fails, the message is moved to the **retry queue** and executed again after `retry_delay_seconds` (10 by default), up to `max_retry_rounds` times; still failing after that, it is **dead-lettered** with the reason `retries-exhausted` (see [Retry queue](#retry-queue)) | continues |
 | raises `MalformedMessageError`: the message can never succeed, e.g. its content is invalid | **dead-lettered** to `<queue>.dlq` at once, without another attempt, with headers saying why (see [Dead-letter queue](#dead-letter-queue)) | continues |
 | raises **any other exception**: treated as a bug | dead-lettered, so it cannot block the queue | **stops**: `run()` raises the exception, and the status is `"CRASHED"` |
 | raises a `BaseException` such as `KeyboardInterrupt` or `SystemExit` | not settled; RabbitMQ requeues it | stops at once, in the middle of `execute()`: `run()` raises it, and the status is `"CRASHED"` |
@@ -786,12 +792,13 @@ def execute(self, message: Document) -> Summary:
 Stopping on an unexpected exception is deliberate: a bug would otherwise fail, and dead-letter,
 every message in the queue. Stopping limits the damage to one message per instance (see [Scaling an
 Executor](#scaling-an-executor)) and makes the failure visible. Once the bug is fixed, start the
-Executor again and, if needed, replay the dead-lettered message from `<queue>.dlq`.
+Executor again and, if needed, send the dead-lettered message back from `<queue>.dlq` (see
+[Sending dead letters back](#sending-dead-letters-back)).
 
-Raise `TransientProcessingError` only for failures that can clear. It never dead-letters a message,
-whatever the queue type: a failure that never clears keeps the message going round through the
-retry queue until you fix the cause or take the message out (see [Retry queue](#retry-queue)). Every
-call may have done part of the work before failing, which is one more reason `execute()` must be
+Raise `TransientProcessingError` only for failures that can clear. A failure that never clears keeps
+the message going round through the retry queue, calling `execute()` again every round, until
+`max_retry_rounds` are used up and it is dead-lettered (see [Retry queue](#retry-queue)). Every call
+may have done part of the work before failing, which is one more reason `execute()` must be
 idempotent (see [Requirement: idempotent processing](#requirement-idempotent-processing)).
 
 ### Retry queue
@@ -816,11 +823,34 @@ classifier ──► Executor ── still failing after max_processing_attempts
    not expire again there.
 3. Whichever instance is free executes it again, with another `max_processing_attempts` calls.
    Messages that arrived meanwhile are processed while it waits.
+4. After `max_retry_rounds` moves, a message whose last round fails too is dead-lettered instead,
+   with the reason `retries-exhausted` (see [Dead-letter queue](#dead-letter-queue)), and the
+   Executor continues.
 
-There is no limit on the number of rounds: a failure that never clears keeps the message going
-round every `retry_delay_seconds`. The copy keeps the body and the message's properties, its `type`
-included, so it comes back as the same version of the message, and its headers, except the headers
-RabbitMQ manages itself (`x-death`, `x-delivery-count`, `x-first-death-*`, and `x-last-death-*`).
+**Choosing `max_retry_rounds`.** It is required: how long a failing service may stay down, and how
+much calling it again may cost, depends on the agent, so every Executor states it. Two numbers follow
+from it:
+
+- A message is dead-lettered no sooner than `max_retry_rounds × retry_delay_seconds` after its first
+  move, because it waits in the retry queue at least that long in every round. It counts tries, not
+  time: waiting in a long input queue, or while the Executor is stopped, uses up no rounds. Size it
+  to the longest outage the agent should wait out, for example 360 rounds of 10 seconds for an
+  hour.
+- `execute()` is called at most `(max_retry_rounds + 1) × max_processing_attempts` times for one
+  message, which bounds what a message that never succeeds costs, for example in calls to a paid
+  service. A longer `retry_delay_seconds` with fewer rounds waits out the same outage with fewer
+  calls: 6 rounds of 10 minutes instead of 360 of 10 seconds.
+
+With `max_retry_rounds=0` a message is never moved to the retry queue: one still failing after its
+first `max_processing_attempts` calls is dead-lettered. The rounds are counted in the message's own
+headers (below), not in the Executor, so every instance continues the count of another, and changing
+`max_retry_rounds` takes only a restart; give every instance of an Executor the same value. After an
+outage that outlasted the limit, send the dead-lettered messages back (see
+[Sending dead letters back](#sending-dead-letters-back)): they get all their rounds again.
+
+The copy in the retry queue keeps the body and the message's properties, its `type` included, so it
+comes back as the same version of the message, and its headers, except the headers RabbitMQ manages
+itself (`x-death`, `x-delivery-count`, `x-first-death-*`, and `x-last-death-*`).
 Its `user_id` becomes the Executor's own user, because RabbitMQ refuses any other, while its
 `x-kicak-original-publisher` header keeps naming the agent that created the message (see
 [Who published a message](#who-published-a-message)), and its `x-kicak-published-at` header
@@ -830,30 +860,31 @@ the rounds:
 
 | Header | Value |
 | --- | --- |
-| `x-kicak-retry-round` | 1 for the first move to the retry queue, then 2, 3, and so on |
+| `x-kicak-retry-round` | 1 for the first move to the retry queue, then 2, 3, and so on, up to `max_retry_rounds`; 1 again for the first move of a message sent back from the dead-letter queue |
 | `x-kicak-retrying-since` | when the message was first moved there, in ISO 8601 and UTC |
 
 Every move is logged at `WARNING`, for example:
 
 ```text
 Message moved to retry queue after 3 failed processing attempts id=doc-42 queue=classifier
-retry_queue=classifier.retry retry_round=37 retrying_since=2026-10-19T08:00:00+00:00
-retry_in=10.0s: summarizer unavailable
+retry_queue=classifier.retry retry_round=37 max_retry_rounds=360
+retrying_since=2026-10-19T08:00:00+00:00 retry_in=10.0s: summarizer unavailable
 ```
 
-**Finding a message that never succeeds.** Alert on these warnings: the same `id` with a high
-`retry_round`, or a `retrying_since` long ago, is a message that keeps failing. A growing number of
-messages in `<queue>.retry` shows a failure that affects many. RabbitMQ's management UI shows the
-headers of the messages waiting there; use "Get messages" with "Nack message requeue true" to look
-at them without removing them.
+**Finding a message that keeps failing.** Alert on these warnings: the same `id` with a
+`retry_round` approaching `max_retry_rounds`, or a `retrying_since` long ago, is a message that keeps
+failing. A growing number of messages in `<queue>.retry` shows a failure that affects many.
+RabbitMQ's management UI shows the headers of the messages waiting there; use "Get messages" with
+"Nack message requeue true" to look at them without removing them.
 
-**Taking such a message out.** RabbitMQ can only take messages from the front of a queue, not one
-chosen by its ID, and the message spends part of its time elsewhere. Taking messages from the retry
-queue by hand also removes the ones in front of it, and rejecting one there sends it back to the
-input queue. The safe way is to make `execute()` raise `MalformedMessageError` for it, for example
-for the IDs on a list your application reads: the next time the message comes round, it is
-dead-lettered to `<queue>.dlq`, where it is kept for inspection or replay. Fixing the cause, such as
-a service that is down, ends the rounds by itself.
+**Taking such a message out sooner.** `max_retry_rounds` takes a message that never succeeds out by
+itself. To take one out before that, note that RabbitMQ can only take messages from the front of a
+queue, not one chosen by its ID, and the message spends part of its time elsewhere: taking messages
+from the retry queue by hand also removes the ones in front of it, and rejecting one there sends it
+back to the input queue. The safe way is to make `execute()` raise `MalformedMessageError` for it,
+for example for the IDs on a list your application reads: the next time the message comes round, it
+is dead-lettered to `<queue>.dlq`, where it is kept for inspection or replay. Fixing the cause, such
+as a service that is down, ends the rounds by itself.
 
 **The way back.** The default exchange cannot be deleted, so the way back depends only on the input
 queue. RabbitMQ dead-letters the expired messages of a classic queue at most once: a message that
@@ -880,7 +911,7 @@ A dead-lettered message is kept in `<queue>.dlq` together with the reason it is 
 looked into without searching the logs:
 
 ```text
-classifier ──► Executor ── malformed, a bug, or a result too large ──► classifier.dlx ──► classifier.dlq
+classifier ──► Executor ── malformed, retries used up, a bug, or a result too large ──► classifier.dlx ──► classifier.dlq
 ```
 
 1. The Executor publishes a copy of the message to the dead-letter exchange `<queue>.dlx`, right
@@ -893,15 +924,15 @@ The copy keeps the body, the `message_id` property exactly as the message arrive
 the same ID, and the other properties, its `type` included, so it can be replayed as the same version
 of the message. It keeps the message's headers, its retry headers `x-kicak-retry-round` and
 `x-kicak-retrying-since` and its `x-kicak-published-at` included, as its history, except the
-headers RabbitMQ manages itself. It never expires. Its `user_id` becomes the Executor's own user, while its `x-kicak-original-publisher`
-header keeps naming the agent that created the message (see
+headers RabbitMQ manages itself. It never expires. Its `user_id` becomes the Executor's own user,
+while its `x-kicak-original-publisher` header keeps naming the agent that created the message (see
 [Who published a message](#who-published-a-message)). It also gets headers that say why, when, and
 from where:
 
 | Header | Value |
 | --- | --- |
-| `x-kicak-dead-letter-reason` | `malformed`: a `MalformedMessageError`, raised by `execute()`, or by the Executor for a message it cannot decode or whose results are invalid; `unexpected-error`: any other exception, treated as a bug, which also stopped the Executor; `result-too-large`: RabbitMQ refused one of its results as larger than its `max_message_size` |
-| `x-kicak-error-type` | the class of the exception with its module, e.g. `pykicak.executor.MalformedMessageError` or `myapp.errors.InvoiceError`; a built-in one without it, e.g. `KeyError` |
+| `x-kicak-dead-letter-reason` | `malformed`: a `MalformedMessageError`, raised by `execute()`, or by the Executor for a message it cannot decode or whose results are invalid; `retries-exhausted`: a `TransientProcessingError` that persisted through `max_retry_rounds` rounds in the retry queue; `unexpected-error`: any other exception, treated as a bug, which also stopped the Executor; `result-too-large`: RabbitMQ refused one of its results as larger than its `max_message_size` |
+| `x-kicak-error-type` | the class of the exception with its module, e.g. `pykicak.executor.MalformedMessageError` or `myapp.errors.InvoiceError`; a built-in one without it, e.g. `KeyError`; for `retries-exhausted`, the `TransientProcessingError` of the last attempt |
 | `x-kicak-error-message` | the text of the exception, at most 1024 bytes of UTF-8; a longer one is cut and ends with `…` |
 | `x-kicak-dead-lettered-at` | when the message was dead-lettered, in ISO 8601 and UTC |
 | `x-kicak-dead-lettered-from` | the queue it was taken from |
@@ -923,10 +954,8 @@ it is missing.
 RabbitMQ's `consumer_timeout` takes the message back, after RabbitMQ has confirmed the copy but
 before the Executor acknowledges the original, RabbitMQ redelivers the original, which is executed
 again. It may then be dead-lettered again, leaving two copies, or succeed, for example once a bug is
-fixed. Replaying a message from the dead-letter queue is safe because agents are idempotent (see
-[Requirement: idempotent processing](#requirement-idempotent-processing)). A replayed message still
-carries the headers above; the Executor drops them from every copy it makes, so a later move to the
-retry queue or the dead-letter queue never shows a stale reason.
+fixed. Sending a message back from the dead-letter queue is safe because agents are idempotent (see
+[Requirement: idempotent processing](#requirement-idempotent-processing)).
 
 **When the copy cannot be placed.** If RabbitMQ returns the copy as unroutable, because the
 dead-letter queue or its binding was deleted right after the Executor declared them, or refuses it,
@@ -938,6 +967,38 @@ or refusing the copy in another way, for example with `403 ACCESS_REFUSED`, stop
 After an unexpected failure, the Executor stops either way, and raises that failure, not the error
 of the copy.
 
+### Sending dead letters back
+
+Once the cause is fixed, for example when a service that was down longer than `max_retry_rounds`
+allowed is back, or a bug in `execute()` is fixed, a dead-lettered message can be sent back to its
+queue to be executed again. Send it to the queue itself, through RabbitMQ's default exchange, which
+routes by queue name, not to the Executor's `source_exchange`, which may deliver it to other
+consumers' queues too.
+
+pykicak itself has no tool for this; operating the broker is the application's. The repository has
+an example, [`examples/replay_dead_letters.py`](https://github.com/przemek-barczak/pykicak/blob/main/examples/replay_dead_letters.py),
+built on pika and `KicakConfig`, which sends back the messages dead-lettered for the reasons you
+choose and leaves the others in the dead-letter queue:
+
+```bash
+python -m examples.replay_dead_letters classifier --reason retries-exhausted --dry-run
+python -m examples.replay_dead_letters classifier --reason retries-exhausted
+```
+
+It removes a message from `<queue>.dlq` only after RabbitMQ has confirmed its copy in `<queue>`,
+so a lost connection in between can send a message back twice. Choose the reasons with care: a
+message dead-lettered as `unexpected-error` stops an Executor instance again until the bug is fixed.
+A RabbitMQ shovel, such as "Move messages" in the management UI, moves every message of the queue,
+whatever its reason.
+
+A message sent back keeps the headers of its dead-lettering, and from those the Executor recognizes
+it:
+
+- Its retry rounds start again: it gets `max_retry_rounds` rounds once more, and `get_info()` and
+  the `Message handled` line report its `retry_round` as 0.
+- Every copy the Executor makes of it, for the retry queue or the dead-letter queue, drops those
+  headers and its old retry headers, so it never shows a stale reason or round.
+
 ### Every outcome of a delivery
 
 The Executor decides the outcome of every delivery from how `execute()` ends, and from what RabbitMQ
@@ -948,6 +1009,7 @@ reports while the results are published and the message is settled:
 | Success | `execute()` returns | results published in one transaction, then acknowledged | continues |
 | Deterministic failure | a `type` property that is missing or names a type the Executor does not accept, missing body, undecodable body (not JSON, `NaN` and `Infinity` included, a number too large for a float, nested too deeply to decode, not a JSON object, missing or unexpected fields, no valid `message_id`, refused by the message class's `__post_init__` with any exception), `MalformedMessageError` raised by `execute()`, or results returned by `execute()` that are not `KicakMessage`s or cannot be serialized | dead-lettered: copied to the dead-letter exchange with headers saying why, and acknowledged once RabbitMQ has confirmed the copy; if RabbitMQ does not take the copy (returns it as unroutable, or refuses it), requeued with `basic_nack(requeue=True)` and logged at `ERROR` (see [Dead-letter queue](#dead-letter-queue)) | continues; RabbitMQ refusing to declare the dead-letter route stops it |
 | Transient failure | `TransientProcessingError` raised by `execute()` | retried in-process; if every attempt fails, copied to the retry queue and acknowledged once RabbitMQ has confirmed the copy; if RabbitMQ does not take the copy (returns it as unroutable, or refuses it), requeued with `basic_nack(requeue=True)` and logged at `ERROR` | continues; RabbitMQ refusing to declare the retry queue stops it |
+| Retries used up | `TransientProcessingError` raised by every attempt of the last round, after `max_retry_rounds` moves to the retry queue (at once with `max_retry_rounds=0`) | dead-lettered as above, with the reason `retries-exhausted` (see [Retry queue](#retry-queue)) | continues |
 | Unexpected failure | any other exception from `execute()`, results of another class than the declared result type, or results returned by a terminator | dead-lettered as above | logs the error and raises it, stopping |
 | Results returned as unroutable | `UnroutableError`: no queue was bound to the destination exchange when the results were committed, although the output side was just verified | held, unacknowledged, with its results; the message is not at fault | logs an `ERROR`, waits (0.5 seconds, doubling up to 30, with jitter), verifies the output side, and publishes the results again, without executing the message again (see [Unroutable results are held](#unroutable-results-are-held)) |
 | Result too large | RabbitMQ refuses a result larger than its `max_message_size` (16 MiB by default in RabbitMQ 4) | dead-lettered as above; RabbitMQ discards the whole transaction, so none of its results is published | continues |
@@ -973,7 +1035,8 @@ and the Executor continues. None of that input's results is published.
 
 `execute()` is called up to `max_processing_attempts` times (default 3) while it raises
 `TransientProcessingError`, with 0.5- and 1.0-second delays that double up to a 30-second cap, and
-the message then goes to the retry queue (see [Retry queue](#retry-queue)).
+the message then goes to the retry queue, or, once it has had `max_retry_rounds` rounds there, to
+the dead-letter queue (see [Retry queue](#retry-queue)).
 
 Every dead-lettered message is logged at `ERROR`, and its copy in `<queue>.dlq` keeps its original
 body and says why it is there (see [Dead-letter queue](#dead-letter-queue)).
@@ -1107,7 +1170,7 @@ moment:
 | `message` | The input message being processed, or `None`. |
 | `attempt` | Which call of `execute()` for `message` is under way, from 1 to `max_processing_attempts`, or `None`. |
 | `redelivered` | Whether RabbitMQ delivered `message` before without it being settled, or `None`. |
-| `retry_round` | How often `message` was moved to the retry queue before, 0 if never, or `None`. |
+| `retry_round` | How often `message` was moved to the retry queue before, 0 if never or if it was sent back from the dead-letter queue, or `None`. |
 | `counts` | How the deliveries the Executor took so far have ended: an `ExecutorCounts`. |
 
 The times are timezone-aware `datetime` objects in UTC, so a monitor can compare and subtract them
@@ -1160,7 +1223,10 @@ exactly when it is:
   may be the cause. A message back from the retry queue is a new delivery, so it is not
   redelivered.
 - `retry_round` is the message's `x-kicak-retry-round` header (see [Retry queue](#retry-queue)):
-  how often it was moved to the retry queue before, 0 for a message that never was.
+  how often it was moved to the retry queue before, 0 for a message that never was. A message whose
+  `retry_round` equals `max_retry_rounds` is dead-lettered if this round fails too. A message sent
+  back from the dead-letter queue starts again at 0 (see
+  [Sending dead letters back](#sending-dead-letters-back)).
 
 `counts` tells how every delivery the Executor started to process has ended. Each one counts
 once, when it is settled or left to RabbitMQ:
@@ -1169,9 +1235,10 @@ once, when it is settled or left to RabbitMQ:
 | --- | --- |
 | `completed` | executed, their results published, if any, and acknowledged |
 | `dead_lettered.malformed` | dead-lettered for a `MalformedMessageError` (see [Dead-letter queue](#dead-letter-queue)) |
+| `dead_lettered.retries_exhausted` | dead-lettered because `TransientProcessingError` persisted through `max_retry_rounds` rounds in the retry queue (see [Retry queue](#retry-queue)) |
 | `dead_lettered.result_too_large` | dead-lettered because RabbitMQ refused one of their results as too large |
 | `dead_lettered.unexpected_error` | dead-lettered for any other exception, each of which also stopped the Executor |
-| `dead_lettered.total` | dead-lettered, for any of the three reasons |
+| `dead_lettered.total` | dead-lettered, for any of the four reasons |
 | `moved_to_retry` | moved to the retry queue after `TransientProcessingError` persisted |
 | `requeued` | returned to the queue by the Executor: RabbitMQ did not take their copy for the retry queue or the dead-letter queue, or `stop()` ended a hold of their unroutable results |
 | `abandoned` | left to RabbitMQ, which delivers them again: the connection was lost, `consumer_timeout` expired, or `run()` ended by raising an exception while processing them |
@@ -1268,8 +1335,9 @@ Consider these when choosing the value:
 
 To process a queue faster, run several instances of the same Executor. Give every instance the
 same configuration (`source_queue`, `source_exchange`, `destination_exchange`,
-`destination_queues`, `queue_type`, `max_processing_attempts`, `heartbeat_seconds`,
-`input_check_seconds`, and `retry_delay_seconds`), and start them as independent processes:
+`destination_queues`, `queue_type`, `max_processing_attempts`, `max_retry_rounds`,
+`heartbeat_seconds`, `input_check_seconds`, and `retry_delay_seconds`), and start them as
+independent processes:
 
 ```text
                                       ┌──► classifier instance 1 ──┐
@@ -1452,7 +1520,7 @@ Message handled outcome=completed reason=None type=Chunk id=doc-17 queue=chunker
 | Key | Value |
 | --- | --- |
 | `outcome` | how the delivery ended, named like the field of [`counts`](#status-information) that counts it: `completed`, `dead_lettered`, `moved_to_retry`, `requeued`, or `abandoned` |
-| `reason` | for `dead_lettered`, its `x-kicak-dead-letter-reason` (`malformed`, `result-too-large`, or `unexpected-error`); otherwise `None` |
+| `reason` | for `dead_lettered`, its `x-kicak-dead-letter-reason` (`malformed`, `retries-exhausted`, `result-too-large`, or `unexpected-error`); otherwise `None` |
 | `type`, `id` | the message's class and `message_id`; for a delivery that could not be decoded, the accepted class its `type` property names and its sender's `message_id` property, each `None` if there is none |
 | `queue`, `delivery_tag` | the source queue, and the delivery's tag on the consuming channel |
 | `redelivered`, `retry_round` | RabbitMQ's redelivered flag, and how often the message was moved to the retry queue before (see [Status information](#status-information)) |
