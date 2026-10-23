@@ -57,28 +57,21 @@ class InjectionError(Exception):
 
 
 class KicakInjectorAbstract[M: KicakMessage](KicakAbstract, abc.ABC):
-    """Short-lived node that creates and publishes messages to the configured exchange.
+    """Short-lived node that creates and publishes the first message of a processing flow.
 
-    The Injector represents the entry point of a processing flow. It creates an
-    application-specific message and publishes it to an exchange, then terminates
-    and closes its RabbitMQ connection.
+    A subclass implements `generate()` and declares the type of its messages, `M`, once, in its
+    class header, where both type checkers and the injector read it, e.g.
+    `class Starter(KicakInjectorAbstract[Order])`. The Executor consuming the exchange must accept
+    that type. The class must declare its own `kicak_type`; an invalid declaration raises
+    `TypeError` when the injector is created, and a message of another class than `M` is refused
+    with `TypeError` before anything is published.
 
-    A subclass declares the type of its messages, `M`, once, in its class header, where both
-    type checkers and the injector read it, e.g. `class Starter(KicakInjectorAbstract[Order])`.
-    It is the contract with the Executor consuming the exchange, which must accept that type:
-    every message is sent with its class's `kicak_type` as the AMQP `type` property, and a
-    message of another class than `M` is refused with `TypeError` before anything is published.
-    The class must declare its own `kicak_type`. The injector raises `TypeError` when it is
-    created if the declaration is missing or invalid, e.g. for a subclass of the unparameterized
-    class, or names more than one class.
+    `run()` publishes each generated message on a connection of its own, which it then closes;
+    `publish()`, after `connect()` or in a `with` block, publishes on a connection kept open.
 
-    Every message it tries to publish, by `run()` or `publish()`, is logged at `INFO` in a
-    `Message injected` line, whether or not it was injected, telling its attempts, its size, and
-    how long each part took, for statistics.
-
-    The destination exchange is application topology, not connection configuration,
-    so it is passed in by the caller (typically sourced from an application's
-    messaging/exchanges.py) rather than read from the `.kicak` file.
+    The exchange name is application topology, passed in by the caller rather than read from the
+    `.kicak` file. Documentation:
+    https://github.com/przemek-barczak/pykicak/blob/main/docs/README.md
     """
 
     def __init__(
@@ -88,24 +81,20 @@ class KicakInjectorAbstract[M: KicakMessage](KicakAbstract, abc.ABC):
         exchange_name: str,
         blocked_timeout_seconds: float = _DEFAULT_BLOCKED_TIMEOUT_SECONDS,
     ) -> None:
-        """Store the exchange this injector publishes to, and how long it waits while blocked.
+        """Validate and store the exchange this injector publishes to. Does not connect.
 
         The message type comes from the class header (see the class docstring), which is checked
         first: an invalid declaration raises `TypeError`.
 
-        `exchange_name` is keyword-only, like the Executor's topology arguments. It must be a
-        non-empty `str` of at most 255 UTF-8 bytes that does not start with `amq.`, a prefix
-        RabbitMQ reserves; otherwise `TypeError` or `ValueError` is raised.
+        `exchange_name` (keyword-only) must be a non-empty `str` of at most 255 UTF-8 bytes that
+        does not start with `amq.`, a prefix RabbitMQ reserves; otherwise `TypeError` or
+        `ValueError` is raised.
 
-        `blocked_timeout_seconds` (default 60) is how long an attempt waits on a connection that
-        a RabbitMQ memory or disk alarm blocks: RabbitMQ then accepts no published message
-        until the alarm clears. After that time the attempt fails with `ConnectionBlockedTimeout`
-        and is retried, so an injection never hangs; lower it for an injector that someone waits
-        for, e.g. one answering an HTTP request. RabbitMQ may still enqueue the publish of a
-        timed-out attempt once the alarm clears, so the message can arrive twice. It must be a
-        finite int or float greater than 0, `bool` excluded; otherwise `TypeError` or
-        `ValueError` is raised. An injector always gives up eventually, so there is no value for
-        waiting until the alarm clears.
+        `blocked_timeout_seconds` (default 60, a finite number greater than 0) is how long an
+        attempt waits on a connection that a RabbitMQ memory or disk alarm blocks. The attempt then
+        fails with `ConnectionBlockedTimeout` and is retried, so an injection never hangs; lower it
+        for an injector someone waits for. A timed-out publish may still be enqueued once the alarm
+        clears, so the message can arrive twice. See "Running an Injector" in the documentation.
         """
         self._message_type = cast(
             type[M], _declared_message_type(type(self), KicakInjectorAbstract)
@@ -177,21 +166,14 @@ class KicakInjectorAbstract[M: KicakMessage](KicakAbstract, abc.ABC):
     def publish(self, message: M) -> None:
         """Publish `message` to the configured exchange and wait for RabbitMQ to confirm it.
 
-        Requires an open connection (`connect()` or a `with` block); otherwise, including after
-        `close()` or the end of the `with` block, raises `RuntimeError`. A message of another
-        class than the declared `M` raises `TypeError`. Raises `InjectionError`
-        if the message was not injected, with the original error as `__cause__`:
-        `UnroutableError` if no queue is bound to the exchange (the consuming Executor's topology
-        is not installed), `NackError` if RabbitMQ refuses the message, or a connection error
-        after three attempts. A connection that a RabbitMQ memory or disk alarm blocks for more
-        than `blocked_timeout_seconds` fails with `ConnectionBlockedTimeout`, a connection error.
+        Requires an open connection (`connect()` or a `with` block); otherwise, also after
+        `close()`, raises `RuntimeError`. A message of another class than the declared `M` raises
+        `TypeError`. Raises `InjectionError` if the message was not injected, with the original
+        error as `__cause__`: `UnroutableError` if no queue is bound to the exchange, `NackError` if
+        RabbitMQ refuses the message, or a connection error after three attempts.
 
-        The injector creates the message, so its user is both the message's `user_id`, which
-        RabbitMQ verifies, and its original publisher, in the `x-kicak-original-publisher` header,
-        which an Executor keeps when it moves the message to its retry queue.
-
-        A connection lost before RabbitMQ confirms the message is retried by publishing it again,
-        so RabbitMQ may receive it twice; the consuming agents must be idempotent.
+        A connection lost before RabbitMQ confirms the message is retried by publishing it again, so
+        RabbitMQ may receive it twice; the consuming agents must be idempotent.
         """
         if self._channel is None:
             raise RuntimeError("Not connected. Call connect() first.")
@@ -245,32 +227,25 @@ class KicakInjectorAbstract[M: KicakMessage](KicakAbstract, abc.ABC):
     def run(self, interval_seconds: float = 0) -> None:
         """Inject one generated message on a short-lived connection, or repeat it at an interval.
 
-        One injection calls `generate()` once. If it returns a message, the Injector opens a
-        connection, declares the exchange, publishes the message, waits for RabbitMQ's
-        confirmation, and closes the connection. Connecting and publishing are attempted up to
-        three times (immediately, after 1 second, and after 2 more seconds), each time on a new
-        connection and always with the same generated message. If `generate()` returns None,
-        nothing is published and no connection is opened.
+        One injection calls `generate()` once. If it returns a message, the injector opens a
+        connection, declares the exchange, publishes the message, waits for RabbitMQ's confirmation,
+        and closes the connection; if it returns None, no connection is opened. Connecting and
+        publishing are attempted up to three times, each time on a new connection and always with
+        the same message.
 
-        With `interval_seconds` of 0 or less (the default), `run()` injects once and returns.
-        With a positive `interval_seconds`, it injects, sleeps for `interval_seconds` with no
-        connection open, and repeats until the process ends; there is no `stop()`. It is checked
-        before anything is generated: a value that is not an int or float (`bool` included)
-        raises `TypeError`, and NaN or infinity `ValueError`.
+        With `interval_seconds` of 0 or less (the default), `run()` injects once and returns; with a
+        positive value, it repeats the injection at that interval until the process ends. A value
+        that is not an int or float (`bool` included) raises `TypeError`, and NaN or infinity
+        `ValueError`.
 
-        `run()` returns normally only when every injection succeeded. If one fails, the
-        connection is closed and `InjectionError` is raised, ending `run()` in either mode, so
-        no message is silently skipped. Its `__cause__` is the error that ended the last attempt
-        (for example a pika connection error, `UnroutableError`, or `NackError`), and its
-        `message` is the message that was not injected. Errors raised by `generate()` or by
-        serializing the message, and the `TypeError` for a message of another class than the
-        declared one, are logged at ERROR and propagate unchanged. An attempt never waits longer
-        than `blocked_timeout_seconds` (60 by default) on a connection that a RabbitMQ memory or
-        disk alarm blocks: it then fails with `ConnectionBlockedTimeout` and is retried, so an
-        injection cannot hang during an alarm.
+        `run()` returns normally only when every injection succeeded. A failed one closes the
+        connection and raises `InjectionError`, with the error of the last attempt as `__cause__`.
+        Errors from `generate()` or from serializing its message, and the `TypeError` for a message
+        of another class than `M`, propagate unchanged.
 
-        A retried attempt publishes the message again, and RabbitMQ may already have accepted
-        the earlier one, so it can arrive twice; the consuming agents must be idempotent.
+        A retried attempt publishes the message again, and RabbitMQ may already have accepted the
+        earlier one, so it can arrive twice; the consuming agents must be idempotent. See "Running
+        an Injector" in the documentation.
         """
         _check_interval_seconds(interval_seconds)
         logger.debug(

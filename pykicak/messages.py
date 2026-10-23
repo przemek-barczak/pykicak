@@ -105,29 +105,22 @@ def _finite_float(text: str) -> float:
 class KicakMessage:
     """Base class for messages exchanged over RabbitMQ.
 
-    Every message class names its type with `kicak_type`, a class attribute such as
-    `kicak_type = "order.v1"`: a non-empty string of at most 255 UTF-8 bytes, chosen once and
-    never derived from the class's name. It is sent as the AMQP `type` property of every message
-    of the class, and an Executor decodes a message into the class it accepts under that name, so
-    the name is the contract between the agents that publish a type and those that consume it.
-    A change of the fields is a new type, a new class with a new name such as `"order.v2"`. Each
-    class declares its own name: an agent refuses a class that only inherits one, because that
-    one names its base class's type.
-
-    Every message has a `message_id`, a keyword-only field declared here: a non-empty string of
-    at most 255 UTF-8 bytes that identifies the message. Delivery is at-least-once, so a message
-    can be processed more than once, and agents rely on its ID to stay idempotent. Assign the ID
-    once, where the message is first created (e.g. `str(uuid.uuid4())` in an Injector's
-    `generate()`), and derive the IDs of results from their input's ID (e.g. with `uuid.uuid5`),
-    so that executing an input again produces results with the same IDs. There is deliberately
-    no default: a generated default would give the results of a re-executed input new IDs. The
-    ID is also published as the AMQP `message_id` property.
-
-    Subclasses should be frozen dataclasses with JSON-serializable fields
-    (e.g. store timestamps as ISO-8601 strings, not `datetime` objects). Floats must be finite:
-    JSON has no NaN or infinity, so `to_bytes()` refuses them. A subclass that defines
-    `__post_init__` must call `KicakMessage.__post_init__(self)`; on Python 3.12, zero-argument
+    Subclasses are frozen dataclasses with JSON-serializable fields (store timestamps as ISO-8601
+    strings, not `datetime` objects), and floats must be finite. A subclass that defines
+    `__post_init__` must call `KicakMessage.__post_init__(self)`: on Python 3.12, zero-argument
     `super()` does not work in a `slots=True` dataclass.
+
+    Every class names its type with its own class attribute `kicak_type`, e.g.
+    `kicak_type = "order.v1"`: a non-empty string of at most 255 UTF-8 bytes, chosen once and sent
+    as the AMQP `type` property, the contract between the agents that publish and consume the type.
+    A change of the fields is a new class with a new name, e.g. `"order.v2"`.
+
+    Every message has a `message_id`, a required keyword-only field declared here: a non-empty
+    string of at most 255 UTF-8 bytes. Delivery is at-least-once, and agents rely on the ID to stay
+    idempotent: assign it once, where the message is first created, and derive the IDs of results
+    from their input's ID (e.g. with `uuid.uuid5`), so that executing an input again produces
+    results with the same IDs. See "Message types" in the documentation:
+    https://github.com/przemek-barczak/pykicak/blob/main/docs/messages.md
     """
 
     kicak_type: ClassVar[str]
@@ -175,20 +168,15 @@ class KicakMessage:
 
     @classmethod
     def from_bytes(cls, data: bytes) -> Self:
-        """Deserialize an AMQP message body previously produced by to_bytes().
+        """Deserialize an AMQP message body produced by `to_bytes()`.
 
-        Raises `ValueError` for a body that is not UTF-8 JSON (including `NaN`, `Infinity`, and
-        `-Infinity`, which Python's json module would accept), has a number too large for a float,
-        is nested too deeply to decode, or has an empty or too long `message_id`, and `TypeError`
-        for one that is not a JSON object, whose fields do not match this class (a missing
-        `message_id` included), or whose `message_id` is not a string. Other field values are
-        not converted or type-checked: a nested dataclass, for example, comes back as a `dict`.
-
-        A decoded message can be serialized again with `to_bytes()`, as long as its class keeps
-        to the message contract, e.g. its `__post_init__` does not replace a value with one JSON
-        cannot hold, and within the limits of Python's json module: it encodes nesting about as
-        deep as it decodes, though not always exactly as deep. The bytes can differ from `data`,
-        for example in whitespace or escapes, but they hold the same JSON value.
+        Raises `ValueError` for a body that is not UTF-8 JSON (`NaN`, `Infinity`, and `-Infinity`
+        included), has a number too large for a float, is nested too deeply to decode, or has an
+        empty or too long `message_id`, and `TypeError` for one that is not a JSON object, whose
+        fields do not match this class (a missing `message_id` included), or whose `message_id` is
+        not a string. Field values are not converted or type-checked: a nested dataclass, for
+        example, comes back as a `dict`. See "Message types" in the documentation for when a decoded
+        message can be serialized again.
         """
         try:
             try:

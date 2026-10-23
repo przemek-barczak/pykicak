@@ -535,27 +535,12 @@ class KicakAbstract(abc.ABC):
         )
 
     def close(self) -> None:
-        """
-        Close the RabbitMQ channel and connection if open.
+        """Close the RabbitMQ channel and connection, if they are open.
 
-        The agent forgets both before closing them, so afterwards it is disconnected even if
-        closing fails: `channel` raises `RuntimeError` again, and `connect()` opens a new
-        connection.
-
-        The channel is closed first. Failure to close the channel is logged but
-        does not prevent the connection from being closed and does not propagate
-        the channel exception.
-
-        The connection is closed in a ``finally`` block, regardless of whether
-        closing the channel succeeds. Failure to close the connection is logged
-        and propagated to the caller.
-
-        Therefore:
-            - channel closes, connection closes --> no exception
-            - channel fails, connection closes --> no exception
-            - channel closes, connection fails --> connection exception raised
-            - channel fails, connection fails --> connection exception raised
-            - channel or connection not declared --> skipped
+        The agent forgets both before closing them, so afterwards it is disconnected even if closing
+        fails: `channel` raises `RuntimeError`, and `connect()` opens a new connection. A failure to
+        close the channel is logged only, and the connection is closed anyway; a failure to close
+        the connection is logged and raised.
         """
         logger.debug("Disconnecting from RabbitMQ")
 

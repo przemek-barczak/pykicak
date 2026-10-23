@@ -113,97 +113,25 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
 ):
     """Long-running node that consumes messages, executes them, and optionally publishes results.
 
-    A subclass declares its message types once, in its class header, where both type checkers and
-    the executor read them: `Accepted`, the message types it accepts from the source queue, and
-    `Result`, the type of its results, or None for a terminator, e.g.
-    `class Summarizer(KicakExecutorAbstract[Document, Summary])`. They are the contract with the
-    agents upstream and downstream:
+    A subclass implements `execute()` and declares its message types once, in its class header,
+    where both type checkers and the executor read them: `Accepted`, the types it accepts, and
+    `Result`, the type of its results, or None for a terminator, which publishes nothing, e.g.
+    `class Summarizer(KicakExecutorAbstract[Document, Summary])`. A union such as
+    `DocumentV1 | DocumentV2` accepts several versions of a message. Each class must declare its own
+    `kicak_type`; an invalid declaration raises `TypeError` when the executor is created.
 
-    - Every message is sent with its class's `kicak_type` as the AMQP `type` property. The
-      executor decodes each delivery into the accepted class with that name, and dead-letters
-      one whose `type` it does not accept, or that has none, as malformed.
-    - To accept several versions of a message, e.g. while its producer is upgraded, give a
-      union: `KicakExecutorAbstract[DocumentV1 | DocumentV2, Summary]`. `execute()` receives an
-      instance of whichever class the message was sent as.
-    - Every result must be exactly of class `Result`; a result of another class is a bug, which
-      dead-letters the input and stops the executor. An executor with a result type needs a
-      destination exchange, and a terminator, declared with `Result` None, must not have one.
+    `run()` consumes the source queue one message at a time until `stop()` is called: each message
+    is executed, its results are published in one RabbitMQ transaction, and it is acknowledged; what
+    `execute()` raises decides whether it is retried or dead-lettered instead. The executor keeps
+    its queues, exchanges, and bindings in place, declaring them again whenever one could have been
+    deleted. `get_info()` reports what it is doing.
 
-    Each accepted class and the result class must declare their own `kicak_type`, and two
-    accepted classes must not declare the same one. The executor raises `TypeError` when it is
-    created if a declaration is missing or invalid, e.g. for a subclass of the unparameterized
-    class.
+    Delivery is at-least-once, so subclasses must be idempotent: a message can be executed, and its
+    results published, more than once.
 
-    Delivery is at-least-once, so subclasses must be idempotent: a message can be executed, and
-    its results published, more than once.
-
-    The executor verifies its topology from both sides, by declaring it again idempotently,
-    which restores whatever was deleted:
-
-    - Input side: its source queue, the queue's binding to the source exchange, its
-      dead-letter route (`<source_queue>.dlx` and `<source_queue>.dlq`), and its retry queue
-      (`<source_queue>.retry`). On every connection, after each message before waiting for the
-      next one, and every `input_check_seconds` while waiting. The dead-letter route is also
-      declared right before every rejection, and the retry queue before every move into it.
-    - Output side: the destination exchange and every queue in `destination_queues`, each
-      bound to it. On every connection, and right before the results of each message are
-      published.
-
-    Each delivery ends in exactly one outcome:
-
-    - Success: the results returned by `execute()` are published to the destination exchange
-      in one RabbitMQ transaction, so RabbitMQ delivers all of them or none, and the delivery is
-      acknowledged only after the transaction is committed.
-    - Deterministic failure (`MalformedMessageError`): the delivery is dead-lettered. A copy of
-      it is published to the dead-letter exchange, with headers saying why, when, and from
-      which queue (`x-kicak-dead-letter-reason`, `x-kicak-error-type`, `x-kicak-error-message`,
-      `x-kicak-dead-lettered-at`, `x-kicak-dead-lettered-from`), and the delivery is
-      acknowledged once RabbitMQ has confirmed the copy. If RabbitMQ returns the copy as
-      unroutable or refuses it, the delivery is requeued instead.
-    - Transient failure (`TransientProcessingError`): `execute()` is retried, and if the failure
-      persists the message is moved to the retry queue, which returns it to the back of the
-      source queue after `retry_delay_seconds`, up to `max_retry_rounds` times. Once it has had
-      all its rounds, it is dead-lettered as above, with the reason `retries-exhausted`.
-    - Any other error is unexpected: the delivery is dead-lettered as above, then the error is
-      raised, stopping the executor.
-    - Results returned by RabbitMQ as unroutable (`UnroutableError`: no queue was bound to the
-      destination exchange at the commit): the executor keeps the delivery unacknowledged and
-      its results in memory, and verifies the output side and publishes them again after a
-      wait (0.5 seconds, doubling up to 30, with jitter) during which the connection keeps
-      answering heartbeats. `execute()` is not called again. A `stop()` during the hold
-      requeues the delivery, so the message is executed again later.
-    - Connection lost while publishing results, or RabbitMQ already took the delivery back
-      because it outlasted `consumer_timeout` (closing its channel, or cancelling the consumer on
-      RabbitMQ 4.3 and newer), also while holding them: RabbitMQ discards the uncommitted results
-      and requeues the delivery, and the executor never re-sends them on a new connection. It
-      reconnects, receives the delivery again, and executes it again, publishing its results
-      once.
-    - A result larger than RabbitMQ's `max_message_size`: RabbitMQ discards the transaction, so
-      nothing is published, and the delivery is dead-lettered as above; the executor continues.
-    - Any other failure to verify the output side or to publish the results, e.g. RabbitMQ
-      refusing a declaration or the commit: the error is raised, stopping the executor, and
-      closing the connection requeues the delivery.
-    - Connection lost while acknowledging or requeueing the delivery, or moving it to the retry
-      queue or the dead-letter queue, or RabbitMQ took the delivery back because it outlasted
-      `consumer_timeout`:
-      RabbitMQ requeues it, so the executor reconnects and receives it again, unless it was
-      stopping anyway because of an unexpected error, which it then still raises.
-
-    Without a destination exchange, and with the result type None, the executor is a terminator,
-    and `execute()` must return None.
-
-    The executor takes one message at a time: RabbitMQ delivers the next message only after
-    the previous one is acknowledged or rejected (prefetch count 1).
-
-    Call `stop()`, from any thread or a signal handler, to make `run()` finish the message in
-    progress and return before taking another one. `get_info()` reports what the Executor is
-    doing, since when, whether a stop was requested, and which message it is processing. Every
-    delivery it takes ends with a `Message handled` line logged at `INFO`, whatever the outcome,
-    telling how it ended and how long each part of its handling took, for statistics.
-
-    All queue/exchange names are application topology, not connection configuration, so they
-    are passed in by the caller (typically sourced from an application's messaging/queues.py,
-    messaging/exchanges.py, and messaging/bindings.py) rather than read from the `.kicak` file.
+    Queue and exchange names are application topology, passed in by the caller rather than read from
+    the `.kicak` file. The documentation describes every outcome of a delivery:
+    https://github.com/przemek-barczak/pykicak/blob/main/docs/README.md
     """
 
     def __init__(
@@ -221,81 +149,41 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
         input_check_seconds: float = _DEFAULT_INPUT_CHECK_SECONDS,
         retry_delay_seconds: float = _DEFAULT_RETRY_DELAY_SECONDS,
     ) -> None:
-        """Store this executor's topology, retry settings, heartbeat timeout, and check interval.
+        """Validate and store this executor's topology and settings. Does not connect.
 
         The message types come from the class header (see the class docstring), which is checked
-        first: an invalid declaration raises `TypeError`.
+        first. Every argument after `config` is keyword-only, and an invalid one raises `TypeError`
+        or `ValueError`.
 
-        `source_exchange` is the upstream exchange that `source_queue` is bound to (e.g. an
-        Injector's exchange, or a previous Executor's destination exchange). It is required so
-        the Executor always consumes from a queue attached to its intended input exchange.
+        - `source_queue` is the queue to consume, and `source_exchange` the exchange it is bound to,
+          e.g. an Injector's exchange or another Executor's destination exchange.
+        - `destination_exchange` receives the results of `execute()`, and `destination_queues` names
+          every queue that must receive them, at least one; the executor declares and binds each of
+          them before publishing. Give both for an executor with a result type, neither for a
+          terminator. A `destination_exchange` equal to `source_exchange`, or `destination_queues`
+          including `source_queue`, is refused: the results would be executed again, possibly
+          forever.
+        - Every name is a non-empty `str` that does not start with `amq.`. An exchange name fits in
+          255 UTF-8 bytes, and a queue name in 249, leaving room for the queues and exchanges
+          derived from it: `<queue>.dlx` and `<queue>.dlq`, its dead-letter route, and
+          `<queue>.retry`.
+        - `queue_type` is `QueueType.CLASSIC` (the default) or `QueueType.QUORUM`, or its string
+          value, for every queue the executor declares; all Executors of a system use the same type.
+        - `max_processing_attempts` (default 3) is how many times `execute()` is called for one
+          delivery while it raises `TransientProcessingError`, before the message is moved to the
+          retry queue.
+        - `max_retry_rounds` (required, 0 or more) is how many times a message may be moved to the
+          retry queue; one still failing after that is dead-lettered as `retries-exhausted`, so
+          `execute()` is called at most `(max_retry_rounds + 1) * max_processing_attempts` times.
+        - `retry_delay_seconds` (default 10, from 0 to 4294967.295) is how long a message waits in
+          the retry queue before it is executed again.
+        - `heartbeat_seconds` (default 600, an int from 1 to 65535) is the AMQP heartbeat timeout.
+          Set it above the longest processing of one message, retries of `execute()` included, or
+          RabbitMQ redelivers the message while it is still being executed. None is refused.
+        - `input_check_seconds` (default 10, 0 or more) is how often the input side is verified
+          while the executor waits for a message; 0 means about every second.
 
-        Every queue and exchange name must be a non-empty `str` that does not start with `amq.`,
-        a prefix RabbitMQ reserves, and fits AMQP's limit of 255 UTF-8 bytes: an exchange name in
-        255, and a queue name, of `source_queue` or in `destination_queues`, in 249, leaving room
-        for the `.retry` suffix of its retry queue. Otherwise `TypeError` or `ValueError` is
-        raised.
-
-        The dead-letter exchange of `source_queue`, set as its `x-dead-letter-exchange`
-        argument, is `<source_queue>.dlx`, and the dead-letter queue bound to it is
-        `<source_queue>.dlq`, so dead-lettered deliveries are retained for inspection or replay:
-        the executor publishes a copy of each, saying why, to the exchange, and RabbitMQ
-        dead-letters there what it removes itself, e.g. at a quorum queue's delivery limit. Like
-        `source_queue`, both are owned and declared only by this executor.
-
-        `destination_exchange`, if given, receives the results returned by `execute()`, and
-        `destination_queues` must then name every queue that must receive them, at least one.
-        Before publishing, the executor declares each of these queues, with the same arguments
-        as its own Executor declares it, and binds it to the destination exchange, so a deleted
-        queue or binding is restored instead of its results being lost. Give neither to run in
-        terminator mode; one without the other raises `ValueError`. So does giving them to a
-        terminator, declared with the result type None, or omitting them for an executor that
-        declares a result type.
-
-        An executor never publishes to itself: a `destination_exchange` equal to
-        `source_exchange`, or `destination_queues` including `source_queue`, raises `ValueError`,
-        because the results would come back to `source_queue` and be executed again, possibly
-        forever. To send results back upstream, let a downstream Executor publish them to
-        `source_exchange`.
-
-        `queue_type` is the RabbitMQ queue type of every queue this executor declares: its
-        source queue, its dead-letter queue, its retry queue, and its destination queues, so
-        every Executor of a system must use the same type. `QueueType.CLASSIC` is the default;
-        `QueueType.QUORUM` is a replicated queue that survives the loss of a cluster node. Their
-        string values, `"classic"` and `"quorum"`, are accepted too, e.g. from an application's
-        configuration; any other value raises `ValueError`. It is always declared explicitly, so
-        a vhost's default queue type does not apply. RabbitMQ cannot change the type of an
-        existing queue: declaring it with another type fails with `406 PRECONDITION_FAILED`.
-
-        `max_processing_attempts` is how many times `execute()` is called for one delivery, one
-        call after the other, while it raises `TransientProcessingError`, before the message is
-        moved to the retry queue `<source_queue>.retry`. That queue, owned and declared only by
-        this executor, holds the message for `retry_delay_seconds` (default 10, at most about
-        49.7 days; 0 returns it at once) and then returns it to the back of the source queue,
-        where it is executed again, with another `max_processing_attempts` calls.
-
-        `max_retry_rounds` (required, an int, 0 or more) is how many times a message may be
-        moved to the retry queue. A message whose last round fails too is dead-lettered instead,
-        with the reason `retries-exhausted`, so `execute()` is called at most
-        `(max_retry_rounds + 1) * max_processing_attempts` times for it, and it is dead-lettered no
-        sooner than `max_retry_rounds * retry_delay_seconds` after its first move. With 0, it is
-        never moved: a message still failing after its first `max_processing_attempts` calls is
-        dead-lettered. The rounds are counted in the message's `x-kicak-retry-round` header, which
-        any instance can read, and start again for a message sent back from the dead-letter
-        queue. There is deliberately no default: how long a failing service may stay down, and
-        how much retrying it may cost, depends on the agent.
-
-        `heartbeat_seconds` (an int from 1 to 65535, default 600) is the AMQP heartbeat timeout of
-        this executor's connections. Set it above the longest time processing one message can
-        take: every call of `execute()` for it, including the calls retried after
-        `TransientProcessingError`, and the waits between them. The connection cannot answer
-        heartbeats during that time, so RabbitMQ closes a connection that stays silent for longer
-        and redelivers its message. A larger value also delays the detection of a dead connection
-        by the same amount. None raises `TypeError`: it would accept the broker's proposal, 60
-        seconds by default, which is too short for a long `execute()`.
-
-        `input_check_seconds` (default 10) is how often the input side is verified while the
-        executor waits for a message. With 0 it is verified on every wakeup, about once a second.
+        See "RabbitMQ topology", "Retry queue", and "Long-running `execute()`" in the documentation.
         """
         accepted_types, result_type = _declared_message_types(type(self), KicakExecutorAbstract)
         topology = _ExecutorTopology.checked(
@@ -425,100 +313,72 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
     def execute(self, message: Accepted) -> Result | Sequence[Result] | None:
         """Process one decoded message and return the results to publish.
 
-        `message` is an instance of the accepted class whose `kicak_type` the delivery's `type`
-        property names. A delivery is dead-lettered as malformed, without calling `execute()`, if
-        its `type` is missing or not accepted, or its body cannot be decoded into that class:
-        not a JSON object, missing or unexpected fields, no valid `message_id`, or refused by the
-        class's own `__post_init__`, whatever it raises. The types of other field values are not
-        checked; validate them here and raise `MalformedMessageError` if needed.
+        `message` is an instance of the accepted class that the delivery's `type` property names; a
+        delivery that cannot be decoded into one is dead-lettered as malformed, without calling
+        `execute()`. The values of its fields are not type-checked: validate them here, and raise
+        `MalformedMessageError` for invalid ones.
 
-        Return a message, a sequence of messages, or None. Every result must be exactly of the
-        declared result class; any other class is a bug, which dead-letters the input and stops
-        the executor. Results are published to the destination exchange only after `execute()`
-        succeeds, all in one RabbitMQ transaction, and the input is acknowledged only after that
-        transaction is committed. A terminator must return None. The executor creates each
-        result, so its user is both the result's `user_id` and its original publisher, in the
-        `x-kicak-original-publisher` header.
+        Return a message, a sequence of messages, or None; a terminator must return None. Every
+        result must be exactly of the declared result class; any other class is a bug, which
+        dead-letters the input and stops the executor. Results are published only after `execute()`
+        succeeds, all in one RabbitMQ transaction, and the input is acknowledged after the commit.
 
         The exception it raises decides what happens, and only `execute()` can know which applies:
 
         - `TransientProcessingError`, for a failure that may clear, e.g. a service that is down:
-          `execute()` is called again, and if the failure persists the message waits in the
-          retry queue for `retry_delay_seconds` and is then executed again, up to
-          `max_retry_rounds` times; then it is dead-lettered. The executor continues.
+          `execute()` is called again, and if the failure persists the message waits in the retry
+          queue for `retry_delay_seconds` and is then executed again, up to `max_retry_rounds`
+          times; then it is dead-lettered. The executor continues.
         - `MalformedMessageError`, for a message that can never succeed: it is dead-lettered. The
           executor continues.
         - Any other exception, including one from a library it calls, is treated as a bug: the
           message is dead-lettered, and the executor stops, `run()` raising the exception with the
           status `"CRASHED"`. Catch the errors you expect and raise one of the two above instead.
 
-        Must be idempotent: the same message can be executed more than once, also concurrently
-        by two instances, and after a call that raised `TransientProcessingError` part-way, and
-        its results can be published more than once. Make side effects idempotent in the
-        database, and derive result IDs from the input's ID.
+        Must be idempotent: the same message can be executed more than once, also concurrently by
+        two instances, and after a call that raised `TransientProcessingError` part-way, and its
+        results can be published more than once. Make side effects idempotent in the database, and
+        derive result IDs from the input's ID.
         """
 
     def stop(self) -> None:
         """Request a graceful stop: `run()` returns before it takes another message.
 
-        A message that is already being processed is finished first: its results are published
-        and it is acknowledged (or requeued or dead-lettered, as usual). `run()` then closes the
-        connection and returns instead of waiting for the next message. Waiting for a message,
-        or waiting to reconnect, is interrupted within about a second. A message that RabbitMQ
-        delivers after the request, but before `run()` notices it, is not processed; closing
-        the connection returns it to the queue.
+        A message already being processed is finished first: its results are published and it is
+        settled as usual. Waiting for a message, or to reconnect, is interrupted within about a
+        second. A message whose unroutable results are held is requeued instead, so it is executed
+        again later, and a stop never waits for the downstream side.
 
-        Safe to call from any thread and from a signal handler: it only sets a flag and records
-        the time, without locking, logging, or using the connection. The request is permanent:
-        `run()` on a stopped Executor returns immediately, so create a new instance to consume
-        again.
-
-        If the results of the message are held because RabbitMQ returned them as unroutable, the
-        message is requeued instead, with `basic_nack(requeue=True)`, so it is executed again
-        later; a stop never waits for the downstream side to recover.
-
-        The status becomes `STOPPING`, unless `run()` has already ended as `STOPPED` or
-        `CRASHED`; calling `stop()` again changes nothing, and `ExecutorInfo.stop_requested_at`
-        keeps the time of the first call.
+        Safe to call from any thread and from a signal handler: it only sets a flag and records the
+        time, without locking, logging, or using the connection. The request is permanent: `run()`
+        on a stopped executor returns at once. See "Graceful stop" in the documentation.
         """
         self._status.request_stop()
 
     def get_info(self) -> ExecutorInfo[Accepted]:
         """Return a snapshot of what the executor is doing: an `ExecutorInfo`.
 
-        Its `status` is `"CREATED"` until `run()` has connected. While it consumes,
-        `"WAITING_FOR_MESSAGE"`, `"PROCESSING"`, and `"SENDING_RESULT"` follow each other for
-        every message, and `"UPSTREAM_RECOVER"` and `"DOWNSTREAM_RECOVER"` show that it is
-        retrying after a failure on its input or output side; see `ExecutorStatus`. After
-        `stop()`, `"STOPPING"` until `run()` returns, then `"STOPPED"`; `"CRASHED"` if `run()`
-        ended by raising an exception. A later `stop()` never changes `"STOPPED"` or `"CRASHED"`;
-        calling `run()` again after `"CRASHED"`, without a stop request, starts again in
-        `"UPSTREAM_RECOVER"`.
-
-        The snapshot also tells when the status was entered, when the snapshot was taken, whether
-        and when `stop()` was called, the input message being processed, if any, with its
-        `attempt`, `redelivered` flag, and `retry_round`, and `counts`, how the deliveries taken
-        so far have ended. Every field describes the same moment, so a monitor never has to
-        combine several calls.
+        All its fields describe the same moment: the status (an `ExecutorStatus`) and since when,
+        whether and when `stop()` was called, the message being processed with its attempt,
+        redelivered flag, and retry round, and `counts`, how the deliveries taken so far have ended.
 
         Safe to call from any thread while `run()` is running: it neither locks nor changes any
-        state, and does not use the RabbitMQ connection.
+        state, and does not use the RabbitMQ connection. See "Status information" in the
+        documentation.
         """
         return self._status.snapshot()
 
     def run(self) -> None:
         """Connect, then consume the source queue until `stop()` is called.
 
-        See the class docstring for when a delivery is acknowledged, requeued, or dead-lettered.
-
-        Returns normally only after `stop()`, with the status `"STOPPED"`, even if closing the
-        connection then fails: the failure is logged, and RabbitMQ requeues a delivery left
-        unsettled once the connection is gone. Otherwise it stops by raising, with the status
-        `"CRASHED"`: on failures, and on a `BaseException` such as `SystemExit` or
-        `KeyboardInterrupt`, which interrupts even a message being processed. In every case the
-        connection is closed, and RabbitMQ requeues a delivery that was not yet acknowledged or
-        rejected. If RabbitMQ cancels the consumer, for example because the queue
-        was deleted, it logs an error and reconnects, which declares the queue again.
+        Returns normally only after `stop()`, with the status `"STOPPED"`. Otherwise it ends by
+        raising, with the status `"CRASHED"`: on a failure that stops the executor, such as an
+        unexpected exception from `execute()` or RabbitMQ refusing a declaration, and on a
+        `BaseException` such as `KeyboardInterrupt`, which interrupts even a message being
+        processed. A lost connection is not such a failure: the executor reconnects, retrying
+        indefinitely. In every case the connection is closed at the end, and RabbitMQ
+        requeues a delivery that was not settled yet, so it is executed again. See "Every outcome of
+        a delivery" in the documentation.
         """
         status = self._status
         if status.stop_requested:
