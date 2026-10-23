@@ -28,7 +28,7 @@ PACKAGE = "pykicak"
 VERSION_PATTERN = re.compile(r"\d+\.\d+\.\d+(?:(?:a|b|rc)\d+)?")
 
 # What the sdist may hold besides the package: setuptools adds these, and MANIFEST.in prunes
-# everything else (tests, examples, the config template)
+# everything else (tests, examples, docs, the config template)
 SDIST_EXTRAS = {
     "LICENSE",
     "MANIFEST.in",

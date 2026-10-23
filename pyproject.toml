@@ -14,15 +14,15 @@ authors = [
 ]
 keywords = [
     "rabbitmq",
+    "amqp",
     "pika",
-    "messaging",
     "message-queue",
+    "messaging",
     "idempotent",
-    "at-least-once",
-    "dead-letter",
-    "agents",
-    "pipeline",
+    "at-least-once-delivery",
+    "dead-letter-queue",
     "distributed-systems",
+    "event-driven",
 ]
 # No license classifier: with an SPDX `license` expression, PEP 639 forbids one.
 classifiers = [
@@ -68,6 +68,7 @@ dev = [
 [project.urls]
 Homepage = "https://github.com/przemek-barczak/pykicak"
 Repository = "https://github.com/przemek-barczak/pykicak"
+Documentation = "https://github.com/przemek-barczak/pykicak/blob/main/docs/README.md"
 Issues = "https://github.com/przemek-barczak/pykicak/issues"
 Changelog = "https://github.com/przemek-barczak/pykicak/blob/main/CHANGELOG.md"
 
@@ -75,8 +76,8 @@ Changelog = "https://github.com/przemek-barczak/pykicak/blob/main/CHANGELOG.md"
 version = { attr = "pykicak.__version__" }
 
 [tool.setuptools.packages.find]
-# Only the library is published (wheel and sdist); tests/ and examples/ stay in the repository,
-# and MANIFEST.in prunes them from the sdist.
+# Only the library is published (wheel and sdist); tests/, examples/, and docs/ stay in the
+# repository, and MANIFEST.in prunes them from the sdist.
 include = ["pykicak*"]
 
 [tool.setuptools.package-data]
