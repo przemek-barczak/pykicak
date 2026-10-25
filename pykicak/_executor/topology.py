@@ -31,7 +31,11 @@ class QueueType(StrEnum):
     __module__ = "pykicak.executor"  # where it is public
 
     CLASSIC = "classic"
-    """A queue stored on one broker node; the default."""
+    """A queue stored on one broker node; the default.
+
+    Its retry queue returns messages at most once: see "When a message can still be lost" in the
+    documentation.
+    """
 
     QUORUM = "quorum"
     """A queue replicated across the nodes of a RabbitMQ cluster, so it survives a node failure.

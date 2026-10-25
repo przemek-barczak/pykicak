@@ -18,10 +18,10 @@ the same ID, and the other properties, its `type` included, so it can be replaye
 version of the message. It keeps the message's headers, its retry headers `x-kicak-retry-round` and
 `x-kicak-retrying-since` and its `x-kicak-published-at` included, as its history, except the headers
 RabbitMQ manages itself and the routing headers `CC` and `BCC`, with which RabbitMQ would also
-deliver the copy to the queues they name. It never expires. Its `user_id` becomes the Executor's own user, while its
-`x-kicak-original-publisher` header keeps naming the agent that created the message (see [Who
-published a message](delivery-guarantees.md#who-published-a-message)). It also gets headers that say
-why, when, and from where:
+deliver the copy to the queues they name. It never expires. Its `user_id` becomes the Executor's own
+user, while its `x-kicak-original-publisher` header keeps naming the agent that created the message
+(see [Who published a message](delivery-guarantees.md#who-published-a-message)). It also gets
+headers that say why, when, and from where:
 
 | Header | Value |
 | --- | --- |
@@ -52,14 +52,14 @@ fixed. Sending a message back from the dead-letter queue is safe because agents 
 [Requirement: idempotent processing](../README.md#requirement-idempotent-processing)).
 
 **When the copy cannot be placed.** If RabbitMQ returns the copy as unroutable, because the
-dead-letter queue or its binding was deleted right after the Executor declared them, or refuses it,
-for example because the dead-letter queue is full and refuses new messages, the Executor requeues the
-message instead and logs an `ERROR`; RabbitMQ then delivers it again at once. Rejecting it for
-RabbitMQ to dead-letter would not help: RabbitMQ dead-letters a rejected message at most once and
-drops it, telling nobody, when no queue takes it. RabbitMQ refusing to declare the dead-letter route,
-or refusing the copy in another way, for example with `403 ACCESS_REFUSED`, stops the Executor.
-After an unexpected failure, the Executor stops either way, and raises that failure, not the error
-of the copy.
+dead-letter queue or its binding was deleted right after the Executor declared them and no other
+queue is bound to `<queue>.dlx`, or refuses it, for example because the dead-letter queue is full
+and refuses new messages, the Executor requeues the message instead and logs an `ERROR`; RabbitMQ
+then delivers it again at once. Rejecting it for RabbitMQ to dead-letter would not help: RabbitMQ
+dead-letters a rejected message at most once and drops it, telling nobody, when no queue takes it.
+RabbitMQ refusing to declare the dead-letter route, or refusing the copy in another way, for example
+with `403 ACCESS_REFUSED`, stops the Executor. After an unexpected failure, the Executor stops
+either way, and raises that failure, not the error of the copy.
 
 ## Sending dead letters back
 

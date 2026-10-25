@@ -156,9 +156,12 @@ its dead-letter queue, its retry queue, and its destination queues, so all Execu
 the same type.
 Pass a member of the exported `QueueType` enum:
 
-- `QueueType.CLASSIC` (the default) is a queue stored on one broker node.
+- `QueueType.CLASSIC` (the default) is a queue stored on one broker node. Its retry queue returns
+  messages at most once, so in a rare case a message can be lost (see [When a message can still be
+  lost](delivery-guarantees.md#when-a-message-can-still-be-lost)).
 - `QueueType.QUORUM` is a queue replicated across the nodes of a RabbitMQ cluster, which keeps its
-  messages when a node fails. It also works on a single node.
+  messages when a node fails, and whose retry queue returns messages at least once. It also works on
+  a single node. Use it where no message may be lost.
 
 For the `ClassifyingExecutor` of the [Usage](../README.md#usage) example in the README:
 

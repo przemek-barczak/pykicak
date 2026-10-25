@@ -86,12 +86,15 @@ is dead-lettered to `<queue>.dlq`, where it is kept for inspection or replay. Fi
 as a service that is down, ends the rounds by itself.
 
 **The way back.** The default exchange cannot be deleted, so the way back depends only on the input
-queue. RabbitMQ dead-letters the expired messages of a classic queue at most once: a message that
-expires while the input queue does not exist is dropped. That takes someone deleting the input
-queue, which destroys every message waiting in it anyway, and the Executor declares the queue again
-within about a second. A quorum retry queue is declared to dead-letter at least once
+queue. RabbitMQ dead-letters the expired messages of a classic queue at most once, without any
+confirmation: a message that expires while the input queue refuses it is dropped, and nobody is
+told. That happens when the input queue is full and set to refuse new messages (a length limit with
+`overflow: reject-publish`, for example from a policy), or does not exist, because someone deleted
+it; the Executor declares it again within about a second. The Executor has already counted the
+message as moved to the retry queue. A quorum retry queue is declared to dead-letter at least once
 (`x-dead-letter-strategy` `at-least-once`, which requires `x-overflow` `reject-publish`), so it
-keeps such a message until the input queue is back.
+keeps such a message until the input queue takes it. Use quorum queues where no message may be lost
+(see [When a message can still be lost](delivery-guarantees.md#when-a-message-can-still-be-lost)).
 
 **Changing the delay.** The delay is set on each message, not as an argument of the queue, so
 changing `retry_delay_seconds` takes only a restart. RabbitMQ expires only the message at the front

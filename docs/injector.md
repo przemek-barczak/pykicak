@@ -19,8 +19,8 @@ alarm clears, so the message can arrive more than once.
 raises `InjectionError`. Its `__cause__` is the error that ended the last attempt, for example
 `pika.exceptions.UnroutableError` when no queue is bound to the exchange yet, or a pika connection
 error when RabbitMQ is unreachable. Its `message` attribute is the message that was not injected,
-and its text and its `repr()` name the message type and `message_id`, never the payload. Catch it to learn that the
-message was not injected:
+and its text and its `repr()` name the message type and `message_id`, never the payload. Catch it to
+learn that the message was not injected:
 
 ```python
 from pykicak import InjectionError

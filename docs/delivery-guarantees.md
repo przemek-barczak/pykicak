@@ -22,9 +22,10 @@ An Injector raises `InjectionError` to its caller, with one of these errors as i
 Executor keeps the input message: after unroutable results it holds them and tries again (see
 [Unroutable results are held](outcomes.md#unroutable-results-are-held)); after a refused commit,
 closing the connection requeues the input and the Executor stops (see [Every outcome of a
-delivery](outcomes.md)). So no message is lost between two
-stages of a pipeline. A result larger than RabbitMQ's `max_message_size` is the exception: its input
-is dead-lettered, and the Executor continues.
+delivery](outcomes.md)). So no message is lost between two stages of a pipeline, apart from the
+rare cases in [When a message can still be lost](#when-a-message-can-still-be-lost). A result larger
+than RabbitMQ's `max_message_size` is the exception: its input is dead-lettered, and the Executor
+continues.
 
 A mandatory message counts as routed if at least one queue is bound to the exchange, so RabbitMQ
 does not report a fanout exchange that is missing only some of its queues. An Executor therefore
@@ -32,6 +33,34 @@ binds every one of its `destination_queues` right before it publishes, which lea
 milliseconds before the commit (see [Topology verification](topology.md#topology-verification)); and
 only one queue may be bound to an Injector's exchange, so a missing binding there always fails the
 injection.
+
+## When a message can still be lost
+
+Wherever a failure leaves pykicak a choice, it processes a message again rather than risk losing it.
+A few cases remain in which a message can be lost, all of them inside RabbitMQ, where no client can
+confirm the outcome:
+
+- **A classic retry queue whose input queue refuses the message.** A message waiting in a classic
+  retry queue is returned to the input queue by RabbitMQ itself, at most once and without any
+  confirmation (see "The way back" in [Retry queue](retry-queue.md)). If the input queue does not
+  take it, because it is full and set to refuse new messages (a length limit with
+  `overflow: reject-publish`, for example from a policy), or because it does not exist at that
+  moment, RabbitMQ drops the message and tells nobody, while the Executor has counted it as moved to
+  the retry queue. A quorum retry queue returns it at least once and keeps it until the input queue
+  takes it. **Use `QueueType.QUORUM` where no message may be lost**, and with classic queues, set no
+  limit that makes an input queue refuse messages.
+- **Results that miss a downstream queue.** If some, but not all, of the bindings of an Executor's
+  destination exchange are deleted in the few milliseconds between its output-side verification and
+  the commit, the queues that lost their binding miss the results, and RabbitMQ reports nothing as
+  long as one queue is still bound (see [Topology verification](topology.md#topology-verification)).
+- **A dead-letter copy taken by another queue only.** The same applies to `<queue>.dlx`: if
+  `<queue>.dlq` or its binding is deleted in the milliseconds before a dead-letter copy is
+  published, while another queue you bound to `<queue>.dlx` still takes the copy, RabbitMQ confirms
+  it and the Executor acknowledges the original, but `<queue>.dlq` keeps nothing (see
+  [Dead-letter queue](dead-letter-queue.md)).
+- **A broker failure during a commit.** RabbitMQ does not guarantee that a transaction is atomic if
+  the broker itself fails while committing it, so some of an input's results can be lost (see
+  [Results are published in a transaction](outcomes.md#results-are-published-in-a-transaction)).
 
 ## Who published a message
 
