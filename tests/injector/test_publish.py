@@ -23,6 +23,7 @@ from tests.injector.helpers import (
     CountingInjector,
     OtherMessage,
     SampleMessage,
+    scripted_connections,
 )
 
 
@@ -197,6 +198,21 @@ def test_injection_error_keeps_message_and_exchange_and_survives_pickling():
     assert str(restored) == (
         "IdentifiedMessage message id=m-1 was not injected into exchange 'my-exchange'"
     )
+
+
+def test_publish_after_rabbitmq_closed_the_channel_closes_the_old_connection(config, monkeypatch):
+    first_channel, second_channel = FakeChannel(), FakeChannel()
+    injector = CountingInjector(config, first_channel, "my-exchange")
+    opened = scripted_connections(injector, monkeypatch, first_channel, second_channel)
+    message = SampleMessage(message_id="m-1", text="hello")
+    with injector:
+        first_channel.close()  # RabbitMQ closed the channel; the connection stays open
+
+        injector.publish(message)
+
+        assert [connection.is_open for connection in opened] == [False, True]
+    assert [connection.is_open for connection in opened] == [False, False]
+    assert len(second_channel.published_messages) == 1
 
 
 def test_publish_logs_and_does_not_wrap_serialization_errors(config, caplog):

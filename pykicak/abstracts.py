@@ -409,7 +409,12 @@ class KicakAbstract(abc.ABC):
         )
 
     def _establish_connection(self) -> None:
-        """Establish one connection and declare topology without retrying."""
+        """Establish one connection and declare topology without retrying.
+
+        A connection still open, e.g. one whose channel RabbitMQ closed, is closed first, so
+        replacing it never leaves it open and unreferenced.
+        """
+        self._discard_connection()
         logger.debug("Connecting to RabbitMQ")
         try:
             self._connection = self._create_connection()

@@ -202,6 +202,22 @@ def test_connect_after_close_opens_a_new_connection(config):
     assert agent.topology_declared is True
 
 
+def test_connect_after_the_channel_closed_closes_the_old_connection(config):
+    # e.g. RabbitMQ closing the channel with 404 or 406, which leaves the connection open
+    agent = ConcreteAgent(config, FakeChannel())
+    agent.connect()
+    old_connection = agent._connection
+    assert old_connection is not None
+    agent.channel.close()
+    agent._fake_channel = FakeChannel()
+
+    agent.connect()
+
+    assert old_connection.is_open is False
+    assert agent._connection is not old_connection
+    assert agent._connection is not None and agent._connection.is_open
+
+
 def test_close_raises_connection_close_failure_but_still_disconnects(config):
     agent = ConcreteAgent(config, FakeChannel(), FailingCloseConnection)
     agent.connect()
