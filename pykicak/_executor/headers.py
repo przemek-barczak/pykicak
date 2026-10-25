@@ -150,18 +150,26 @@ def _error_type_name(error: BaseException) -> str:
     return f"{module}.{error_class.__qualname__}"
 
 
+def _error_text(error: BaseException) -> str:
+    """Return `str(error)`, or, if that raises, a placeholder, as the traceback module does.
+
+    An exception from outside, e.g. raised by a message class's `__post_init__`, may fail in
+    `__str__` too, and describing it must not raise another exception in its place.
+    """
+    try:
+        return str(error)
+    except Exception:
+        return "<exception str() failed>"
+
+
 def _error_description(error: BaseException) -> str:
     """Return the text of `error` that a header can carry: at most 1024 bytes of valid UTF-8.
 
     A lone surrogate, which UTF-8 cannot encode and pika would fail on, becomes `?`, and a longer
     text is cut at a character boundary and ends with `…`. An exception whose `str()` raises is
-    described as the traceback module does.
+    described as by `_error_text()`.
     """
-    try:
-        text = str(error)
-    except Exception:
-        text = "<exception str() failed>"
-    encoded = text.encode("utf-8", errors="replace")
+    encoded = _error_text(error).encode("utf-8", errors="replace")
     if len(encoded) <= _MAX_ERROR_MESSAGE_BYTES:
         return encoded.decode("utf-8")
     kept = encoded[: _MAX_ERROR_MESSAGE_BYTES - len(_TRUNCATION_MARK.encode("utf-8"))]

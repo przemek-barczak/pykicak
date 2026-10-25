@@ -316,7 +316,8 @@ def test_init_accepts_input_check_interval(config, input_check_seconds):
     assert executor._settings.input_check_seconds == input_check_seconds
 
 
-@pytest.mark.parametrize("input_check_seconds", [-1, -0.5, float("inf"), float("nan")])
+# An int too large for a float counts as infinite, rather than raising OverflowError
+@pytest.mark.parametrize("input_check_seconds", [-1, -0.5, float("inf"), float("nan"), 10**1000])
 def test_init_rejects_negative_or_infinite_input_check_interval(config, input_check_seconds):
     with pytest.raises(ValueError, match="input_check_seconds must be a finite number"):
         make_executor(config, FakeChannel(), input_check_seconds=input_check_seconds)
@@ -344,15 +345,18 @@ def test_init_accepts_retry_delay(config, retry_delay_seconds, milliseconds):
     assert executor._settings.retry_delay_milliseconds == milliseconds
 
 
-@pytest.mark.parametrize("retry_delay_seconds", [-1, float("inf"), float("nan")])
+@pytest.mark.parametrize("retry_delay_seconds", [-1, float("inf"), float("nan"), 10**1000])
 def test_init_rejects_negative_or_infinite_retry_delay(config, retry_delay_seconds):
     with pytest.raises(ValueError, match="retry_delay_seconds must be a finite number"):
         make_executor(config, FakeChannel(), retry_delay_seconds=retry_delay_seconds)
 
 
-def test_init_rejects_retry_delay_longer_than_rabbitmq_takes(config):
+# Compared in seconds: 1e308 milliseconds overflow round(), and 4294967.2951 would round down to
+# the maximum number of milliseconds
+@pytest.mark.parametrize("retry_delay_seconds", [4294967.296, 4294967.2951, 1e308])
+def test_init_rejects_retry_delay_longer_than_rabbitmq_takes(config, retry_delay_seconds):
     with pytest.raises(ValueError, match="retry_delay_seconds must be at most 4294967.295"):
-        make_executor(config, FakeChannel(), retry_delay_seconds=4294967.296)
+        make_executor(config, FakeChannel(), retry_delay_seconds=retry_delay_seconds)
 
 
 @pytest.mark.parametrize("retry_delay_seconds", ["10", None, True])

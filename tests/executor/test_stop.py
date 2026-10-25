@@ -145,6 +145,29 @@ def test_run_after_stop_returns_without_connecting(config, monkeypatch):
     executor.run()
 
 
+def test_run_after_connect_and_stop_closes_the_connection_connect_opened(config, monkeypatch):
+    # run() promises the connection is closed at the end, also when it never starts consuming
+    channel = FakeChannel()
+    executor = make_executor(config, channel)
+    executor.connect()
+    connection = executor._connection
+    assert connection is not None
+
+    def unexpected_connection():
+        raise AssertionError("a stopped executor must not connect")
+
+    monkeypatch.setattr(executor, "_create_connection", unexpected_connection)
+    executor.stop()
+
+    executor.run()
+
+    assert connection.is_open is False
+    assert channel.is_open is False
+    assert executor.get_info().status == ExecutorStatus.STOPPED
+    with pytest.raises(RuntimeError, match="Not connected"):
+        _ = executor.channel
+
+
 def test_stop_during_reconnection_backoff_returns(config, monkeypatch, caplog):
     caplog.set_level("INFO", logger="pykicak.executor")
     executor = make_executor(config, FakeChannel())

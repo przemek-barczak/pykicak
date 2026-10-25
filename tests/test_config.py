@@ -258,6 +258,30 @@ def test_from_file_rejects_invalid_utf8_without_leaking_contents(tmp_path, caplo
     assert "secret-value" not in caplog.text
 
 
+@pytest.mark.parametrize(
+    ("content", "line"),
+    [
+        # The decoder's offset does not count a byte order mark, which used to stop the count early
+        (b"\xef\xbb\xbfA=x\nB=\xff\n", 2),
+        (b"\xef\xbb\xbf\xff", 1),
+        (b"\xff", 1),
+        (b"A=x\nB=y\n\xff", 3),
+        (b"A=x\n\nB=\xff", 3),
+        # Numbered as the lines of a valid file are, by str.splitlines()
+        (b"A=x\r\nB=\xff", 2),
+        (b"A=x\rB=\xff", 2),
+        ("A=x B=".encode() + b"\xff", 2),
+    ],
+    ids=["bom", "bom-first-line", "first-line", "line-start", "blank-line", "crlf", "cr", "u2028"],
+)
+def test_from_file_reports_the_line_of_invalid_utf8(tmp_path, content, line):
+    kicak_file = tmp_path / ".kicak"
+    kicak_file.write_bytes(content)
+
+    with pytest.raises(KicakConfigError, match=f"^Invalid UTF-8 on line {line} of "):
+        KicakConfig.from_file(kicak_file)
+
+
 def test_from_file_raises_when_path_is_a_directory(tmp_path):
     with pytest.raises(KicakConfigError, match="Cannot read Kicak config file"):
         KicakConfig.from_file(tmp_path)

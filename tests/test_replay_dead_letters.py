@@ -170,8 +170,22 @@ def test_limit_stops_after_that_many_messages_sent_back(config, monkeypatch):
     report = tool.replay_dead_letters(config, "classifier", {"retries-exhausted"}, limit=1)
 
     assert report.sent_back == {"retries-exhausted": 1}
+    assert report.taken() == 1
     assert channel.acked == [1]
     assert len(channel.waiting) == 3  # not even looked at
+
+
+def test_limit_counts_the_messages_left_as_well_as_those_sent_back(config, monkeypatch):
+    # The messages left stay unacknowledged until the run ends, so the limit must bound them too
+    channel, _connections = broker(monkeypatch, WAITING)
+
+    report = tool.replay_dead_letters(config, "classifier", {"rabbitmq"}, limit=2)
+
+    assert report.sent_back == {}
+    assert report.left == {"retries-exhausted": 1, "malformed": 1}
+    assert report.taken() == 2
+    assert channel.acked == []
+    assert len(channel.waiting) == 2  # not even looked at
 
 
 def test_a_copy_rabbitmq_does_not_take_stops_the_run_without_removing_the_message(

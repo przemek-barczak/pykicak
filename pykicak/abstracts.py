@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import abc
 import logging
+import math
 import os
 import socket
 import ssl
@@ -79,6 +80,19 @@ def _log_values(log: logging.Logger, title: str, event: str, values: dict[str, o
         extra={"kicak": {"event": event, **values}},
         stacklevel=2,
     )
+
+
+def _finite_float(value: int | float) -> float | None:
+    """Return `value` as a float, or None if it is NaN or infinite.
+
+    An int too large for a float counts as infinite: `math.isfinite()` and `float()` raise
+    `OverflowError` for it, which an argument check reports as `ValueError` instead.
+    """
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
+    return number if math.isfinite(number) else None
 
 
 def _check_name(argument: str, name: object, *, suffix: str = "") -> None:
@@ -287,7 +301,9 @@ class KicakAbstract(abc.ABC):
         """Establish one connection and declare topology without retrying.
 
         A connection still open, e.g. one whose channel RabbitMQ closed, is closed first, so
-        replacing it never leaves it open and unreferenced.
+        replacing it never leaves it open and unreferenced. A new connection is closed again if
+        setting it up fails, also on a `BaseException` such as `KeyboardInterrupt`: in a `with`
+        block, `__exit__()` is not called when `__enter__()` raises.
         """
         self._discard_connection()
         logger.debug("Connecting to RabbitMQ")
@@ -300,7 +316,7 @@ class KicakAbstract(abc.ABC):
             logger.debug("RabbitMQ publisher confirms enabled")
             self._declare_topology()
             logger.debug("RabbitMQ topology setup completed")
-        except Exception:
+        except BaseException:
             self._discard_connection()
             raise
 

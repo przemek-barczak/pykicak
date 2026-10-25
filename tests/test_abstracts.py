@@ -202,6 +202,37 @@ def test_connect_after_close_opens_a_new_connection(config):
     assert agent.topology_declared is True
 
 
+@pytest.mark.parametrize(
+    "error",
+    [KeyboardInterrupt(), SystemExit(1), StreamLostError("lost while declaring")],
+    ids=["keyboard-interrupt", "system-exit", "connection-error"],
+)
+def test_connect_closes_the_new_connection_when_setting_it_up_fails(config, monkeypatch, error):
+    # Also on a BaseException: in a `with` block, __exit__() is not called when __enter__() raises
+    channel = FakeChannel()
+    agent = ConcreteAgent(config, channel)
+    connections: list[FakeConnection] = []
+
+    def create_connection() -> FakeConnection:
+        connections.append(FakeConnection(channel))
+        return connections[-1]
+
+    def declare_topology() -> None:
+        raise error
+
+    monkeypatch.setattr(agent, "_create_connection", create_connection)
+    monkeypatch.setattr(agent, "_declare_topology", declare_topology)
+
+    with pytest.raises(type(error)):
+        with agent:
+            pass
+
+    assert [connection.is_open for connection in connections] == [False]
+    assert channel.is_open is False
+    with pytest.raises(RuntimeError, match="Not connected"):
+        _ = agent.channel
+
+
 def test_connect_after_the_channel_closed_closes_the_old_connection(config):
     # e.g. RabbitMQ closing the channel with 404 or 406, which leaves the connection open
     agent = ConcreteAgent(config, FakeChannel())

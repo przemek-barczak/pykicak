@@ -98,8 +98,9 @@ def test_blocked_timeout_seconds_sets_how_long_a_blocked_connection_waits(monkey
         (-1, ValueError),
         (float("nan"), ValueError),
         (float("inf"), ValueError),
+        (10**1000, ValueError),  # too large for a float: counts as infinite
     ],
-    ids=["none", "bool", "str", "zero", "negative", "nan", "infinity"],
+    ids=["none", "bool", "str", "zero", "negative", "nan", "infinity", "int-beyond-float"],
 )
 def test_init_rejects_an_invalid_blocked_timeout_seconds(config, seconds, error):
     with pytest.raises(error, match="blocked_timeout_seconds"):

@@ -20,6 +20,7 @@ from pykicak.executor import (
 )
 from pykicak.messages import KicakMessage
 from tests.executor.helpers import (
+    DESTINATION_QUEUES,
     TOPOLOGY,
     CopyRefusingChannel,
     ProcessingExecutor,
@@ -54,11 +55,21 @@ class ValidatedMessage(KicakMessage):
         KicakMessage.__post_init__(self)
         if self.text == "invalid":
             raise InvalidTextError("text must not be 'invalid'")
+        if self.text == "unprintable":
+            raise UnprintableError()
 
 
 class UnprintableError(Exception):
     def __str__(self) -> str:
         raise RuntimeError("cannot describe this error")
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class UnserializableResult(KicakMessage):
+    kicak_type = "unserializable.v1"
+
+    def to_bytes(self) -> bytes:
+        raise UnprintableError()
 
 
 def results_for_input_only(results):
@@ -192,6 +203,32 @@ def test_run_dead_letters_message_its_class_refuses_with_any_exception_and_conti
     assert executor.processed_messages == [valid]
     assert "Message dead-lettered type=ValidatedMessage id=bad" in caplog.text
     assert "text must not be 'invalid'" in caplog.text
+
+
+def test_run_dead_letters_message_refused_with_an_exception_whose_str_fails_and_continues(config):
+    # Describing the refusal used to raise the exception's own error, which stopped the executor
+    class ValidatingExecutor(ProcessingExecutor[ValidatedMessage, None]):
+        pass
+
+    channel = FakeChannel()
+    executor = ValidatingExecutor(config, channel, **TOPOLOGY)
+    valid = ValidatedMessage(message_id="valid", text="valid")
+    channel.queue_deliveries(
+        b'{"message_id": "bad", "text": "unprintable"}',
+        properties=pika.BasicProperties(type="validated.v1", message_id="bad"),
+    )
+    channel.queue_deliveries(valid.to_bytes(), properties=pika.BasicProperties(type="validated.v1"))
+
+    run_until_stopped(executor)
+
+    assert executor.processed_messages == [valid]
+    assert executor.get_info().counts == ExecutorCounts(
+        completed=1, dead_lettered=DeadLetterCounts(malformed=1)
+    )
+    [copy] = dead_letter_copies(channel)
+    assert copy.properties.headers["x-kicak-error-message"] == (
+        "Could not decode message as ValidatedMessage: <exception str() failed>"
+    )
 
 
 def test_dead_letter_copy_records_why_when_and_from_which_queue(config, clock):
@@ -536,6 +573,36 @@ def test_run_dead_letters_and_raises_when_terminator_returns_results(config, han
 
     assert dead_lettered(channel) == [1]
     assert channel.published_messages == dead_letter_copies(channel)
+
+
+def test_run_dead_letters_input_whose_result_fails_with_an_unprintable_error_and_continues(
+    config,
+):
+    class UnserializingExecutor(ProcessingExecutor[SampleMessage, UnserializableResult]):
+        pass
+
+    channel = FakeChannel()
+    executor = UnserializingExecutor(
+        config,
+        channel,
+        lambda message: UnserializableResult(message_id=message.message_id),
+        destination_exchange="output-exchange",
+        destination_queues=DESTINATION_QUEUES,
+        **TOPOLOGY,
+    )
+    channel.queue_deliveries(
+        SampleMessage(message_id="input", text="input").to_bytes(),
+        SampleMessage(message_id="following", text="following").to_bytes(),
+    )
+
+    run_until_stopped(executor)
+
+    assert executor.get_info().counts == ExecutorCounts(dead_lettered=DeadLetterCounts(malformed=2))
+    assert channel.published_messages == dead_letter_copies(channel)
+    assert channel.published_messages[0].properties.headers["x-kicak-error-message"] == (
+        "execute() returned a result that cannot be serialized, type=UnserializableResult: "
+        "<exception str() failed>"
+    )
 
 
 @pytest.mark.parametrize(

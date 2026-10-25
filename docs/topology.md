@@ -189,8 +189,8 @@ queues, follow the topology redesign steps above: drain them, stop every instanc
 Executor, delete the queues, then start the Executors with the new `queue_type`.
 
 Quorum queues count the deliveries of each message. On RabbitMQ 4.0 and newer they apply a default
-delivery limit of 20: a message delivered 20 times without success is dead-lettered with the
-`x-death` reason `delivery_limit` instead of being delivered a 21st time. What counts depends on the
+delivery limit of 20: a message delivered 21 times without success is dead-lettered with the
+`x-death` reason `delivery_limit` instead of being delivered again. What counts depends on the
 version of RabbitMQ:
 
 - RabbitMQ 4.2 counts every return of a message to the queue: a requeue by the Executor

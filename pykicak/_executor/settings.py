@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
+
+from pykicak.abstracts import _finite_float
 
 _INITIAL_RETRY_DELAY_SECONDS = 0.5
 _MAX_RETRY_DELAY_SECONDS = 30.0
 _MAX_BACKOFF_EXPONENT = 16
 _MAX_RETRY_DELAY_MILLISECONDS = 2**32 - 1  # about 49.7 days; RabbitMQ refuses far larger ones
+_MAX_RETRY_QUEUE_DELAY_SECONDS = _MAX_RETRY_DELAY_MILLISECONDS / 1000
 _STOP_POLL_SECONDS = 1.0
 """Longest wait, for a message, a reconnection, or held results, before checking `stop()`."""
 
@@ -31,12 +33,13 @@ def _checked_count(argument: str, value: object, minimum: int, condition: str) -
 
 
 def _checked_seconds(argument: str, value: object) -> float:
-    """Return `value` if it is a finite number of seconds, 0 or more."""
+    """Return `value` as a float if it is a finite number of seconds, 0 or more."""
     if isinstance(value, bool) or not isinstance(value, int | float):
         raise TypeError(f"{argument} must be a number")
-    if not math.isfinite(value) or value < 0:
+    seconds = _finite_float(value)
+    if seconds is None or seconds < 0:
         raise ValueError(f"{argument} must be a finite number, 0 or more")
-    return float(value)
+    return seconds
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -79,15 +82,16 @@ class _ExecutorSettings:
         rounds = _checked_count("max_retry_rounds", max_retry_rounds, 0, "0 or more")
         input_check = _checked_seconds("input_check_seconds", input_check_seconds)
         retry_delay = _checked_seconds("retry_delay_seconds", retry_delay_seconds)
-        milliseconds = round(retry_delay * 1000)
-        if milliseconds > _MAX_RETRY_DELAY_MILLISECONDS:
+        # In seconds, before converting: the milliseconds of a huge delay overflow `round()`, and
+        # a delay just above the maximum would round down to it
+        if retry_delay > _MAX_RETRY_QUEUE_DELAY_SECONDS:
             raise ValueError(
-                f"retry_delay_seconds must be at most {_MAX_RETRY_DELAY_MILLISECONDS / 1000}"
+                f"retry_delay_seconds must be at most {_MAX_RETRY_QUEUE_DELAY_SECONDS}"
             )
         return cls(
             max_processing_attempts=attempts,
             max_retry_rounds=rounds,
-            retry_delay_milliseconds=milliseconds,
+            retry_delay_milliseconds=round(retry_delay * 1000),
             input_check_seconds=input_check,
         )
 

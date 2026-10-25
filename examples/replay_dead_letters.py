@@ -33,8 +33,14 @@ message is back in its queue and still in the dead-letter queue, and running the
 it back twice. The agents are idempotent, so that is safe. Send back `unexpected-error` messages
 only once the bug is fixed: each of them would stop an Executor instance again.
 
-The messages taken stay unacknowledged until the run ends, so RabbitMQ's `consumer_timeout` (30
-minutes by default) bounds how long a run may take; use `--limit` for a very long queue.
+The messages it leaves stay unacknowledged until the run ends, when RabbitMQ returns them to the
+front of the dead-letter queue, so the next run takes them first again. RabbitMQ's
+`consumer_timeout` (30 minutes by default) bounds how long a run may hold them on RabbitMQ 4.2,
+and on 4.3 and newer for a quorum dead-letter queue (classic queues have no consumer timeout
+there): RabbitMQ then closes the channel, which stops the run, and the messages not yet sent back
+stay in the dead-letter queue. `--limit` bounds how many messages a run takes, sent back or left,
+and so how many it holds: use it for a very long queue, and raise it, or leave it out, to reach
+the messages behind those a limited run leaves.
 """
 
 from __future__ import annotations
@@ -80,6 +86,10 @@ class ReplayReport:
     left: Counter[str] = field(default_factory=Counter)
     """Looked at but not selected, so left in the dead-letter queue."""
 
+    def taken(self) -> int:
+        """How many messages the run took from the dead-letter queue, sent back or left."""
+        return self.sent_back.total() + self.left.total()
+
 
 def replay_dead_letters(
     config: KicakConfig,
@@ -91,8 +101,9 @@ def replay_dead_letters(
 ) -> ReplayReport:
     """Send the messages in `<queue>.dlq` dead-lettered for one of `reasons` back to `queue`.
 
-    At most `limit` messages, if given. With `dry_run`, nothing is sent back: the report tells
-    what would be. Raises a pika error if a queue is missing or RabbitMQ does not take a copy;
+    At most `limit` messages are taken from the dead-letter queue, if given, counting those left
+    there as well as those sent back. With `dry_run`, nothing is sent back: the report tells what
+    would be. Raises a pika error if a queue is missing or RabbitMQ does not take a copy;
     the messages not yet sent back then stay in the dead-letter queue.
     """
     dead_letter_queue = f"{queue}.dlq"
@@ -106,7 +117,8 @@ def replay_dead_letters(
         waiting = channel.queue_declare(queue=dead_letter_queue, passive=True).method.message_count
         # Only the messages waiting now: a message dead-lettered meanwhile waits for the next run
         for _ in range(waiting):
-            if limit is not None and report.sent_back.total() >= limit:
+            # Every message taken counts: those left stay unacknowledged until the end
+            if limit is not None and report.taken() >= limit:
                 break
             method, properties, body = channel.basic_get(dead_letter_queue, auto_ack=False)
             if method is None:
@@ -220,7 +232,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         choices=(*DEAD_LETTER_REASONS, RABBITMQ_REASON),
         help="send back the messages dead-lettered for this reason; may be given more than once",
     )
-    parser.add_argument("--limit", type=_positive_int, help="send back at most this many")
+    parser.add_argument(
+        "--limit",
+        type=_positive_int,
+        help="take at most this many messages from <queue>.dlq, counting those left there",
+    )
     parser.add_argument("--dry-run", action="store_true", help="only list what would be sent back")
     arguments = parser.parse_args(argv)
     config = KicakConfig.from_file(os.environ.get("KICAK_CONFIG_PATH", ".kicak"))

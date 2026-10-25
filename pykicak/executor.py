@@ -13,7 +13,12 @@ from pika.exceptions import UnroutableError
 from pika.spec import Basic
 
 from pykicak._executor import logger
-from pykicak._executor.headers import _retry_round_of, _retrying_since_of, _sent_type
+from pykicak._executor.headers import (
+    _error_text,
+    _retry_round_of,
+    _retrying_since_of,
+    _sent_type,
+)
 from pykicak._executor.message_types import _as_messages, _declared_message_types
 from pykicak._executor.session import (
     _Consumer,
@@ -384,6 +389,8 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
         """
         status = self._status
         if status.stop_requested:
+            if self._connection is not None:  # opened by connect(); none is opened here
+                self._close_without_masking()
             if not status.ended:
                 status.end(ExecutorStatus.STOPPED)
             logger.info(
@@ -800,13 +807,14 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
         """Decode `body` into `message_class`, classifying failures as malformed.
 
         Any exception while building the message counts, including one raised by the message
-        class's own validation in `__post_init__`: the body is at fault, whoever produced it.
+        class's own validation in `__post_init__`: the body is at fault, whoever produced it. Its
+        text is taken with `_error_text()`, so even an exception whose `str()` fails counts.
         """
         try:
             return message_class.from_bytes(body)
         except Exception as error:
             raise MalformedMessageError(
-                f"Could not decode message as {message_class.__name__}: {error}"
+                f"Could not decode message as {message_class.__name__}: {_error_text(error)}"
             ) from error
 
     def _execute_with_retries(
@@ -860,7 +868,9 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
         except TypeError as error:
             if destination_exchange is None:
                 raise RuntimeError(terminator_error) from error
-            raise MalformedMessageError(f"execute() returned an invalid result: {error}") from error
+            raise MalformedMessageError(
+                f"execute() returned an invalid result: {_error_text(error)}"
+            ) from error
         if not messages:
             return []
         result_type = self._result_type
@@ -880,7 +890,7 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
             except Exception as error:
                 raise MalformedMessageError(
                     "execute() returned a result that cannot be serialized, "
-                    f"type={type(message).__name__}: {error}"
+                    f"type={type(message).__name__}: {_error_text(error)}"
                 ) from error
             publications.append((destination_exchange, message, body))
         return publications

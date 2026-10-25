@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import codecs
 import dataclasses
 import logging
 import os
@@ -76,15 +77,17 @@ class KicakConfig:
                 f"Cannot read Kicak config file {file_path}: {exc.strerror}"
             ) from exc
 
-        # Always UTF-8, so a file reads the same on every platform; "utf-8-sig" also drops the
-        # byte order mark some Windows editors write, which would otherwise prefix the first key.
+        # Always UTF-8, so a file reads the same on every platform, without the byte order mark
+        # some Windows editors write, which would otherwise prefix the first key. It is removed
+        # before decoding, as "utf-8-sig" would, so an error's offset counts in `content` itself.
+        content = content.removeprefix(codecs.BOM_UTF8)
         text: str | None
         bad_line_number = 0
         try:
-            text = content.decode("utf-8-sig")
+            text = content.decode("utf-8")
         except UnicodeDecodeError as exc:
             text = None
-            bad_line_number = content[: exc.start].count(b"\n") + 1
+            bad_line_number = _line_number_at(content, exc.start)
         # Raised outside the except block so the error has no __context__: the UnicodeDecodeError
         # holds the whole file, secrets included.
         if text is None:
@@ -256,3 +259,14 @@ def _is_valid_utf8(value: str) -> bool:
     except UnicodeEncodeError:
         return False  # returned, not raised, so no error carries the value as its context
     return True
+
+
+def _line_number_at(content: bytes, offset: int) -> int:
+    """Return the number, from 1, of the line of `content` that holds the byte at `offset`.
+
+    Lines are numbered as `from_file()` numbers them, split by `str.splitlines()`, so a file whose
+    lines end in carriage returns alone is reported the same way. The bytes before `offset` must
+    be valid UTF-8, as those before a decoding error are.
+    """
+    # A character after them makes the line holding `offset` count even while it is still empty
+    return len((content[:offset].decode("utf-8") + "_").splitlines())

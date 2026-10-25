@@ -57,11 +57,13 @@ def test_run_one_shot_generates_and_publishes_once(config):
         (float("nan"), ValueError, "interval_seconds must be a finite number"),
         (float("inf"), ValueError, "interval_seconds must be a finite number"),
         (float("-inf"), ValueError, "interval_seconds must be a finite number"),
+        # Too large for a float: counts as infinite, rather than raising OverflowError
+        (10**1000, ValueError, "interval_seconds must be a finite number"),
         (True, TypeError, "interval_seconds must be a number"),
         ("60", TypeError, "interval_seconds must be a number"),
         (None, TypeError, "interval_seconds must be a number"),
     ],
-    ids=["nan", "inf", "-inf", "bool", "str", "none"],
+    ids=["nan", "inf", "-inf", "int-beyond-float", "bool", "str", "none"],
 )
 def test_run_rejects_an_invalid_interval_before_generating(
     config, monkeypatch, interval_seconds, error, reason

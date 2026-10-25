@@ -665,6 +665,120 @@ def test_classic_executor_accepts_queues_declared_without_queue_type(config, top
         assert executor.channel.is_open
 
 
+_RETURN_ROUNDS = 25
+"""More deliveries than the 21 after which a quorum queue's default delivery limit dead-letters."""
+
+
+def _poll_for_message(channel, queue: str) -> tuple[Any, Any]:
+    """Take the next message of `queue`, unacknowledged; (None, None) if none comes within 1 s."""
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline:
+        method, properties, _body = channel.basic_get(queue=queue, auto_ack=False)
+        if method is not None:
+            return method, properties
+        time.sleep(0.02)
+    return None, None
+
+
+def _headers_until_dead_lettered(
+    config: KicakConfig, queue: str, *, requeue: bool
+) -> list[dict[str, Any]]:
+    """Take the message waiting in `queue` and return it, at most `_RETURN_ROUNDS` times.
+
+    It is returned with `basic_nack(requeue=True)`, or by closing the connection without settling
+    it, a failed delivery. Returns the headers of each delivery, until RabbitMQ dead-letters it.
+    """
+    delivered: list[dict[str, Any]] = []
+    connection = _open_connection(config)
+    try:
+        channel = connection.channel()
+        while len(delivered) < _RETURN_ROUNDS:
+            method, properties = _poll_for_message(channel, queue)
+            if method is None:
+                break
+            delivered.append(properties.headers or {})
+            if requeue:
+                channel.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+            else:
+                connection.close()
+                connection = _open_connection(config)
+                channel = connection.channel()
+    finally:
+        connection.close()
+    return delivered
+
+
+@pytest.mark.parametrize("requeue", [True, False], ids=["requeued", "connection-lost"])
+def test_quorum_delivery_limit_counts_what_the_queue_type_docs_say(config, topology, requeue):
+    # docs/topology.md, "Queue type": by default, a message delivered 21 times without success is
+    # dead-lettered. RabbitMQ 4.2 counts every return to the queue; 4.3 and newer count only
+    # failed deliveries, and count requeues in x-acquired-count, so a requeue loop never ends
+    names = topology.executor_topology("source", topology.exchange("inject"))
+    source_queue = names["source_queue"]
+    with RecordingTerminator(config, queue_type=QueueType.QUORUM, **names):
+        pass  # declares the queue and its dead-letter route as its Executor does
+    message = IntegrationMessage(message_id="returned", payload="returned")
+    _with_broker_channel(
+        config,
+        lambda channel: channel.basic_publish(
+            exchange="", routing_key=source_queue, body=message.to_bytes()
+        ),
+    )
+
+    delivered = _headers_until_dead_lettered(config, source_queue, requeue=requeue)
+
+    if requeue and _broker_version(config) >= (4, 3):
+        assert len(delivered) == _RETURN_ROUNDS
+        assert delivered[-1]["x-acquired-count"] == _RETURN_ROUNDS - 1
+        assert "x-delivery-count" not in delivered[-1]
+        assert _ready_message_count(config, _dead_letter_queue(names))[0] == 0
+    else:
+        assert len(delivered) == 21
+        assert delivered[-1]["x-delivery-count"] == 20
+        connection = _open_connection(config)
+        try:
+            properties, _body = _get_dead_letter(connection.channel(), _dead_letter_queue(names))
+        finally:
+            connection.close()
+        assert [death["reason"] for death in properties.headers["x-death"]] == ["delivery_limit"]
+
+
+def test_retry_copy_drops_the_counts_rabbitmq_keeps_of_a_returned_message(config, topology):
+    inject_exchange = topology.exchange("inject")
+    names = topology.executor_topology("source", inject_exchange)
+    source_queue = names["source_queue"]
+    message = IntegrationMessage(message_id="returned", payload="unavailable")
+
+    def requeue_once(channel) -> None:
+        method, _properties = _poll_for_message(channel, source_queue)
+        assert method is not None
+        channel.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+
+    with RecordingTerminator(
+        config,
+        queue_type=QueueType.QUORUM,
+        max_processing_attempts=1,
+        retry_delay_seconds=30,
+        **names,
+    ) as executor:
+        with OneShotInjector(config, inject_exchange, message) as injector:
+            injector.publish(message)
+        # RabbitMQ counts the requeue in x-delivery-count on 4.2, in x-acquired-count on 4.3+
+        _with_broker_channel(config, requeue_once)
+        executor.handle_next_delivery(source_queue)  # fails: moved to the retry queue
+        counted = executor.last_properties.headers
+        _wait_for_ready_messages(config, f"{source_queue}.retry")
+        method, properties, _body = executor.channel.basic_get(
+            queue=f"{source_queue}.retry", auto_ack=True
+        )
+
+    rabbitmq_counts = {"x-delivery-count", "x-acquired-count"}
+    assert rabbitmq_counts & set(counted)
+    assert method is not None
+    assert not rabbitmq_counts & set(properties.headers)
+    assert properties.headers["x-kicak-retry-round"] == 1
+
+
 def test_injector_raises_when_no_queue_is_bound(config, topology):
     unbound_exchange = topology.exchange("unbound")
 

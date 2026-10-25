@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import math
+from pykicak.abstracts import _finite_float
 
 _MAX_RABBITMQ_ATTEMPTS = 3
 _INITIAL_RETRY_DELAY_SECONDS = 1.0  # attempts: immediately, after 1 second, after 2 more seconds
@@ -24,18 +24,19 @@ def _checked_blocked_timeout_seconds(blocked_timeout_seconds: object) -> float:
         blocked_timeout_seconds, int | float
     ):
         raise TypeError("blocked_timeout_seconds must be a number")
-    if not math.isfinite(blocked_timeout_seconds) or blocked_timeout_seconds <= 0:
+    seconds = _finite_float(blocked_timeout_seconds)
+    if seconds is None or seconds <= 0:
         raise ValueError("blocked_timeout_seconds must be a finite number greater than 0")
-    return float(blocked_timeout_seconds)
+    return seconds
 
 
 def _check_interval_seconds(interval_seconds: object) -> None:
     """Raise unless `interval_seconds` is a finite int or float, `bool` excluded.
 
-    `TypeError` for anything but a number, `ValueError` for NaN or infinity; 0 or less is valid
-    and means a single injection.
+    `TypeError` for anything but a number, `ValueError` for NaN, infinity, or an int too large
+    for a float; 0 or less is valid and means a single injection.
     """
     if isinstance(interval_seconds, bool) or not isinstance(interval_seconds, int | float):
         raise TypeError("interval_seconds must be a number")
-    if not math.isfinite(interval_seconds):
+    if _finite_float(interval_seconds) is None:
         raise ValueError("interval_seconds must be a finite number")
