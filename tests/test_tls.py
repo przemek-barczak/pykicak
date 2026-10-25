@@ -23,6 +23,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 from pika.exceptions import AMQPConnectionError
 
+import pykicak
 from pykicak.abstracts import KicakAbstract
 from pykicak.config import KicakConfig, KicakConfigError
 from pykicak.executor import ExecutorStatus, KicakExecutorAbstract
@@ -261,6 +262,29 @@ def test_connection_without_tls_has_no_tls_options(monkeypatch):
     assert captured_connection_parameters(executor, monkeypatch).ssl_options is None
 
 
+def test_tls_options_are_none_without_tls():
+    assert pykicak.tls_options(KicakConfig(values=CONNECTION_VALUES)) is None
+
+
+def test_tls_options_are_the_ones_agents_connect_with(monkeypatch, tmp_path):
+    ca = trustme.CA()
+    config = tls_config(
+        RABBIT_MQ_HOST="broker.example.com",
+        RABBIT_MQ_CA_FILE=write_ca_file(ca, tmp_path),
+        **write_client_certificate(ca, tmp_path),
+    )
+    agents = captured_connection_parameters(TlsExecutor(config), monkeypatch).ssl_options.context
+
+    options = pykicak.tls_options(config)
+
+    assert options is not None
+    assert options.server_hostname == "broker.example.com"
+    context = options.context
+    for setting in ("minimum_version", "verify_mode", "check_hostname", "verify_flags"):
+        assert getattr(context, setting) == getattr(agents, setting), setting
+    assert context.get_ca_certs() == agents.get_ca_certs()
+
+
 def test_connection_with_tls_verifies_the_certificate_and_the_host_name(monkeypatch):
     executor = TlsExecutor(tls_config(RABBIT_MQ_HOST="broker.example.com"))
 
@@ -283,7 +307,7 @@ def python_defaults_to_minimum(monkeypatch, minimum: ssl.TLSVersion) -> None:
         context.minimum_version = minimum
         return context
 
-    monkeypatch.setattr("pykicak.abstracts.ssl.create_default_context", default_context)
+    monkeypatch.setattr("pykicak.tls.ssl.create_default_context", default_context)
 
 
 @pytest.mark.parametrize("ca_file", [False, True], ids=["system-cas", "ca-file"])

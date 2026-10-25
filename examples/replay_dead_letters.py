@@ -1,9 +1,10 @@
 """Send dead-lettered messages back to the queue of the Executor that dead-lettered them.
 
-An operator's tool, an example built on pika and `KicakConfig` only, not part of pykicak. Run it
-once the cause is fixed: a service that was down long enough for messages to use up their
-`max_retry_rounds`, a bug fixed in `execute()`, or a message type the Executor now accepts. From
-the repository root, with `KICAK_CONFIG_PATH` naming the connection file (default `.kicak`):
+An operator's tool, an example built on pika and pykicak's `KicakConfig` and `tls_options()`, not
+part of pykicak. Run it once the cause is fixed: a service that was down long enough for messages to
+use up their `max_retry_rounds`, a bug fixed in `execute()`, or a message type the Executor now
+accepts. From the repository root, with `KICAK_CONFIG_PATH` naming the connection file (default
+`.kicak`):
 
     python -m examples.replay_dead_letters classifier --reason retries-exhausted --dry-run
     python -m examples.replay_dead_letters classifier --reason retries-exhausted
@@ -39,7 +40,6 @@ from __future__ import annotations
 import argparse
 import os
 import socket
-import ssl
 import sys
 from collections import Counter
 from collections.abc import Collection, Sequence
@@ -48,7 +48,7 @@ from dataclasses import dataclass, field
 import pika
 import pika.exceptions
 
-from pykicak import KicakConfig, KicakConfigError
+from pykicak import KicakConfig, tls_options
 
 DEAD_LETTER_REASONS = ("malformed", "retries-exhausted", "result-too-large", "unexpected-error")
 """The values of the `x-kicak-dead-letter-reason` header of an Executor's dead-letter copies."""
@@ -133,26 +133,8 @@ def replay_dead_letters(
 
 
 def _connect(config: KicakConfig, queue: str) -> pika.BlockingConnection:
-    """Connect as `config` says, with TLS if it asks for it, verifying the broker's certificate."""
-    tls_files = {
-        "RABBIT_MQ_CA_FILE": config.rabbitmq_ca_file,
-        "RABBIT_MQ_CERT_FILE": config.rabbitmq_cert_file,
-        "RABBIT_MQ_KEY_FILE": config.rabbitmq_key_file,
-    }
-    ssl_options = None
-    if config.rabbitmq_tls:
-        context = ssl.create_default_context(cafile=tls_files["RABBIT_MQ_CA_FILE"])
-        if tls_files["RABBIT_MQ_CERT_FILE"] is not None:
-            # The client certificate, for a broker that verifies its clients (mutual TLS)
-            context.load_cert_chain(
-                tls_files["RABBIT_MQ_CERT_FILE"], tls_files["RABBIT_MQ_KEY_FILE"]
-            )
-        ssl_options = pika.SSLOptions(context, server_hostname=config.rabbitmq_host)
-    else:
-        for key, path in tls_files.items():
-            if path is not None:
-                # A TLS file shows that TLS was intended: never send the credentials unencrypted
-                raise KicakConfigError(f"{key} is given, but RABBIT_MQ_TLS is false")
+    """Connect as `config` says, with TLS if it asks for it, as pykicak's agents connect."""
+    ssl_options = tls_options(config)  # pykicak's TLS policy: TLS 1.2+, strict certificate checks
     parameters = pika.ConnectionParameters(
         host=config.rabbitmq_host,
         port=config.rabbitmq_port,

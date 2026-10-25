@@ -31,7 +31,6 @@ from pika.spec import Basic
 
 from examples.replay_dead_letters import replay_dead_letters
 from pykicak._executor.topology import _ExecutorTopology
-from pykicak.abstracts import _tls_options
 from pykicak.config import KicakConfig
 from pykicak.executor import (
     DeadLetterCounts,
@@ -43,6 +42,7 @@ from pykicak.executor import (
 )
 from pykicak.injector import InjectionError, KicakInjectorAbstract
 from pykicak.messages import KicakMessage
+from pykicak.tls import tls_options
 
 pytestmark = pytest.mark.integration
 
@@ -190,7 +190,7 @@ def _open_connection(config: KicakConfig) -> pika.BlockingConnection:
             port=config.rabbitmq_port,
             virtual_host=config.rabbitmq_virtual_host,
             credentials=pika.PlainCredentials(config.rabbitmq_username, config.rabbitmq_password),
-            ssl_options=_tls_options(config),
+            ssl_options=tls_options(config),
         )
     )
 

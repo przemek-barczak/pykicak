@@ -14,6 +14,8 @@ from typing import Any
 
 import pika
 import pytest
+import trustme
+from cryptography.hazmat.primitives import serialization
 from pika.exceptions import ChannelClosedByBroker, StreamLostError, UnroutableError
 
 import examples.replay_dead_letters as tool
@@ -279,62 +281,95 @@ def test_connection_is_named_and_unencrypted_only_when_asked(config, monkeypatch
     assert parameters.credentials.username == "guest"
 
 
-def test_connection_uses_tls_with_the_ca_file(monkeypatch, tmp_path):
+def test_connection_uses_the_tls_options_of_pykicak(monkeypatch):
     opened: list[pika.ConnectionParameters] = []
     monkeypatch.setattr(pika, "BlockingConnection", opened.append)
-    contexts: list[str | None] = []
-    context = ssl.create_default_context()
+    options = pika.SSLOptions(ssl.create_default_context(), server_hostname="localhost")
+    configs: list[KicakConfig] = []
 
-    def create_default_context(cafile=None):
-        contexts.append(cafile)
-        return context
+    def recording_tls_options(config: KicakConfig) -> pika.SSLOptions:
+        configs.append(config)
+        return options
 
-    monkeypatch.setattr(ssl, "create_default_context", create_default_context)
-    ca_file = str(tmp_path / "ca.pem")
+    monkeypatch.setattr(tool, "tls_options", recording_tls_options)
+    config = KicakConfig(values={**CONNECTION_VALUES, "RABBIT_MQ_TLS": "true"})
+
+    tool._connect(config, "classifier")
+
+    assert configs == [config]
+    assert opened[0].ssl_options is options
+
+
+def write_tls_files(tmp_path) -> dict[str, str]:
+    """Write a CA file and a client certificate with its key; return the keys naming them."""
+    ca = trustme.CA()
+    client = ca.issue_cert("operator.example")
+    paths = {name: str(tmp_path / name) for name in ("ca.pem", "client.pem", "client.key")}
+    ca.cert_pem.write_to_path(paths["ca.pem"])
+    client.cert_chain_pems[0].write_to_path(paths["client.pem"])
+    client.private_key_pem.write_to_path(paths["client.key"])
+    return {
+        "RABBIT_MQ_CA_FILE": paths["ca.pem"],
+        "RABBIT_MQ_CERT_FILE": paths["client.pem"],
+        "RABBIT_MQ_KEY_FILE": paths["client.key"],
+    }
+
+
+def test_connection_applies_the_tls_policy_of_pykicak(monkeypatch, tmp_path):
+    opened: list[pika.ConnectionParameters] = []
+    monkeypatch.setattr(pika, "BlockingConnection", opened.append)
     config = KicakConfig(
-        values={**CONNECTION_VALUES, "RABBIT_MQ_TLS": "true", "RABBIT_MQ_CA_FILE": ca_file}
+        values={**CONNECTION_VALUES, "RABBIT_MQ_TLS": "true", **write_tls_files(tmp_path)}
     )
 
     tool._connect(config, "classifier")
 
-    assert contexts == [ca_file]
-    assert opened[0].ssl_options.server_hostname == "localhost"
+    ssl_options = opened[0].ssl_options
+    assert ssl_options.server_hostname == "localhost"
+    context = ssl_options.context
+    assert context.minimum_version >= ssl.TLSVersion.TLSv1_2
+    assert context.verify_flags & ssl.VERIFY_X509_STRICT
+    assert context.check_hostname is True
 
 
-def test_connection_presents_the_client_certificate(monkeypatch):
-    opened: list[pika.ConnectionParameters] = []
-    monkeypatch.setattr(pika, "BlockingConnection", opened.append)
-    loaded: list[tuple[str, str | None]] = []
-
-    class RecordingContext(ssl.SSLContext):
-        def load_cert_chain(self, certfile, keyfile=None, password=None) -> None:
-            loaded.append((certfile, keyfile))
-
-    monkeypatch.setattr(
-        ssl, "create_default_context", lambda cafile=None: RecordingContext(ssl.PROTOCOL_TLS_CLIENT)
+def encrypted_key_file(tmp_path, key_file: str) -> str:
+    key = serialization.load_pem_private_key(open(key_file, "rb").read(), password=None)
+    path = tmp_path / "encrypted.key"
+    path.write_bytes(
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.BestAvailableEncryption(b"key-password"),
+        )
     )
-    config = KicakConfig(
-        values={
-            **CONNECTION_VALUES,
-            "RABBIT_MQ_TLS": "true",
-            "RABBIT_MQ_CERT_FILE": "agent.pem",
-            "RABBIT_MQ_KEY_FILE": "agent.key",
-        }
-    )
-
-    tool._connect(config, "classifier")
-
-    assert loaded == [("agent.pem", "agent.key")]
-    assert isinstance(opened[0].ssl_options.context, RecordingContext)
+    return str(path)
 
 
-@pytest.mark.parametrize("key", ["RABBIT_MQ_CA_FILE", "RABBIT_MQ_CERT_FILE", "RABBIT_MQ_KEY_FILE"])
-def test_connection_refuses_a_tls_file_without_tls(monkeypatch, key):
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        ("tls-off", "RABBIT_MQ_CA_FILE requires RABBIT_MQ_TLS=true"),
+        ("key-only", "RABBIT_MQ_CERT_FILE and RABBIT_MQ_KEY_FILE must be given together"),
+        (
+            "encrypted-key",
+            "RABBIT_MQ_KEY_FILE holds an encrypted private key, which is not supported",
+        ),
+    ],
+)
+def test_connection_refuses_what_pykicak_refuses(monkeypatch, tmp_path, change, message):
+    # Before tls_options(), the tool ignored a key without its certificate, and an encrypted key
+    # made OpenSSL ask for its password on the terminal, which left the tool waiting
     monkeypatch.setattr(pika, "BlockingConnection", pytest.fail)
-    config = KicakConfig(values={**CONNECTION_VALUES, key: "file.pem"})
+    values = {**CONNECTION_VALUES, "RABBIT_MQ_TLS": "true", **write_tls_files(tmp_path)}
+    if change == "tls-off":
+        values["RABBIT_MQ_TLS"] = "false"
+    elif change == "key-only":
+        del values["RABBIT_MQ_CERT_FILE"]
+    else:
+        values["RABBIT_MQ_KEY_FILE"] = encrypted_key_file(tmp_path, values["RABBIT_MQ_KEY_FILE"])
 
-    with pytest.raises(KicakConfigError, match=f"^{key} is given, but RABBIT_MQ_TLS is false$"):
-        tool._connect(config, "classifier")
+    with pytest.raises(KicakConfigError, match=f"^{message}$"):
+        tool._connect(KicakConfig(values=values), "classifier")
 
 
 @pytest.fixture

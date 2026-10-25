@@ -22,6 +22,7 @@ PUBLIC_API = [
     "QueueType",
     "TransientProcessingError",
     "__version__",
+    "tls_options",
 ]
 
 

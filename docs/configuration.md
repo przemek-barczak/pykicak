@@ -127,6 +127,32 @@ When TLS fails:
   includes a port that does not speak TLS, such as 5672 with `RABBIT_MQ_TLS=true` (see
   [Retries and logging](delivery-guarantees.md#retries)).
 
+### TLS for a connection of your own
+
+An application that opens a pika connection of its own, for example an operator's tool, gets the
+TLS settings agents connect with from `tls_options()`:
+
+```python
+import pika
+
+from pykicak import KicakConfig, tls_options
+
+config = KicakConfig.from_file(".kicak")
+parameters = pika.ConnectionParameters(
+    host=config.rabbitmq_host,
+    port=config.rabbitmq_port,
+    virtual_host=config.rabbitmq_virtual_host,
+    credentials=pika.PlainCredentials(config.rabbitmq_username, config.rabbitmq_password),
+    ssl_options=tls_options(config),  # None with RABBIT_MQ_TLS=false
+)
+connection = pika.BlockingConnection(parameters)
+```
+
+It returns pika's `SSLOptions`, or `None` with `RABBIT_MQ_TLS=false`, and raises `KicakConfigError`
+in the same cases as an agent connecting. It reads the CA, certificate, and key files on every
+call, so call it for each connection to pick up renewed certificates. The replay example
+[`examples/replay_dead_letters.py`](../examples/replay_dead_letters.py) uses it.
+
 ### Client certificates (mutual TLS)
 
 Most brokers do not need this. A broker configured to verify its clients

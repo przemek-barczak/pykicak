@@ -360,8 +360,10 @@ every case, connection failures included.
 `pykicak` exports `DeadLetterCounts`, `ExecutorCounts`, `ExecutorInfo`, `ExecutorStatus`,
 `InjectionError`, `KicakConfig`, `KicakConfigError`, `KicakExecutorAbstract`,
 `KicakInjectorAbstract`, `KicakMessage`, `MalformedMessageError`, `QueueType`,
-`TransientProcessingError`, and `__version__`. Build agents by
-subclassing `KicakInjectorAbstract` or `KicakExecutorAbstract`; their shared base class is internal.
+`TransientProcessingError`, `tls_options`, and `__version__`. Build agents by subclassing
+`KicakInjectorAbstract` or `KicakExecutorAbstract`; their shared base class is internal.
+`tls_options(config)` returns the TLS settings agents connect with, for a pika connection of your
+own (see [TLS for a connection of your own][tls-for-a-connection-of-your-own]).
 
 ## Development
 
@@ -381,6 +383,7 @@ version is released.
 [dead-letter-queue]: https://github.com/przemek-barczak/pykicak/blob/main/docs/dead-letter-queue.md
 [unroutable-results-are-held]: https://github.com/przemek-barczak/pykicak/blob/main/docs/outcomes.md#unroutable-results-are-held
 [configuration]: https://github.com/przemek-barczak/pykicak/blob/main/docs/configuration.md
+[tls-for-a-connection-of-your-own]: https://github.com/przemek-barczak/pykicak/blob/main/docs/configuration.md#tls-for-a-connection-of-your-own
 [type-names-the-contract-between-agents]: https://github.com/przemek-barczak/pykicak/blob/main/docs/messages.md#type-names-the-contract-between-agents
 [messages]: https://github.com/przemek-barczak/pykicak/blob/main/docs/messages.md
 [topology]: https://github.com/przemek-barczak/pykicak/blob/main/docs/topology.md
