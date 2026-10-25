@@ -11,6 +11,7 @@ import dataclasses
 import json
 import logging
 import math
+from collections.abc import Mapping
 from typing import Any, ClassVar, NoReturn, Self
 
 logger = logging.getLogger(__name__)
@@ -35,8 +36,9 @@ def _type_name_of(message_class: object) -> str:
 
     Raises `TypeError` unless `message_class` is a subclass of `KicakMessage` that declares its
     own `kicak_type` as a class attribute: an inherited one names its base class's type, so a
-    subclass would be sent as its base. Raises `ValueError` for an empty name, or one longer
-    than 255 UTF-8 bytes, the limit of the AMQP `type` property it is sent as.
+    subclass would be sent as its base. Also for a field declared with `init=False`, which would be
+    sent but could not be decoded again. Raises `ValueError` for an empty name, or one longer than
+    255 UTF-8 bytes, the limit of the AMQP `type` property it is sent as.
     """
     if not (
         isinstance(message_class, type)
@@ -50,6 +52,13 @@ def _type_name_of(message_class: object) -> str:
         raise TypeError(
             f"{name} declares {_TYPE_NAME_ATTRIBUTE} as a field; declare it as a class "
             f"attribute without an annotation, {example}"
+        )
+    not_init = [field.name for field in dataclasses.fields(message_class) if not field.init]
+    if not_init:
+        # to_bytes() sends every field, and from_bytes() passes them to the constructor
+        raise TypeError(
+            f"{name} declares {', '.join(not_init)} with init=False; every field of a message is "
+            f"sent and given to the constructor when it is decoded, so it must be an init field"
         )
     if _TYPE_NAME_ATTRIBUTE not in vars(message_class):
         inherited = getattr(message_class, _TYPE_NAME_ATTRIBUTE, None)
@@ -85,6 +94,27 @@ def _encode_nested(value: object) -> dict[str, Any]:
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         return _fields_of(value)
     raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
+def _check_field_names(message_class: type, payload: Mapping[str, object]) -> None:
+    """Raise `TypeError` unless `payload` has exactly the fields of `message_class`.
+
+    A field with a default is required too, so a body without it is refused rather than given the
+    default. The missing fields are named, from the class, but an unexpected one only counted: its
+    name comes from the body, which may hold anything.
+    """
+    expected = {field.name for field in dataclasses.fields(message_class) if field.init}
+    missing = sorted(expected - payload.keys())
+    unexpected = len(payload.keys() - expected)
+    problems = []
+    if missing:
+        problems.append(f"missing field(s) {', '.join(missing)}")
+    if unexpected:
+        problems.append(f"{unexpected} unexpected field(s)")
+    if problems:
+        raise TypeError(
+            f"JSON body does not match {message_class.__name__}: {' and '.join(problems)}"
+        )
 
 
 def _reject_constant(constant: str) -> NoReturn:
@@ -173,8 +203,8 @@ class KicakMessage:
         Raises `ValueError` for a body that is not UTF-8 JSON (`NaN`, `Infinity`, and `-Infinity`
         included), has a number too large for a float, is nested too deeply to decode, or has an
         empty or too long `message_id`, and `TypeError` for one that is not a JSON object, whose
-        fields do not match this class (a missing `message_id` included), or whose `message_id` is
-        not a string. Field values are not converted or type-checked: a nested dataclass, for
+        fields are not exactly those of this class (a missing `message_id`, and a missing field
+        that has a default, included), or whose `message_id` is not a string. Field values are not converted or type-checked: a nested dataclass, for
         example, comes back as a `dict`. See "Message types" in the documentation for when a decoded
         message can be serialized again.
         """
@@ -188,6 +218,9 @@ class KicakMessage:
             except RecursionError as error:
                 # Deep nesting exhausts the decoder's recursion limit: the body is at fault
                 raise ValueError("JSON body is nested too deeply to decode") from error
+            if not isinstance(payload, dict):
+                raise TypeError(f"JSON body must be an object, got {type(payload).__name__}")
+            _check_field_names(cls, payload)
             message = cls(**payload)
             _check_message_id(message.message_id)
         except Exception:

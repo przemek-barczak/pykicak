@@ -118,6 +118,38 @@ def test_from_bytes_raises_on_unexpected_fields():
         )
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class DefaultedMessage(KicakMessage):
+    kicak_type = "defaulted.v1"
+    text: str = "default"
+
+
+def test_from_bytes_refuses_a_body_without_a_field_that_has_a_default():
+    # Filling in the default would accept a body that never carried the field, e.g. from an
+    # older version of the producer, which a new version of a message must not be mistaken for
+    with pytest.raises(TypeError, match="^JSON body does not match DefaultedMessage: missing"):
+        DefaultedMessage.from_bytes(b'{"message_id": "m-1"}')
+
+
+def test_from_bytes_names_missing_fields_but_only_counts_unexpected_ones():
+    body = b'{"message_id": "m-1", "count": 3, "SECRET_FIELD": 1, "another": 2}'
+
+    with pytest.raises(TypeError) as raised:
+        SampleMessage.from_bytes(body)
+
+    # A field name in the body is the sender's, and may hold anything, so it is not repeated
+    assert str(raised.value) == (
+        "JSON body does not match SampleMessage: missing field(s) name and 2 unexpected field(s)"
+    )
+    assert raised.value.__context__ is None
+
+
+@pytest.mark.parametrize("body", [b"[1, 2]", b'"text"', b"3", b"null"])
+def test_from_bytes_refuses_a_body_that_is_not_a_json_object(body):
+    with pytest.raises(TypeError, match="^JSON body must be an object, got "):
+        SampleMessage.from_bytes(body)
+
+
 def test_message_id_is_required():
     with pytest.raises(TypeError, match="message_id"):
         SampleMessage(name="hello", count=3)  # type: ignore[call-arg]
@@ -458,6 +490,20 @@ def test_type_name_must_be_declared_by_the_class_itself():
         _type_name_of(UnnamedOrder)
 
     assert "the inherited 'order.v1' names another type" in str(raised.value)
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class OrderWithDerivedField(KicakMessage):
+    kicak_type = "order.derived"
+    item: str
+    priority: int = dataclasses.field(init=False, default=1)
+
+
+def test_type_name_refuses_a_class_with_an_init_false_field():
+    # to_bytes() sends the field, and from_bytes() could not give it to the constructor, so the
+    # Executor receiving it would dead-letter every message of the class
+    with pytest.raises(TypeError, match="OrderWithDerivedField declares priority with init=False"):
+        _type_name_of(OrderWithDerivedField)
 
 
 def test_type_name_must_not_be_a_field():

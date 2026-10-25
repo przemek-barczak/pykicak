@@ -53,8 +53,13 @@ Floats must be finite: JSON has no NaN or infinity, and other languages' JSON pa
 `ValueError` (an Executor dead-letters the input whose results hold one), and decoding refuses
 `NaN`, `Infinity`, `-Infinity`, and a number too large for a float.
 Decoding checks that the body is a JSON object with exactly the fields of the class that the
-delivery's `type` property names; it does not convert or check the types of their values, so a
-nested dataclass, for example, is decoded as a `dict`.
+delivery's `type` property names. A field with a default is required in the body too: a body without
+it is refused, not given the default, so a message of another version is never taken for this one.
+The error names the missing fields, but only counts unexpected ones, whose names come from the
+sender. Decoding does not convert or check the types of the values, so a nested dataclass, for
+example, is decoded as a `dict`. Every field is sent and given to the constructor again when it is
+decoded, so a field declared with `field(init=False)` is not supported: an agent declaring such a
+class refuses it with `TypeError` when it is created.
 Validate values in `execute()` and raise `MalformedMessageError` for invalid ones. A dataclass you
 nest in a message, also inside a list, tuple, or dict, is serialized as a JSON object of its
 fields.

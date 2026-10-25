@@ -93,6 +93,25 @@ def test_run_dead_letters_undecodable_message_and_continues(config, caplog):
     ]
 
 
+def test_field_names_of_an_undecodable_body_stay_out_of_logs_and_dead_letter_headers(
+    config, caplog, clock
+):
+    caplog.set_level("DEBUG")
+    channel = FakeChannel()
+    executor = make_executor(config, channel)
+    channel.queue_deliveries(b'{"message_id": "m-1", "text": "t", "SECRET_FIELD_NAME": 1}')
+
+    run_until_stopped(executor)
+
+    [copy] = dead_letter_copies(channel)
+    error_message = copy.properties.headers["x-kicak-error-message"]
+    assert error_message == (
+        "Could not decode message as SampleMessage: "
+        "JSON body does not match SampleMessage: 1 unexpected field(s)"
+    )
+    assert "SECRET_FIELD_NAME" not in caplog.text
+
+
 @pytest.mark.parametrize(
     ("body", "properties", "logged_id"),
     [
