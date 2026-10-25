@@ -8,10 +8,10 @@ and bind it to that exchange. The fan-out executor names both terminator queues 
 declares the dead-letter exchange and queue of its input queue (for example
 `poc.heartbeat.source.dlx` → `poc.heartbeat.source.dlq`) and its retry queue
 (`poc.heartbeat.source.retry`). Start the fan-out executor before running the injector: until it has
-declared its queue, the injector fails with `UnroutableError`. The terminators can start at any
-time; their queues collect the messages meanwhile. The queue/exchange topology is defined once in
-`examples/poc/messaging/` (`queues.py`, `exchanges.py`, `bindings.py`) and imported by every agent —
-none of it lives in `.kicak`.
+declared its queue, the injector fails with `InjectionError`, caused by `UnroutableError`. The
+terminators can start at any time; their queues collect the messages meanwhile. The queue/exchange
+topology is defined once in `examples/poc/messaging/` (`queues.py`, `exchanges.py`, `bindings.py`)
+and imported by every agent — none of it lives in `.kicak`.
 
 The PoC also shows [a new version of a message](messages.md#a-new-version-of-a-message) being
 introduced while the flow keeps running. `examples/poc/messages.py` defines two versions of the

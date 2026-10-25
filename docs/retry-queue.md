@@ -33,10 +33,16 @@ from it:
   time: waiting in a long input queue, or while the Executor is stopped, uses up no rounds. Size it
   to the longest outage the agent should wait out, for example 360 rounds of 10 seconds for an
   hour.
-- `execute()` is called at most `(max_retry_rounds + 1) × max_processing_attempts` times for one
-  message, which bounds what a message that never succeeds costs, for example in calls to a paid
-  service. A longer `retry_delay_seconds` with fewer rounds waits out the same outage with fewer
-  calls: 6 rounds of 10 minutes instead of 360 of 10 seconds.
+- The retry rounds call `execute()` at most `(max_retry_rounds + 1) × max_processing_attempts`
+  times for one message, which bounds what a message that never succeeds costs, for example in
+  calls to a paid service. A longer `retry_delay_seconds` with fewer rounds waits out the same
+  outage with fewer calls: 6 rounds of 10 minutes instead of 360 of 10 seconds.
+- That bound counts the rounds only. Every repeat that does not move the message to the retry
+  queue adds calls on top: a redelivery after a lost connection, a crash, or an expired
+  `consumer_timeout`, a requeue when RabbitMQ does not take the copy for the retry queue, and
+  sending the message back from the dead-letter queue (see [Requirement: idempotent
+  processing](../README.md#requirement-idempotent-processing)). With at-least-once delivery no
+  bound on the calls can be absolute.
 
 With `max_retry_rounds=0` a message is never moved to the retry queue: one still failing after its
 first `max_processing_attempts` calls is dead-lettered. The rounds are counted in the message's own

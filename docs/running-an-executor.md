@@ -23,7 +23,10 @@ another message:
   message is executed again later.
 - **While waiting for a message,** `run()` returns within about a second, without taking one.
 - **While reconnecting after a lost connection,** `run()` stops retrying and returns within about a
-  second.
+  second of a wait between two attempts. An attempt already under way is not interrupted: it ends
+  when the broker answers or pika's connection timeouts expire, about 15 seconds for a server that
+  accepts the connection but never answers. The same holds for a call to RabbitMQ already under
+  way, so give the process time to stop accordingly.
 - **A message delivered after the stop request,** before the Executor notices it, is not processed;
   RabbitMQ returns it to the queue when the connection closes.
 
@@ -86,6 +89,7 @@ executor = ClassifyingExecutor(
     source_exchange="items.inbox",
     destination_exchange="items.classified",
     destination_queues=["db-writer", "quality-checker"],
+    max_retry_rounds=0,
     heartbeat_seconds=1800,  # this classifier can take up to 20 minutes per item, retries included
 )
 ```

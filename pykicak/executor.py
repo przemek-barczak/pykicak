@@ -173,8 +173,9 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
           delivery while it raises `TransientProcessingError`, before the message is moved to the
           retry queue.
         - `max_retry_rounds` (required, 0 or more) is how many times a message may be moved to the
-          retry queue; one still failing after that is dead-lettered as `retries-exhausted`, so
-          `execute()` is called at most `(max_retry_rounds + 1) * max_processing_attempts` times.
+          retry queue; one still failing after that is dead-lettered as `retries-exhausted`, so its
+          retry rounds call `execute()` at most `(max_retry_rounds + 1) * max_processing_attempts`
+          times. Redeliveries, e.g. after a lost connection, add calls on top.
         - `retry_delay_seconds` (default 10, from 0 to 4294967.295) is how long a message waits in
           the retry queue before it is executed again.
         - `heartbeat_seconds` (default 600, an int from 1 to 65535) is the AMQP heartbeat timeout.
@@ -345,9 +346,10 @@ class KicakExecutorAbstract[Accepted: KicakMessage, Result: KicakMessage | None]
         """Request a graceful stop: `run()` returns before it takes another message.
 
         A message already being processed is finished first: its results are published and it is
-        settled as usual. Waiting for a message, or to reconnect, is interrupted within about a
-        second. A message whose unroutable results are held is requeued instead, so it is executed
-        again later, and a stop never waits for the downstream side.
+        settled as usual. Waiting for a message, or between two attempts to reconnect, is
+        interrupted within about a second; a connection attempt or a call to RabbitMQ already under
+        way is finished first. A message whose unroutable results are held is requeued instead, so
+        it is executed again later, and a stop never waits for the downstream side.
 
         Safe to call from any thread and from a signal handler: it only sets a flag and records the
         time, without locking, logging, or using the connection. The request is permanent: `run()`

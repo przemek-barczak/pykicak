@@ -152,7 +152,7 @@ Message handled outcome=completed reason=None type=Chunk id=doc-17 queue=chunker
 | `queue`, `delivery_tag` | the source queue, and the delivery's tag on the consuming channel |
 | `redelivered`, `retry_round` | RabbitMQ's redelivered flag, and how often the message was moved to the retry queue before (see [Status information](#status-information)) |
 | `attempts` | the calls of `execute()`; 0 for a delivery that could not be decoded |
-| `results` | the results `execute()` returned, once validated and serialized; they are published only when the outcome is `completed` |
+| `results` | the results `execute()` returned, once validated and serialized. With `completed`, they were committed before the input was acknowledged; an `abandoned` delivery may have had its results committed too, if the connection was lost between the commit and the acknowledgement |
 | `input_bytes` | the size of the delivery's body, also of one that could not be decoded; `None` for a delivery without a body |
 | `result_bytes` | the size of all the results' bodies together; 0 without results |
 | `largest_result_bytes` | the size of the largest result's body; 0 without results |

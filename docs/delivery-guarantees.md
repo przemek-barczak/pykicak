@@ -110,14 +110,16 @@ Injectors retry transient RabbitMQ connection and publish failures up to three a
 2-second delays between attempts; each retry publishes the message again on a new connection, and
 after the third failed attempt the error is raised. Executors reconnect indefinitely after transient
 failures, using exponential full jitter with a 0.5-second initial delay and a 30-second maximum, but
-never retry a result publish (see [Every outcome of a
-delivery](outcomes.md)). Authentication and access-denied
-failures, and a broker certificate that fails verification (see [TLS](configuration.md#tls)), are
-not retried. Application processing is retried only for `TransientProcessingError`, first in place
-and then through the retry queue (see [Retry queue](retry-queue.md)). Message acknowledgements are
-not retried: an acknowledgement is valid only on the connection that delivered the message, so when
-the connection is lost while settling a message, RabbitMQ requeues it and the Executor reconnects
-and receives it again.
+never publish results again on a new connection: after a lost connection the input is redelivered
+and executed again instead. On the same connection they publish again only results RabbitMQ returned
+as unroutable, while holding the input (see
+[Unroutable results are held](outcomes.md#unroutable-results-are-held)). Authentication and
+access-denied failures, and a broker certificate that fails verification (see
+[TLS](configuration.md#tls)), are not retried. Application processing is retried only for
+`TransientProcessingError`, first in place and then through the retry queue (see
+[Retry queue](retry-queue.md)). Message acknowledgements are not retried: an acknowledgement is
+valid only on the connection that delivered the message, so when the connection is lost while
+settling a message, RabbitMQ requeues it and the Executor reconnects and receives it again.
 
 An Executor cannot tell a broker that is down from a connection setting that will never work, so it
 also retries indefinitely when the host name does not resolve, nothing listens on the port, or the

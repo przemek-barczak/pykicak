@@ -174,6 +174,7 @@ executor = ClassifyingExecutor(
     source_exchange="items.inbox",
     destination_exchange="items.classified",
     destination_queues=["db-writer", "quality-checker"],
+    max_retry_rounds=0,
     queue_type=QueueType.QUORUM,
 )
 ```

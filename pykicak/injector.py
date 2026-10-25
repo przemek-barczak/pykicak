@@ -175,8 +175,8 @@ class KicakInjectorAbstract[M: KicakMessage](KicakAbstract, abc.ABC):
 
         Requires an open connection (`connect()` or a `with` block); otherwise, also after
         `close()`, raises `RuntimeError`. A message of another class than the declared `M` raises
-        `TypeError`. Raises `InjectionError` if the message was not injected, with the original
-        error as `__cause__`: `UnroutableError` if no queue is bound to the exchange, `NackError` if
+        `TypeError`. Raises `InjectionError` if RabbitMQ did not confirm the message, with the
+        original error as `__cause__`: `UnroutableError` if no queue is bound to the exchange, `NackError` if
         RabbitMQ refuses the message, or a connection error after three attempts.
 
         A connection lost before RabbitMQ confirms the message is retried by publishing it again, so
@@ -245,8 +245,9 @@ class KicakInjectorAbstract[M: KicakMessage](KicakAbstract, abc.ABC):
         that is not an int or float (`bool` included) raises `TypeError`, and NaN or infinity
         `ValueError`.
 
-        `run()` returns normally only when every injection succeeded. A failed one closes the
-        connection and raises `InjectionError`, with the error of the last attempt as `__cause__`.
+        `run()` returns normally only when RabbitMQ confirmed every message, or `generate()`
+        returned None. An injection that was not confirmed closes the connection and raises
+        `InjectionError`, with the error of the last attempt as `__cause__`.
         Errors from `generate()` or from serializing its message, and the `TypeError` for a message
         of another class than `M`, propagate unchanged.
 

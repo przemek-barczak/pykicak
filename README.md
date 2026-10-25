@@ -220,7 +220,7 @@ Exactly one queue may be bound to an Injector's exchange: the input queue of the
 here `classifier`, whose Executor binds it (see [RabbitMQ topology][topology]).
 
 [Running an Injector][injector] describes how an injection is retried, what `run()`
-raises when a message was not injected, `publish()`, and repeated injections.
+raises when an injection was not confirmed, `publish()`, and repeated injections.
 
 Executor (with publishing to an exchange):
 

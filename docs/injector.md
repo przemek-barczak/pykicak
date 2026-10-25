@@ -15,19 +15,24 @@ blocked_timeout_seconds=5)` gives up within about 20 seconds, three attempts of 
 1- and 2-second waits between them. Every attempt that timed out may still be enqueued once the
 alarm clears, so the message can arrive more than once.
 
-`run()` returns normally only if the message was injected. Otherwise it closes the connection and
-raises `InjectionError`. Its `__cause__` is the error that ended the last attempt, for example
+`run()` returns normally when RabbitMQ has confirmed the message, and also when `generate()`
+returned `None`, which injects nothing. Otherwise it closes the connection and raises
+`InjectionError`. Its `__cause__` is the error that ended the last attempt, for example
 `pika.exceptions.UnroutableError` when no queue is bound to the exchange yet, or a pika connection
-error when RabbitMQ is unreachable. Its `message` attribute is the message that was not injected,
-and its text and its `repr()` name the message type and `message_id`, never the payload. Catch it to
-learn that the message was not injected:
+error when RabbitMQ is unreachable. Its `message` attribute is the message whose injection was not confirmed,
+and its text and its `repr()` name the message type and `message_id`, never the payload.
+
+`InjectionError` means that the injection was not confirmed, not that the message is certainly
+missing: if the connection was lost before RabbitMQ's confirmation arrived, or an attempt timed out
+while a memory or disk alarm blocked it, RabbitMQ may still have taken the message. To try again,
+publish the same message, with the same `message_id`, so that consumers can deduplicate it:
 
 ```python
 from pykicak import InjectionError
 
 try:
     injector.run()
-except InjectionError as error:  # nothing was injected; the connection is already closed
+except InjectionError as error:  # not confirmed; the connection is already closed
     ...  # e.g. return an error to the API caller, or exit with a non-zero status
 ```
 
