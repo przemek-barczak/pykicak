@@ -53,12 +53,12 @@ back](dead-letter-queue.md#sending-dead-letters-back)): they get all their round
 
 The copy in the retry queue keeps the body and the message's properties, its `type` included, so it
 comes back as the same version of the message, and its headers, except the headers RabbitMQ manages
-itself (`x-death`, `x-delivery-count`, `x-first-death-*`, and `x-last-death-*`) and the routing
-headers `CC` and `BCC`: another publisher's `CC` naming the source queue would otherwise deliver the
-copy there at once, skipping the retry delay, besides putting it in the retry queue. Its `user_id`
-becomes the Executor's own user, because RabbitMQ refuses any other, while its
-`x-kicak-original-publisher` header keeps naming the agent that created the message (see [Who
-published a message](delivery-guarantees.md#who-published-a-message)), and its
+itself (`x-death`, `x-delivery-count`, `x-acquired-count`, `x-first-death-*`, and `x-last-death-*`)
+and the routing headers `CC` and `BCC`: another publisher's `CC` naming the source queue would
+otherwise deliver the copy there at once, skipping the retry delay, besides putting it in the retry
+queue. Its `user_id` becomes the Executor's own user, because RabbitMQ refuses any other, while its
+`x-kicak-original-publisher` header keeps naming the agent that created the message (see
+[Who published a message](delivery-guarantees.md#who-published-a-message)), and its
 `x-kicak-published-at` header becomes the time of the move, because the copy is published anew (see
 [When a message was published](delivery-guarantees.md#when-a-message-was-published)). It also gets
 two headers that count the rounds:

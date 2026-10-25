@@ -219,6 +219,7 @@ def test_copy_keeps_the_message_and_its_dead_letter_headers_but_not_rabbitmq_s()
             "tenant": "acme",
             "x-death": [{"reason": "expired"}],
             "x-delivery-count": 3,
+            "x-acquired-count": 5,
             "x-first-death-queue": "classifier",
             "x-last-death-reason": "expired",
             # Sender-selected routing: RabbitMQ would also deliver the copy to these queues

@@ -243,9 +243,9 @@ class _Settlement:
         """Settle the delivery as `outcome`, and record it once RabbitMQ has taken it.
 
         `_Outcome.REQUEUED` returns the delivery to the queue with `basic_nack()`, after declaring
-        the dead-letter route again: a quorum queue dead-letters a requeued message once it
-        reaches its delivery limit, and RabbitMQ drops a message dead-lettered into a missing
-        exchange. Every other outcome acknowledges it, once it is done with: completed, moved to
+        the dead-letter route again: a quorum queue can dead-letter a requeued message at its
+        delivery limit (RabbitMQ 4.2 counts every requeue toward it, 4.3+ only failed deliveries),
+        and RabbitMQ drops a message dead-lettered into a missing exchange. Every other outcome acknowledges it, once it is done with: completed, moved to
         the retry queue, or dead-lettered for the given reason.
 
         Returns False if the connection was lost, or RabbitMQ took the delivery back because it

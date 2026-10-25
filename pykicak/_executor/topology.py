@@ -40,8 +40,10 @@ class QueueType(StrEnum):
     QUORUM = "quorum"
     """A queue replicated across the nodes of a RabbitMQ cluster, so it survives a node failure.
 
-    It limits how often a message is redelivered: on RabbitMQ 4.0 and newer, by default, a
-    message is dead-lettered on its 21st delivery instead of being requeued again.
+    It limits how often the delivery of a message may fail: on RabbitMQ 4.0 and newer, by default,
+    a message is dead-lettered instead of being delivered a 21st time. RabbitMQ 4.2 counts every
+    requeue, 4.3 and newer only failed deliveries, e.g. after a lost connection. See "Queue type"
+    in the documentation.
     """
 
 

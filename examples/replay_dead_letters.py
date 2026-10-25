@@ -61,7 +61,7 @@ RABBITMQ_REASON = "rabbitmq"
 _REASON_HEADER = "x-kicak-dead-letter-reason"
 _ORIGINAL_PUBLISHER_HEADER = "x-kicak-original-publisher"
 # Headers RabbitMQ sets itself when it dead-letters a message
-_BROKER_HEADERS = frozenset({"x-death", "x-delivery-count"})
+_BROKER_HEADERS = frozenset({"x-death", "x-delivery-count", "x-acquired-count"})
 _BROKER_HEADER_PREFIXES = ("x-first-death-", "x-last-death-")
 # Sender-selected distribution: RabbitMQ would also route the copy to the queues these name
 _ROUTING_HEADERS = frozenset({"CC", "BCC"})

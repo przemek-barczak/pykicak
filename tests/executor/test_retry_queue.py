@@ -165,6 +165,7 @@ def test_retry_copy_keeps_application_properties_but_not_rabbitmq_headers(config
             "tenant": "acme",
             "x-death": [{"queue": "input-queue", "reason": "rejected", "count": 1}],
             "x-delivery-count": 3,
+            "x-acquired-count": 5,
             "x-first-death-queue": "input-queue",
             "x-last-death-reason": "rejected",
             # Sender-selected routing: RabbitMQ would also deliver the copy to these at once

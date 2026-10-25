@@ -31,8 +31,9 @@ _DEAD_LETTER_HEADERS = frozenset(
 # Keeps the message properties well within one frame (frame_max is 128 KiB by default)
 _MAX_ERROR_MESSAGE_BYTES = 1024
 _TRUNCATION_MARK = "…"
-# Headers RabbitMQ sets itself; a copy must not carry stale ones, e.g. a quorum delivery count
-_BROKER_HEADERS = frozenset({"x-death", "x-delivery-count"})
+# Headers RabbitMQ sets itself; a copy must not carry stale ones, e.g. a quorum delivery count, or
+# the count of requeues that quorum queues keep since RabbitMQ 4.3
+_BROKER_HEADERS = frozenset({"x-death", "x-delivery-count", "x-acquired-count"})
 _BROKER_HEADER_PREFIXES = ("x-first-death-", "x-last-death-")
 # Sender-selected distribution: RabbitMQ also routes a message to the routing keys these name, so
 # a copy keeping them, e.g. `CC` naming the source queue, would also reach queues it is not for

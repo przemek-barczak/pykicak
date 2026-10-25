@@ -60,8 +60,8 @@ before the commit. None of the results was delivered then, and the Executor hold
 - A lost connection, or RabbitMQ's `consumer_timeout` (30 minutes by default) expiring, also ends
   it: RabbitMQ requeues the input, and the Executor reconnects and executes it again.
 
-On a quorum queue, every requeue counts toward the delivery limit (see [Queue
-type](topology.md#queue-type)).
+On a quorum queue, the requeue counts toward the delivery limit on RabbitMQ 4.2; on 4.3 and newer,
+only the requeue that follows a lost connection does (see [Queue type](topology.md#queue-type)).
 
 ## Results are published in a transaction
 

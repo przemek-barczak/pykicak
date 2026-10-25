@@ -127,8 +127,8 @@ restores whatever was deleted. That is logged only at `DEBUG`.
   channel. So a downstream queue, binding, or destination exchange deleted since is restored
   before the results are published, and none of the queues misses them.
 - **Right before dead-lettering or requeueing a message**: the dead-letter route. The copy of a
-  dead-lettered message is published to the dead-letter exchange, and a quorum queue dead-letters
-  a requeued message once it reaches its delivery limit; RabbitMQ drops a message it dead-letters
+  dead-lettered message is published to the dead-letter exchange, and a quorum queue can
+  dead-letter a requeued message at its delivery limit; RabbitMQ drops a message it dead-letters
   into an exchange that does not exist.
 - **Right before moving a message to the retry queue**: the retry queue.
 
@@ -189,10 +189,19 @@ queues, follow the topology redesign steps above: drain them, stop every instanc
 Executor, delete the queues, then start the Executors with the new `queue_type`.
 
 Quorum queues count the deliveries of each message. On RabbitMQ 4.0 and newer they apply a default
-delivery limit of 20: a message delivered 21 times is dead-lettered with the `x-death` reason
-`delivery_limit` instead of being delivered again. Every requeue counts, for example after a lost
-connection or a hard stop. A message that comes back from the retry queue arrives as a new message,
-so its count starts again: the delivery limit never ends the retries of `TransientProcessingError`,
-which only `max_retry_rounds` bounds (see [Retry queue](retry-queue.md)). A classic queue has no
-such limit and requeues a message indefinitely. The limit can be changed with a RabbitMQ policy
-(`delivery-limit`).
+delivery limit of 20: a message delivered 20 times without success is dead-lettered with the
+`x-death` reason `delivery_limit` instead of being delivered a 21st time. What counts depends on the
+version of RabbitMQ:
+
+- RabbitMQ 4.2 counts every return of a message to the queue: a requeue by the Executor
+  (`basic_nack` with `requeue=True`), and a delivery left unsettled by a lost connection or a hard
+  stop.
+- RabbitMQ 4.3 and newer count only a delivery that fails, such as one left unsettled by a lost
+  connection. A requeue by the Executor does not count (RabbitMQ counts it in the `x-acquired-count`
+  header instead), so a message the Executor keeps requeueing, for example because RabbitMQ keeps
+  refusing its copy for the retry queue, is never dead-lettered by the limit.
+
+A message that comes back from the retry queue arrives as a new message, so its count starts again:
+the delivery limit never ends the retries of `TransientProcessingError`, which only
+`max_retry_rounds` bounds (see [Retry queue](retry-queue.md)). A classic queue has no such limit and
+requeues a message indefinitely. The limit can be changed with a RabbitMQ policy (`delivery-limit`).
