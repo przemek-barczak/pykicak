@@ -49,6 +49,12 @@ confirm the outcome:
   the retry queue. A quorum retry queue returns it at least once and keeps it until the input queue
   takes it. **Use `QueueType.QUORUM` where no message may be lost**, and with classic queues, set no
   limit that makes an input queue refuse messages.
+- **A message a classic queue dead-letters itself.** RabbitMQ itself dead-letters a message from a
+  classic input queue when it expires (a message TTL from a policy, or an expiration its publisher
+  set) or a length limit drops it, at most once and without any confirmation. If no queue takes it
+  at that moment, for example because `<queue>.dlq` or its binding was deleted, or `<queue>.dlq` is
+  full and refuses new messages, RabbitMQ drops it. A quorum queue dead-letters at least once and
+  keeps the message until `<queue>.dlq` takes it (see [Queue type](topology.md#queue-type)).
 - **Results that miss a downstream queue.** If some, but not all, of the bindings of an Executor's
   destination exchange are deleted in the few milliseconds between its output-side verification and
   the commit, the queues that lost their binding miss the results, and RabbitMQ reports nothing as

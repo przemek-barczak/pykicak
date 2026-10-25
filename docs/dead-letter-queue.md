@@ -42,7 +42,9 @@ message TTL set by a policy dead-letters the messages it drops. RabbitMQ routes 
 same `<queue>.dlx`, with its own `x-death` header recording the queue and the reason, for example
 `delivery_limit`, and without the headers above. The Executor's copies have no `x-death`, because
 RabbitMQ did not dead-letter them. So read `x-kicak-dead-letter-reason` first, and `x-death` when it
-is missing.
+is missing. A quorum queue dead-letters such a message at least once, keeping it until
+`<queue>.dlq` takes it; a classic queue does so at most once, and drops it if no queue takes it (see
+[When a message can still be lost](delivery-guarantees.md#when-a-message-can-still-be-lost)).
 
 **A message can be both in the dead-letter queue and processed.** If the connection is lost, or
 RabbitMQ's `consumer_timeout` takes the message back, after RabbitMQ has confirmed the copy but
@@ -55,8 +57,9 @@ fixed. Sending a message back from the dead-letter queue is safe because agents 
 dead-letter queue or its binding was deleted right after the Executor declared them and no other
 queue is bound to `<queue>.dlx`, or refuses it, for example because the dead-letter queue is full
 and refuses new messages, the Executor requeues the message instead and logs an `ERROR`; RabbitMQ
-then delivers it again at once. Rejecting it for RabbitMQ to dead-letter would not help: RabbitMQ
-dead-letters a rejected message at most once and drops it, telling nobody, when no queue takes it.
+then delivers it again at once. Rejecting it for RabbitMQ to dead-letter would not help: a
+classic queue dead-letters a rejected message at most once and drops it, telling nobody, when no
+queue takes it, and neither queue type would add the headers saying why.
 RabbitMQ refusing to declare the dead-letter route, or refusing the copy in another way, for example
 with `403 ACCESS_REFUSED`, stops the Executor. After an unexpected failure, the Executor stops
 either way, and raises that failure, not the error of the copy.

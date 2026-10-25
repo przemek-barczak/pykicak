@@ -23,8 +23,8 @@ documentation is in [`docs/`][docs].
 **pykicak is designed for idempotent agents only.** It delivers every message *at least once*, never
 *exactly once*: wherever a failure leaves a choice, it processes a message again rather than risk
 losing it, and the price is that a message can be processed, and its results published, more than
-once. The few cases in which RabbitMQ itself can still lose a message, one of them with classic
-retry queues, are listed in [When a message can still be lost][when-a-message-can-still-be-lost].
+once. The few cases in which RabbitMQ itself can still lose a message, two of them with classic
+queues, are listed in [When a message can still be lost][when-a-message-can-still-be-lost].
 Every agent built on pykicak must therefore be idempotent: processing the same message twice, or
 twice at the same time, must leave the system in the same state as processing it once. Using pykicak
 for processing that is not idempotent can corrupt data or repeat external actions.

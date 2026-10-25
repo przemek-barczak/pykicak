@@ -104,10 +104,12 @@ The library assumes this deployment model:
 
 RabbitMQ queue arguments cannot change after a queue is created. If the source queue or a
 destination queue already exists with another `x-dead-letter-exchange` argument (for example one
-that does not follow the `<queue>.dlx` convention), or any queue exists with another queue type, its
-declaration fails with `406 PRECONDITION_FAILED`, which is not retried: connecting raises, and a
-running Executor stops. Queues declared by an earlier pykicak version with other dead-letter names
-must therefore be drained and deleted before the Executors that declare them are upgraded.
+that does not follow the `<queue>.dlx` convention), or any queue exists with another queue type or
+without the arguments of at-least-once dead-lettering that quorum queues get (see [Queue
+type](#queue-type)), its declaration fails with `406 PRECONDITION_FAILED`, which is not retried:
+connecting raises, and a running Executor stops. Queues declared by an earlier pykicak version with
+other dead-letter names, and quorum queues declared by pykicak before 0.4.0, must therefore be
+drained and deleted before the Executors that declare them are upgraded.
 
 ## Topology verification
 
@@ -128,8 +130,8 @@ restores whatever was deleted. That is logged only at `DEBUG`.
   before the results are published, and none of the queues misses them.
 - **Right before dead-lettering or requeueing a message**: the dead-letter route. The copy of a
   dead-lettered message is published to the dead-letter exchange, and a quorum queue can
-  dead-letter a requeued message at its delivery limit; RabbitMQ drops a message it dead-letters
-  into an exchange that does not exist.
+  dead-letter a requeued message at its delivery limit; while no queue takes such a message,
+  RabbitMQ keeps it and tries again only minutes later.
 - **Right before moving a message to the retry queue**: the retry queue.
 
 The input side is the input queue, its binding to the source exchange, the dead-letter route, and
@@ -156,12 +158,23 @@ its dead-letter queue, its retry queue, and its destination queues, so all Execu
 the same type.
 Pass a member of the exported `QueueType` enum:
 
-- `QueueType.CLASSIC` (the default) is a queue stored on one broker node. Its retry queue returns
-  messages at most once, so in a rare case a message can be lost (see [When a message can still be
-  lost](delivery-guarantees.md#when-a-message-can-still-be-lost)).
+- `QueueType.CLASSIC` (the default) is a queue stored on one broker node. It dead-letters messages
+  at most once, and its retry queue returns them at most once, so in rare cases a message can be
+  lost (see [When a message can still be lost](delivery-guarantees.md#when-a-message-can-still-be-lost)).
 - `QueueType.QUORUM` is a queue replicated across the nodes of a RabbitMQ cluster, which keeps its
-  messages when a node fails, and whose retry queue returns messages at least once. It also works on
-  a single node. Use it where no message may be lost.
+  messages when a node fails. It dead-letters messages at least once, and its retry queue returns
+  them at least once. It also works on a single node. Use it where no message may be lost.
+
+Every quorum queue that dead-letters messages, the input queue, the destination queues, and the
+retry queue, is declared with `x-dead-letter-strategy` `at-least-once` and the `x-overflow`
+`reject-publish` that RabbitMQ requires with it. A message RabbitMQ dead-letters itself, for example
+at the delivery limit (see below), stays in the queue until the queue it goes to takes it: while
+none does, for example because `<queue>.dlq` was deleted, RabbitMQ logs a warning and tries again
+every 3 minutes. And a quorum queue with a length limit, for example from a policy, refuses new
+messages once it is full, instead of dropping or dead-lettering its oldest: an Injector publishing to
+it raises `InjectionError`, and an Executor publishing results to it stops, while its input stays in
+RabbitMQ (see [Results are published in a
+transaction](outcomes.md#results-are-published-in-a-transaction)).
 
 For the `ClassifyingExecutor` of the [Usage](../README.md#usage) example in the README:
 

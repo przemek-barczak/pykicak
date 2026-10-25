@@ -85,10 +85,11 @@ chunks while its input is acknowledged or dead-lettered.
   is one of the reasons agents must be idempotent (see [Requirement: idempotent
   processing](../README.md#requirement-idempotent-processing)).
 - **Two RabbitMQ cases can leave part of a transaction.** RabbitMQ does not guarantee atomicity if
-  the broker itself fails during the commit. And a destination queue with a length limit and
-  `overflow: reject-publish` can refuse some of the results while other queues accept them; the
-  commit then fails and the Executor stops. Do not use `reject-publish` on queues that receive
-  results of several messages per input.
+  the broker itself fails during the commit. And a full destination queue that refuses new
+  messages can refuse some of the results while other queues accept them; the commit then fails and
+  the Executor stops. A quorum queue refuses them whenever it has a length limit (see [Queue
+  type](topology.md#queue-type)), a classic one with `overflow: reject-publish`. Set no such limit
+  on queues that receive results of several messages per input.
 - **Results are never re-sent on a new connection.** An acknowledgement can only be sent on the
   channel that delivered the message, and RabbitMQ requeues the delivery as soon as that connection
   is lost, so re-sending would duplicate the results. The redelivered input is executed again

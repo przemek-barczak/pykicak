@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
+from types import MappingProxyType
 
 from pika.adapters.blocking_connection import BlockingChannel
 from pika.exchange_type import ExchangeType
@@ -18,6 +19,12 @@ _RETRY_QUEUE_SUFFIX = ".retry"
 # A queue an Executor consumes from leaves room in its name for the names derived from it
 _LONGEST_QUEUE_NAME_SUFFIX = max(
     (_DEAD_LETTER_EXCHANGE_SUFFIX, _DEAD_LETTER_QUEUE_SUFFIX, _RETRY_QUEUE_SUFFIX), key=len
+)
+# A quorum queue dead-letters at most once by default, dropping a message that no queue takes;
+# at least once, it keeps the message until one does, which requires refusing new messages, not
+# dropping old ones, when the queue is full
+_AT_LEAST_ONCE_DEAD_LETTERING = MappingProxyType(
+    {"x-dead-letter-strategy": "at-least-once", "x-overflow": "reject-publish"}
 )
 
 
@@ -33,14 +40,16 @@ class QueueType(StrEnum):
     CLASSIC = "classic"
     """A queue stored on one broker node; the default.
 
-    Its retry queue returns messages at most once: see "When a message can still be lost" in the
-    documentation.
+    It dead-letters messages at most once, and its retry queue returns them at most once: see
+    "When a message can still be lost" in the documentation.
     """
 
     QUORUM = "quorum"
     """A queue replicated across the nodes of a RabbitMQ cluster, so it survives a node failure.
 
-    It limits how often the delivery of a message may fail: on RabbitMQ 4.0 and newer, by default,
+    It dead-letters at least once: a message RabbitMQ dead-letters, or returns from the retry
+    queue, is kept until the queue it goes to takes it. A full queue refuses new messages. It
+    limits how often the delivery of a message may fail: on RabbitMQ 4.0 and newer, by default,
     a message delivered 21 times without success is dead-lettered instead of being delivered
     again. RabbitMQ 4.2 counts every requeue, 4.3 and newer only failed deliveries, e.g. after a
     lost connection. See "Queue type" in the documentation.
@@ -284,8 +293,7 @@ class _ExecutorTopology:
             "x-queue-type": self.queue_type.value,
         }
         if self.queue_type is QueueType.QUORUM:
-            arguments["x-dead-letter-strategy"] = "at-least-once"
-            arguments["x-overflow"] = "reject-publish"  # required by at-least-once dead-lettering
+            arguments.update(_AT_LEAST_ONCE_DEAD_LETTERING)
         logger.debug(
             "Declaring %s queue %s returning to %s",
             self.queue_type,
@@ -311,20 +319,22 @@ class _ExecutorTopology:
         """Declare a queue that an Executor consumes from, with the arguments every one uses.
 
         The arguments follow from the name and the queue type alone, so the executor upstream of
-        a queue declares it exactly as the queue's own executor does.
+        a queue declares it exactly as the queue's own executor does. A quorum queue dead-letters
+        at least once, like the retry queue: a message RabbitMQ dead-letters itself, e.g. at the
+        delivery limit, stays in the queue until `<queue>.dlq` takes it, instead of being dropped
+        if no queue is bound to `<queue>.dlx` at that moment. A classic queue cannot.
         """
         dead_letter_exchange = _dead_letter_exchange_of(queue_name)
+        arguments: dict[str, object] = {
+            "x-dead-letter-exchange": dead_letter_exchange,
+            "x-queue-type": self.queue_type.value,
+        }
+        if self.queue_type is QueueType.QUORUM:
+            arguments.update(_AT_LEAST_ONCE_DEAD_LETTERING)
         logger.debug(
             "Declaring %s queue %s dead_letter_exchange=%s",
             self.queue_type,
             queue_name,
             dead_letter_exchange,
         )
-        channel.queue_declare(
-            queue=queue_name,
-            durable=True,
-            arguments={
-                "x-dead-letter-exchange": dead_letter_exchange,
-                "x-queue-type": self.queue_type.value,
-            },
-        )
+        channel.queue_declare(queue=queue_name, durable=True, arguments=arguments)

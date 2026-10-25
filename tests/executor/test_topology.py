@@ -135,6 +135,9 @@ def test_declare_topology_declares_every_queue_as_quorum_when_requested(config):
     assert source_queue.arguments == {
         "x-dead-letter-exchange": "input-queue.dlx",
         "x-queue-type": "quorum",
+        # Dead-lettered at least once: RabbitMQ keeps a message no queue takes until one does
+        "x-dead-letter-strategy": "at-least-once",
+        "x-overflow": "reject-publish",
     }
     assert dead_letter_queue.queue == "input-queue.dlq"
     assert dead_letter_queue.durable is True
@@ -151,9 +154,12 @@ def test_declare_topology_declares_every_queue_as_quorum_when_requested(config):
     }
     assert destination_queue.queue == "output-queue"
     assert destination_queue.durable is True
+    # Exactly as its own executor declares it
     assert destination_queue.arguments == {
         "x-dead-letter-exchange": "output-queue.dlx",
         "x-queue-type": "quorum",
+        "x-dead-letter-strategy": "at-least-once",
+        "x-overflow": "reject-publish",
     }
 
 

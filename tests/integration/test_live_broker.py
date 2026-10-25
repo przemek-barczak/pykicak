@@ -30,7 +30,7 @@ from pika.exceptions import UnroutableError
 from pika.spec import Basic
 
 from examples.replay_dead_letters import replay_dead_letters
-from pykicak._executor.topology import _ExecutorTopology
+from pykicak._executor.topology import _AT_LEAST_ONCE_DEAD_LETTERING, _ExecutorTopology
 from pykicak.config import KicakConfig
 from pykicak.executor import (
     DeadLetterCounts,
@@ -616,7 +616,8 @@ def test_executor_declares_both_queues_with_the_requested_type(
     with RecordingTerminator(config, queue_type=queue_type, **names):
         pass
 
-    # RabbitMQ reports no queue type on declare, but rejects a redeclaration with another type.
+    # RabbitMQ reports no queue arguments on declare, but accepts a redeclaration only with the
+    # same ones: the first declaration checks them all, the second the type
     connection = _open_connection(config)
     try:
         retry_arguments = {
@@ -628,12 +629,9 @@ def test_executor_declares_both_queues_with_the_requested_type(
             (_dead_letter_queue(names), {}),
             (f"{names['source_queue']}.retry", retry_arguments),
         ):
-            if queue.endswith(".retry") and queue_type == QueueType.QUORUM:
-                arguments = {
-                    **arguments,
-                    "x-dead-letter-strategy": "at-least-once",
-                    "x-overflow": "reject-publish",
-                }
+            # Quorum queues that dead-letter messages do so at least once
+            if not queue.endswith(".dlq") and queue_type == QueueType.QUORUM:
+                arguments = {**arguments, **_AT_LEAST_ONCE_DEAD_LETTERING}
             connection.channel().queue_declare(
                 queue=queue, durable=True, arguments={**arguments, "x-queue-type": queue_type}
             )
@@ -644,6 +642,29 @@ def test_executor_declares_both_queues_with_the_requested_type(
             assert raised.value.reply_code == 406
     finally:
         connection.close()
+
+
+def test_quorum_executor_refuses_an_input_queue_that_dead_letters_at_most_once(config, topology):
+    # e.g. declared by pykicak before 0.4.0: RabbitMQ refuses to change a queue's arguments
+    names = topology.executor_topology("source", topology.exchange("inject"))
+    _with_broker_channel(
+        config,
+        lambda channel: channel.queue_declare(
+            queue=names["source_queue"],
+            durable=True,
+            arguments={
+                "x-dead-letter-exchange": _dead_letter_exchange(names),
+                "x-queue-type": QueueType.QUORUM,
+            },
+        ),
+    )
+    executor = RecordingTerminator(config, queue_type=QueueType.QUORUM, **names)
+
+    with pytest.raises(pika.exceptions.ChannelClosedByBroker) as raised:
+        executor.connect()
+
+    assert raised.value.reply_code == 406
+    assert "x-dead-letter-strategy" in raised.value.reply_text
 
 
 def test_classic_executor_accepts_queues_declared_without_queue_type(config, topology):
