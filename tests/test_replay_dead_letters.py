@@ -20,6 +20,7 @@ from pika.exceptions import ChannelClosedByBroker, StreamLostError, UnroutableEr
 
 import examples.replay_dead_letters as tool
 from pykicak import KicakConfig, KicakConfigError
+from pykicak._executor.headers import _retry_round_of
 from tests.fakes import CONNECTION_VALUES
 
 
@@ -233,8 +234,7 @@ def test_copy_keeps_the_message_and_its_dead_letter_headers_but_not_rabbitmq_s()
 
     assert copy.headers == {
         "tenant": "acme",
-        "x-kicak-retry-round": 5,
-        # Kept, so the Executor sees the message was sent back and gives it its rounds again
+        # Kept, so the Executor sees the message was sent back; its retry round is dropped
         "x-kicak-dead-letter-reason": "retries-exhausted",
         "x-kicak-original-publisher": "injector",
     }
@@ -265,6 +265,33 @@ def test_copy_names_the_creator_of_a_message_without_the_original_publisher_head
 )
 def test_reason_of_a_dead_letter(headers, reason):
     assert tool._dead_letter_reason(pika.BasicProperties(headers=headers)) == reason
+
+
+@pytest.mark.parametrize(
+    "dead_letter_headers",
+    [
+        {"x-kicak-dead-letter-reason": "retries-exhausted"},
+        {"x-death": [{"reason": "delivery_limit"}]},
+    ],
+    ids=["by-an-executor", "by-rabbitmq"],
+)
+def test_message_sent_back_gets_all_its_retry_rounds_again(dead_letter_headers):
+    # A message RabbitMQ dead-lettered itself, e.g. at a quorum queue's delivery limit, has no
+    # dead-letter headers of an Executor, so only dropping its rounds gives it them all again
+    dead_lettered = pika.BasicProperties(
+        message_id="input",
+        headers={
+            "x-kicak-retry-round": 7,
+            "x-kicak-retrying-since": "2026-10-01T12:00:00+00:00",
+            **dead_letter_headers,
+        },
+    )
+
+    copy = tool._sent_back_properties(dead_lettered, "operator")
+
+    assert "x-kicak-retry-round" not in copy.headers
+    assert "x-kicak-retrying-since" not in copy.headers
+    assert _retry_round_of(copy.headers) == 0
 
 
 def test_connection_is_named_and_unencrypted_only_when_asked(config, monkeypatch):

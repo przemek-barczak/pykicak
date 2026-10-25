@@ -92,3 +92,7 @@ it:
   the `Message handled` line report its `retry_round` as 0.
 - Every copy the Executor makes of it, for the retry queue or the dead-letter queue, drops those
   headers and its old retry headers, so it never shows a stale reason or round.
+
+The example tool drops the retry headers of every message it sends back, so a message RabbitMQ
+dead-lettered itself, which has no dead-letter headers to recognize it by, gets all its rounds
+again too.

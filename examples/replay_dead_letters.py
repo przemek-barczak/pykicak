@@ -18,8 +18,10 @@ removed from the dead-letter queue only after RabbitMQ has confirmed the copy. T
 unacknowledged until the end, when closing the connection returns them to the dead-letter queue.
 
 The copy keeps the body and the properties, so the message comes back as the same version and
-with the same ID, and its headers, the dead-letter headers included: from those the Executor sees
-that the message was sent back, and gives it all its retry rounds again. Its `user_id` becomes the
+with the same ID, and its headers, the dead-letter headers included, from which the Executor sees
+that the message was sent back. The retry headers (`x-kicak-retry-round` and
+`x-kicak-retrying-since`) are dropped, so the message gets all its retry rounds again, also one
+that RabbitMQ dead-lettered itself, which has no dead-letter headers. Its `user_id` becomes the
 user of this tool's connection, because RabbitMQ refuses any other, while its
 `x-kicak-original-publisher` header keeps naming the agent that created the message. RabbitMQ's
 own headers (`x-death` and the others) are dropped, and so are `CC` and `BCC`, with which RabbitMQ
@@ -63,6 +65,9 @@ _BROKER_HEADERS = frozenset({"x-death", "x-delivery-count"})
 _BROKER_HEADER_PREFIXES = ("x-first-death-", "x-last-death-")
 # Sender-selected distribution: RabbitMQ would also route the copy to the queues these name
 _ROUTING_HEADERS = frozenset({"CC", "BCC"})
+# The rounds a message spent in the retry queue before it was dead-lettered; sent back, it gets all
+# its rounds again, also when RabbitMQ dead-lettered it, without the headers the Executor adds
+_RETRY_HEADERS = frozenset({"x-kicak-retry-round", "x-kicak-retrying-since"})
 
 
 @dataclass
@@ -161,17 +166,18 @@ def _dead_letter_reason(properties: pika.BasicProperties) -> str:
 def _sent_back_properties(properties: pika.BasicProperties, user_id: str) -> pika.BasicProperties:
     """Return the properties of the copy sent back: the message's own, as it was dead-lettered.
 
-    Its headers lose those RabbitMQ sets itself, and `CC` and `BCC`, which would route the copy
-    to other queues too. The dead-letter headers stay, so that the Executor gives the message its
-    retry rounds again. The `user_id` must be the user of this connection, so a message RabbitMQ
-    dead-lettered itself, whose `user_id` names its creator, keeps the creator in
-    `x-kicak-original-publisher` if the header is missing.
+    Its headers lose those RabbitMQ sets itself, `CC` and `BCC`, which would route the copy to
+    other queues too, and the retry headers, so that the message gets its retry rounds again,
+    whoever dead-lettered it. The dead-letter headers stay. The `user_id` must be the user of
+    this connection, so a message RabbitMQ dead-lettered itself, whose `user_id` names its
+    creator, keeps the creator in `x-kicak-original-publisher` if the header is missing.
     """
     headers = {
         name: value
         for name, value in (properties.headers or {}).items()
         if name not in _BROKER_HEADERS
         and name not in _ROUTING_HEADERS
+        and name not in _RETRY_HEADERS
         and not name.startswith(_BROKER_HEADER_PREFIXES)
     }
     if _ORIGINAL_PUBLISHER_HEADER not in headers and properties.user_id:
