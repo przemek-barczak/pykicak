@@ -171,6 +171,21 @@ def test_injection_error_describes_message_by_type_and_id_with_cause():
     assert "do not log me" not in text
 
 
+def test_injection_error_repr_shows_the_message_by_type_and_id_never_its_payload():
+    # Exception's own repr would show its args, and the message with them, e.g. in a log
+    # formatted with %r or in a crash report
+    error = InjectionError(
+        IdentifiedMessage(message_id="m-1", secret_payload="do not log me"), "my-exchange"
+    )
+    expected = (
+        "InjectionError(message=<IdentifiedMessage message_id='m-1'>, exchange_name='my-exchange')"
+    )
+
+    assert repr(error) == expected
+    assert repr(pickle.loads(pickle.dumps(error))) == expected
+    assert "do not log me" not in repr(error)
+
+
 def test_injection_error_keeps_message_and_exchange_and_survives_pickling():
     message = IdentifiedMessage(message_id="m-1", secret_payload="payload")
     error = InjectionError(message, "my-exchange")

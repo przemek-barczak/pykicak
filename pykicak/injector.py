@@ -55,6 +55,13 @@ class InjectionError(Exception):
             text += f": {self.__cause__!r}"
         return text
 
+    def __repr__(self) -> str:
+        """Show the message by type and ID, never by payload, which `Exception`'s repr would."""
+        return (
+            f"{type(self).__name__}(message=<{type(self.message).__name__} "
+            f"message_id={self.message.message_id!r}>, exchange_name={self.exchange_name!r})"
+        )
+
 
 class KicakInjectorAbstract[M: KicakMessage](KicakAbstract, abc.ABC):
     """Short-lived node that creates and publishes the first message of a processing flow.
