@@ -21,7 +21,8 @@ with the same ID, and its headers, the dead-letter headers included: from those 
 that the message was sent back, and gives it all its retry rounds again. Its `user_id` becomes the
 user of this tool's connection, because RabbitMQ refuses any other, while its
 `x-kicak-original-publisher` header keeps naming the agent that created the message. RabbitMQ's
-own headers (`x-death` and the others) are dropped.
+own headers (`x-death` and the others) are dropped, and so are `CC` and `BCC`, with which RabbitMQ
+would also deliver the copy to the queues they name.
 
 Like every delivery in pykicak, sending back is at-least-once: if the connection is lost after
 RabbitMQ confirmed a copy but before the message was removed from the dead-letter queue, the
@@ -60,6 +61,8 @@ _ORIGINAL_PUBLISHER_HEADER = "x-kicak-original-publisher"
 # Headers RabbitMQ sets itself when it dead-letters a message
 _BROKER_HEADERS = frozenset({"x-death", "x-delivery-count"})
 _BROKER_HEADER_PREFIXES = ("x-first-death-", "x-last-death-")
+# Sender-selected distribution: RabbitMQ would also route the copy to the queues these name
+_ROUTING_HEADERS = frozenset({"CC", "BCC"})
 
 
 @dataclass
@@ -176,15 +179,18 @@ def _dead_letter_reason(properties: pika.BasicProperties) -> str:
 def _sent_back_properties(properties: pika.BasicProperties, user_id: str) -> pika.BasicProperties:
     """Return the properties of the copy sent back: the message's own, as it was dead-lettered.
 
-    Its headers lose only those RabbitMQ sets itself. The dead-letter headers stay, so that the
-    Executor gives the message its retry rounds again. The `user_id` must be the user of this
-    connection, so a message RabbitMQ dead-lettered itself, whose `user_id` names its creator, keeps
-    the creator in `x-kicak-original-publisher` if the header is missing.
+    Its headers lose those RabbitMQ sets itself, and `CC` and `BCC`, which would route the copy
+    to other queues too. The dead-letter headers stay, so that the Executor gives the message its
+    retry rounds again. The `user_id` must be the user of this connection, so a message RabbitMQ
+    dead-lettered itself, whose `user_id` names its creator, keeps the creator in
+    `x-kicak-original-publisher` if the header is missing.
     """
     headers = {
         name: value
         for name, value in (properties.headers or {}).items()
-        if name not in _BROKER_HEADERS and not name.startswith(_BROKER_HEADER_PREFIXES)
+        if name not in _BROKER_HEADERS
+        and name not in _ROUTING_HEADERS
+        and not name.startswith(_BROKER_HEADER_PREFIXES)
     }
     if _ORIGINAL_PUBLISHER_HEADER not in headers and properties.user_id:
         headers[_ORIGINAL_PUBLISHER_HEADER] = properties.user_id

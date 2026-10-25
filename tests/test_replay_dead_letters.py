@@ -218,6 +218,9 @@ def test_copy_keeps_the_message_and_its_dead_letter_headers_but_not_rabbitmq_s()
             "x-delivery-count": 3,
             "x-first-death-queue": "classifier",
             "x-last-death-reason": "expired",
+            # Sender-selected routing: RabbitMQ would also deliver the copy to these queues
+            "CC": ["other-queue"],
+            "BCC": ["other-queue"],
             "x-kicak-retry-round": 5,
             "x-kicak-dead-letter-reason": "retries-exhausted",
             "x-kicak-original-publisher": "injector",

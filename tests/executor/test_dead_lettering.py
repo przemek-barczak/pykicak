@@ -193,6 +193,9 @@ def test_dead_letter_copy_records_why_when_and_from_which_queue(config, clock):
             "x-death": [{"queue": "input-queue.retry", "reason": "expired", "count": 1}],
             "x-delivery-count": 3,
             "x-first-death-queue": "input-queue.retry",
+            # Sender-selected routing: RabbitMQ would also deliver the copy to these
+            "CC": ["input-queue"],
+            "BCC": ["input-queue"],
             "x-kicak-retry-round": 2,
             "x-kicak-retrying-since": "2026-09-30T08:00:00+00:00",
             "x-kicak-published-at": "2026-09-30T08:30:00+00:00",

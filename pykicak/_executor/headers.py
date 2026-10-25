@@ -34,6 +34,9 @@ _TRUNCATION_MARK = "…"
 # Headers RabbitMQ sets itself; a copy must not carry stale ones, e.g. a quorum delivery count
 _BROKER_HEADERS = frozenset({"x-death", "x-delivery-count"})
 _BROKER_HEADER_PREFIXES = ("x-first-death-", "x-last-death-")
+# Sender-selected distribution: RabbitMQ also routes a message to the routing keys these name, so
+# a copy keeping them, e.g. `CC` naming the source queue, would also reach queues it is not for
+_ROUTING_HEADERS = frozenset({"CC", "BCC"})
 
 
 def _was_dead_lettered(headers: Mapping[str, object] | None) -> bool:
@@ -48,11 +51,12 @@ def _was_dead_lettered(headers: Mapping[str, object] | None) -> bool:
 def _copied_headers(headers: Mapping[str, object] | None) -> dict[str, object]:
     """Return the headers of a delivery that a copy the executor publishes of it keeps.
 
-    RabbitMQ's own headers are dropped, and so are the reasons of an earlier dead-lettering, which
-    a message sent back from a dead-letter queue still carries, together with its retry headers,
-    because its retry rounds start again (see `_retry_round_of()`).
+    RabbitMQ's own headers are dropped, and so are `CC` and `BCC`, which would route the copy to
+    other queues too, and the reasons of an earlier dead-lettering, which a message sent back from
+    a dead-letter queue still carries, together with its retry headers, because its retry rounds
+    start again (see `_retry_round_of()`).
     """
-    dropped = _DEAD_LETTER_HEADERS
+    dropped = _DEAD_LETTER_HEADERS | _ROUTING_HEADERS
     if _was_dead_lettered(headers):
         dropped |= _RETRY_HEADERS
     return {

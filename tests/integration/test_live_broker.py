@@ -474,6 +474,45 @@ def test_executor_retries_a_transient_failure_through_its_retry_queue(config, to
 
 
 @pytest.mark.parametrize("queue_type", list(QueueType))
+def test_retry_copy_of_a_message_with_cc_headers_waits_in_the_retry_queue(
+    config, topology, queue_type
+):
+    # Another publisher's CC header names the source queue; a copy keeping it would reach the
+    # source queue at once, besides the retry queue, and skip the retry delay
+    inject_exchange = topology.exchange("inject")
+    names = topology.executor_topology("source", inject_exchange)
+    source_queue = names["source_queue"]
+    message = IntegrationMessage(message_id="routed", payload="unavailable")
+
+    with RecordingTerminator(
+        config,
+        queue_type=queue_type,
+        max_processing_attempts=1,
+        retry_delay_seconds=30,
+        **names,
+    ) as executor:
+        executor.channel.basic_publish(
+            exchange=inject_exchange,  # a fanout exchange, which ignores CC itself
+            routing_key="",
+            body=message.to_bytes(),
+            properties=pika.BasicProperties(
+                type=IntegrationMessage.kicak_type,
+                message_id="routed",
+                headers={"CC": [source_queue], "BCC": [source_queue]},
+            ),
+        )
+        executor.handle_next_delivery(source_queue)  # fails: moved to the retry queue
+        _wait_for_ready_messages(config, f"{source_queue}.retry")
+        time.sleep(0.5)  # a copy routed to the source queue too would be there by now
+        # Stop consuming, so a copy the consumer was sent returns to the queue and is counted
+        executor.channel.cancel()
+
+        assert executor.get_info().counts == ExecutorCounts(moved_to_retry=1)
+        assert _ready_message_count(config, source_queue)[0] == 0
+        assert _ready_message_count(config, f"{source_queue}.retry")[0] == 1
+
+
+@pytest.mark.parametrize("queue_type", list(QueueType))
 def test_executor_dead_letters_a_message_that_used_up_its_retry_rounds(
     config, topology, queue_type
 ):

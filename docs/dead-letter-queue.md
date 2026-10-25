@@ -17,7 +17,8 @@ The copy keeps the body, the `message_id` property exactly as the message arrive
 the same ID, and the other properties, its `type` included, so it can be replayed as the same
 version of the message. It keeps the message's headers, its retry headers `x-kicak-retry-round` and
 `x-kicak-retrying-since` and its `x-kicak-published-at` included, as its history, except the headers
-RabbitMQ manages itself. It never expires. Its `user_id` becomes the Executor's own user, while its
+RabbitMQ manages itself and the routing headers `CC` and `BCC`, with which RabbitMQ would also
+deliver the copy to the queues they name. It never expires. Its `user_id` becomes the Executor's own user, while its
 `x-kicak-original-publisher` header keeps naming the agent that created the message (see [Who
 published a message](delivery-guarantees.md#who-published-a-message)). It also gets headers that say
 why, when, and from where:

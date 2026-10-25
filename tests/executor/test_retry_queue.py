@@ -167,6 +167,9 @@ def test_retry_copy_keeps_application_properties_but_not_rabbitmq_headers(config
             "x-delivery-count": 3,
             "x-first-death-queue": "input-queue",
             "x-last-death-reason": "rejected",
+            # Sender-selected routing: RabbitMQ would also deliver the copy to these at once
+            "CC": ["input-queue"],
+            "BCC": ["input-queue"],
         },
     )
     channel.queue_deliveries(
