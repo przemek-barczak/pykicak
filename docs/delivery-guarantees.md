@@ -99,6 +99,12 @@ refuses its [client certificate](configuration.md#client-certificates-mutual-tls
 for every failed attempt; alert on a status that stays `"UPSTREAM_RECOVER"`, on those warnings, or
 on the queue having no consumer.
 
+A server that accepts the connection but never completes the AMQP handshake, such as a broker that
+is still starting or overloaded, or a proxy in front of one that is down, is a connection error too:
+after pika's handshake timeout (15 seconds) the attempt fails with pika's
+`AMQPConnectorStackTimeout` and is retried. An Executor reconnects, and an Injector makes its three
+attempts.
+
 An Injector's connection fails with `ConnectionBlockedTimeout` after RabbitMQ has blocked it for
 `blocked_timeout_seconds` (60 by default) because of a memory or disk alarm, and the attempt is
 retried like other connection errors.

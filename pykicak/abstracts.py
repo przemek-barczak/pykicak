@@ -17,6 +17,7 @@ from typing import Self, TypeVar
 
 import pika
 from pika.adapters.blocking_connection import BlockingChannel
+from pika.adapters.utils.connection_workflow import AMQPConnectorStackTimeout
 from pika.exceptions import (
     AMQPConnectionError,
     ChannelWrongStateError,
@@ -34,6 +35,10 @@ _RETRYABLE_RABBITMQ_ERRORS = (
     ChannelWrongStateError,
     OSError,
     TimeoutError,
+    # pika's BlockingConnection raises it, not wrapped in AMQPConnectionError, when a server
+    # accepts the TCP connection but does not complete the AMQP handshake in time, e.g. a broker
+    # still starting or overloaded, or a proxy in front of one that is down
+    AMQPConnectorStackTimeout,
 )
 _MAX_HEARTBEAT_SECONDS = 65535  # AMQP 0-9-1 encodes the heartbeat timeout in 16 bits
 _MAX_NAME_BYTES = 255  # AMQP carries queue and exchange names as short strings
