@@ -21,6 +21,7 @@ import threading
 import time
 import uuid
 from collections.abc import Iterator, Sequence
+from datetime import datetime
 from typing import Any, cast
 
 import pika
@@ -28,9 +29,12 @@ import pytest
 from pika.exceptions import UnroutableError
 from pika.spec import Basic
 
-from pykicak.abstracts import _tls_options
+from examples.replay_dead_letters import replay_dead_letters
+from pykicak._executor.topology import _AT_LEAST_ONCE_DEAD_LETTERING, _ExecutorTopology
 from pykicak.config import KicakConfig
 from pykicak.executor import (
+    DeadLetterCounts,
+    ExecutorCounts,
     KicakExecutorAbstract,
     MalformedMessageError,
     QueueType,
@@ -38,6 +42,7 @@ from pykicak.executor import (
 )
 from pykicak.injector import InjectionError, KicakInjectorAbstract
 from pykicak.messages import KicakMessage
+from pykicak.tls import tls_options
 
 pytestmark = pytest.mark.integration
 
@@ -75,9 +80,13 @@ class OneShotInjectorV2(OneShot[IntegrationMessageV2]):
 
 
 class RecordingAgent[M: KicakMessage, R: KicakMessage | None](KicakExecutorAbstract[M, R]):
-    """Forwards messages if it has a destination; payloads "reject"/"flaky" exercise failures."""
+    """Forwards messages if it has a destination; some payloads exercise failures.
+
+    "reject" is malformed, "flaky" fails transiently once, and "unavailable" always.
+    """
 
     def __init__(self, config: KicakConfig, **topology) -> None:
+        topology.setdefault("max_retry_rounds", 10)  # more than any test uses up
         super().__init__(config, **topology)
         self.received: list[M] = []
         self._last_properties: pika.BasicProperties | None = None
@@ -95,8 +104,10 @@ class RecordingAgent[M: KicakMessage, R: KicakMessage | None](KicakExecutorAbstr
             raise MalformedMessageError("rejected by the test")
         if payload == "flaky" and len(self.received) == 1:
             raise TransientProcessingError("first attempt fails")
+        if payload == "unavailable":
+            raise TransientProcessingError("service unavailable")
         # Only the forwarding RecordingExecutor has a destination, and it publishes what it accepts
-        return cast(R, message) if self._destination_exchange is not None else None
+        return cast(R, message) if self._topology.destination_exchange is not None else None
 
     def handle_next_delivery(self, queue: str) -> Basic.Deliver:
         """Handle one delivery through the executor's real decode/execute/settle path."""
@@ -105,7 +116,7 @@ class RecordingAgent[M: KicakMessage, R: KicakMessage | None](KicakExecutorAbstr
         )
         assert method is not None, f"No delivery on {queue} within {_DELIVERY_TIMEOUT_SECONDS}s"
         self._last_properties = properties
-        assert self._handle_delivery(method.delivery_tag, properties, body)
+        assert self._handle_delivery(method.delivery_tag, method.redelivered, properties, body)
         return method
 
 
@@ -179,7 +190,7 @@ def _open_connection(config: KicakConfig) -> pika.BlockingConnection:
             port=config.rabbitmq_port,
             virtual_host=config.rabbitmq_virtual_host,
             credentials=pika.PlainCredentials(config.rabbitmq_username, config.rabbitmq_password),
-            ssl_options=_tls_options(config),
+            ssl_options=tls_options(config),
         )
     )
 
@@ -321,6 +332,23 @@ def test_every_message_names_its_verified_user_and_its_original_publisher(config
     assert foreign_result.headers["x-kicak-original-publisher"] == user
     # ...and a retry copy keeps the creator of the message
     assert retry_copy.headers["x-kicak-original-publisher"] == "origin-user"
+    # Every message an agent publishes, and every retry copy, says when it was published,
+    # including the copy of the foreign message, which had no such header
+    published_at = {
+        name: datetime.fromisoformat(properties.headers["x-kicak-published-at"])
+        for name, properties in (
+            ("from_injector", from_injector),
+            ("injected_result", injected_result),
+            ("retry_copy", retry_copy),
+            ("foreign_result", foreign_result),
+        )
+    }
+    assert all(time.utcoffset() is not None for time in published_at.values())
+    # In the order they were published: the foreign message failed, and was copied to the
+    # retry queue, before the injected message was executed
+    assert published_at["from_injector"] <= published_at["retry_copy"]
+    assert published_at["retry_copy"] <= published_at["injected_result"]
+    assert published_at["injected_result"] <= published_at["foreign_result"]
 
 
 @pytest.mark.parametrize("queue_type", list(QueueType))
@@ -339,10 +367,16 @@ def test_executor_dead_letters_undecodable_message(config, topology, queue_type)
         properties, body = _get_dead_letter(executor.channel, _dead_letter_queue(names))
 
     assert executor.received == []
+    assert executor.get_info().counts == ExecutorCounts(dead_lettered=DeadLetterCounts(malformed=1))
     assert body == b"not json"
-    death = properties.headers["x-death"][0]
-    assert death["reason"] == "rejected"
-    assert death["queue"] == names["source_queue"]
+    headers = properties.headers
+    assert "x-death" not in headers  # the executor's copy: RabbitMQ did not dead-letter it
+    assert headers["x-kicak-dead-letter-reason"] == "malformed"
+    assert headers["x-kicak-error-type"] == "pykicak.executor.MalformedMessageError"
+    assert headers["x-kicak-error-message"].startswith("Could not decode message as")
+    assert headers["x-kicak-dead-lettered-from"] == names["source_queue"]
+    assert datetime.fromisoformat(headers["x-kicak-dead-lettered-at"]).tzinfo is not None
+    assert properties.user_id == config.rabbitmq_username
 
 
 @pytest.mark.parametrize("queue_type", list(QueueType))
@@ -379,7 +413,8 @@ def test_executor_accepts_the_versions_it_declares_and_dead_letters_others(
     # The version nobody accepts is kept in the dead-letter queue, with its type
     assert body == unknown.to_bytes()
     assert properties.type == "integration.v3"
-    assert properties.headers["x-death"][0]["reason"] == "rejected"
+    assert properties.headers["x-kicak-dead-letter-reason"] == "malformed"
+    assert "'integration.v3', which is not accepted" in properties.headers["x-kicak-error-message"]
 
 
 @pytest.mark.parametrize("queue_type", list(QueueType))
@@ -397,6 +432,8 @@ def test_executor_dead_letters_message_rejected_by_execute(config, topology, que
     assert IntegrationMessage.from_bytes(body) == message
     assert properties.message_id == "reject"
     assert properties.content_type == "application/json"
+    assert properties.headers["x-kicak-dead-letter-reason"] == "malformed"
+    assert properties.headers["x-kicak-original-publisher"] == config.rabbitmq_username
 
 
 @pytest.mark.parametrize("queue_type", list(QueueType))
@@ -425,6 +462,7 @@ def test_executor_retries_a_transient_failure_through_its_retry_queue(config, to
         dead_letter = executor.channel.basic_get(_dead_letter_queue(names), auto_ack=True)
 
     assert executor.received == [flaky, behind, flaky]
+    assert executor.get_info().counts == ExecutorCounts(completed=2, moved_to_retry=1)
     assert returned_after >= 0.9
     assert returned.headers["x-kicak-retry-round"] == 1
     assert returned.expiration is None  # RabbitMQ removes it on the way back
@@ -433,6 +471,137 @@ def test_executor_retries_a_transient_failure_through_its_retry_queue(config, to
     assert returned.headers["x-kicak-original-publisher"] == config.rabbitmq_username
     assert dead_letter[0] is None
     assert _ready_message_count(config, f"{names['source_queue']}.retry") == (0, 0)
+
+
+@pytest.mark.parametrize("queue_type", list(QueueType))
+def test_retry_copy_of_a_message_with_cc_headers_waits_in_the_retry_queue(
+    config, topology, queue_type
+):
+    # Another publisher's CC header names the source queue; a copy keeping it would reach the
+    # source queue at once, besides the retry queue, and skip the retry delay
+    inject_exchange = topology.exchange("inject")
+    names = topology.executor_topology("source", inject_exchange)
+    source_queue = names["source_queue"]
+    message = IntegrationMessage(message_id="routed", payload="unavailable")
+
+    with RecordingTerminator(
+        config,
+        queue_type=queue_type,
+        max_processing_attempts=1,
+        retry_delay_seconds=30,
+        **names,
+    ) as executor:
+        executor.channel.basic_publish(
+            exchange=inject_exchange,  # a fanout exchange, which ignores CC itself
+            routing_key="",
+            body=message.to_bytes(),
+            properties=pika.BasicProperties(
+                type=IntegrationMessage.kicak_type,
+                message_id="routed",
+                headers={"CC": [source_queue], "BCC": [source_queue]},
+            ),
+        )
+        executor.handle_next_delivery(source_queue)  # fails: moved to the retry queue
+        _wait_for_ready_messages(config, f"{source_queue}.retry")
+        time.sleep(0.5)  # a copy routed to the source queue too would be there by now
+        # Stop consuming, so a copy the consumer was sent returns to the queue and is counted
+        executor.channel.cancel()
+
+        assert executor.get_info().counts == ExecutorCounts(moved_to_retry=1)
+        assert _ready_message_count(config, source_queue)[0] == 0
+        assert _ready_message_count(config, f"{source_queue}.retry")[0] == 1
+
+
+@pytest.mark.parametrize("queue_type", list(QueueType))
+def test_executor_dead_letters_a_message_that_used_up_its_retry_rounds(
+    config, topology, queue_type
+):
+    inject_exchange = topology.exchange("inject")
+    names = topology.executor_topology("source", inject_exchange)
+    message = IntegrationMessage(message_id="unavailable", payload="unavailable")
+
+    with RecordingTerminator(
+        config,
+        queue_type=queue_type,
+        max_processing_attempts=1,
+        max_retry_rounds=1,
+        retry_delay_seconds=0.2,
+        **names,
+    ) as executor:
+        with OneShotInjector(config, inject_exchange, message) as injector:
+            injector.publish(message)
+        executor.handle_next_delivery(names["source_queue"])  # fails: moved to the retry queue
+        executor.handle_next_delivery(names["source_queue"])  # fails again: no rounds left
+        properties, body = _get_dead_letter(executor.channel, _dead_letter_queue(names))
+
+    assert executor.received == [message, message]
+    assert executor.get_info().counts == ExecutorCounts(
+        dead_lettered=DeadLetterCounts(retries_exhausted=1), moved_to_retry=1
+    )
+    assert IntegrationMessage.from_bytes(body) == message
+    headers = properties.headers
+    assert headers["x-kicak-dead-letter-reason"] == "retries-exhausted"
+    assert headers["x-kicak-error-type"] == "pykicak.executor.TransientProcessingError"
+    assert headers["x-kicak-error-message"] == "service unavailable"
+    assert headers["x-kicak-retry-round"] == 1
+    assert datetime.fromisoformat(headers["x-kicak-retrying-since"]).tzinfo is not None
+    assert _ready_message_count(config, f"{names['source_queue']}.retry") == (0, 0)
+
+
+@pytest.mark.parametrize("queue_type", list(QueueType))
+def test_dead_letters_sent_back_by_the_example_tool_get_their_retry_rounds_again(
+    config, topology, queue_type
+):
+    inject_exchange = topology.exchange("inject")
+    names = topology.executor_topology("source", inject_exchange)
+    source_queue = names["source_queue"]
+    unavailable = IntegrationMessage(message_id="unavailable", payload="unavailable")
+    rejected = IntegrationMessage(message_id="reject", payload="reject")
+
+    with RecordingTerminator(
+        config,
+        queue_type=queue_type,
+        max_processing_attempts=1,
+        max_retry_rounds=1,
+        retry_delay_seconds=0.2,
+        **names,
+    ) as executor:
+        with OneShotInjector(config, inject_exchange, unavailable) as injector:
+            injector.publish(unavailable)
+            injector.publish(rejected)
+        executor.handle_next_delivery(source_queue)  # unavailable: moved to the retry queue
+        executor.handle_next_delivery(source_queue)  # rejected: dead-lettered as malformed
+        executor.handle_next_delivery(source_queue)  # unavailable again: dead-lettered
+        _wait_for_ready_messages(config, _dead_letter_queue(names), 2)
+
+        dry_run = replay_dead_letters(config, source_queue, {"retries-exhausted"}, dry_run=True)
+        assert _ready_message_count(config, _dead_letter_queue(names)) == (2, 0)
+        report = replay_dead_letters(config, source_queue, {"retries-exhausted"})
+
+        # The malformed message stays in the dead-letter queue
+        assert _ready_message_count(config, _dead_letter_queue(names)) == (1, 0)
+        executor.handle_next_delivery(source_queue)  # sent back: its rounds start again
+        sent_back = executor.last_properties
+        executor.handle_next_delivery(source_queue)  # back from the retry queue: no rounds left
+        properties, _body = _get_dead_letter(executor.channel, _dead_letter_queue(names))
+        if properties.headers["x-kicak-dead-letter-reason"] == "malformed":
+            properties, _body = _get_dead_letter(executor.channel, _dead_letter_queue(names))
+
+    assert dry_run.sent_back == {"retries-exhausted": 1}
+    assert report.sent_back == {"retries-exhausted": 1}
+    assert report.left == {"malformed": 1}
+    # Sent back as it was dead-lettered, by the tool's own (verified) user
+    assert sent_back.message_id == "unavailable"
+    assert sent_back.type == IntegrationMessage.kicak_type
+    assert sent_back.user_id == config.rabbitmq_username
+    assert sent_back.headers["x-kicak-dead-letter-reason"] == "retries-exhausted"
+    assert sent_back.headers["x-kicak-original-publisher"] == config.rabbitmq_username
+    # It was moved to the retry queue once more, as round 1, then dead-lettered again
+    assert executor.get_info().counts == ExecutorCounts(
+        dead_lettered=DeadLetterCounts(malformed=1, retries_exhausted=2), moved_to_retry=2
+    )
+    assert properties.headers["x-kicak-dead-letter-reason"] == "retries-exhausted"
+    assert properties.headers["x-kicak-retry-round"] == 1
 
 
 @pytest.mark.parametrize(
@@ -447,7 +616,8 @@ def test_executor_declares_both_queues_with_the_requested_type(
     with RecordingTerminator(config, queue_type=queue_type, **names):
         pass
 
-    # RabbitMQ reports no queue type on declare, but rejects a redeclaration with another type.
+    # RabbitMQ reports no queue arguments on declare, but accepts a redeclaration only with the
+    # same ones: the first declaration checks them all, the second the type
     connection = _open_connection(config)
     try:
         retry_arguments = {
@@ -459,12 +629,9 @@ def test_executor_declares_both_queues_with_the_requested_type(
             (_dead_letter_queue(names), {}),
             (f"{names['source_queue']}.retry", retry_arguments),
         ):
-            if queue.endswith(".retry") and queue_type == QueueType.QUORUM:
-                arguments = {
-                    **arguments,
-                    "x-dead-letter-strategy": "at-least-once",
-                    "x-overflow": "reject-publish",
-                }
+            # Quorum queues that dead-letter messages do so at least once
+            if not queue.endswith(".dlq") and queue_type == QueueType.QUORUM:
+                arguments = {**arguments, **_AT_LEAST_ONCE_DEAD_LETTERING}
             connection.channel().queue_declare(
                 queue=queue, durable=True, arguments={**arguments, "x-queue-type": queue_type}
             )
@@ -475,6 +642,29 @@ def test_executor_declares_both_queues_with_the_requested_type(
             assert raised.value.reply_code == 406
     finally:
         connection.close()
+
+
+def test_quorum_executor_refuses_an_input_queue_that_dead_letters_at_most_once(config, topology):
+    # e.g. declared by pykicak before 0.4.0: RabbitMQ refuses to change a queue's arguments
+    names = topology.executor_topology("source", topology.exchange("inject"))
+    _with_broker_channel(
+        config,
+        lambda channel: channel.queue_declare(
+            queue=names["source_queue"],
+            durable=True,
+            arguments={
+                "x-dead-letter-exchange": _dead_letter_exchange(names),
+                "x-queue-type": QueueType.QUORUM,
+            },
+        ),
+    )
+    executor = RecordingTerminator(config, queue_type=QueueType.QUORUM, **names)
+
+    with pytest.raises(pika.exceptions.ChannelClosedByBroker) as raised:
+        executor.connect()
+
+    assert raised.value.reply_code == 406
+    assert "x-dead-letter-strategy" in raised.value.reply_text
 
 
 def test_classic_executor_accepts_queues_declared_without_queue_type(config, topology):
@@ -494,6 +684,120 @@ def test_classic_executor_accepts_queues_declared_without_queue_type(config, top
 
     with RecordingTerminator(config, **names) as executor:
         assert executor.channel.is_open
+
+
+_RETURN_ROUNDS = 25
+"""More deliveries than the 21 after which a quorum queue's default delivery limit dead-letters."""
+
+
+def _poll_for_message(channel, queue: str) -> tuple[Any, Any]:
+    """Take the next message of `queue`, unacknowledged; (None, None) if none comes within 1 s."""
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline:
+        method, properties, _body = channel.basic_get(queue=queue, auto_ack=False)
+        if method is not None:
+            return method, properties
+        time.sleep(0.02)
+    return None, None
+
+
+def _headers_until_dead_lettered(
+    config: KicakConfig, queue: str, *, requeue: bool
+) -> list[dict[str, Any]]:
+    """Take the message waiting in `queue` and return it, at most `_RETURN_ROUNDS` times.
+
+    It is returned with `basic_nack(requeue=True)`, or by closing the connection without settling
+    it, a failed delivery. Returns the headers of each delivery, until RabbitMQ dead-letters it.
+    """
+    delivered: list[dict[str, Any]] = []
+    connection = _open_connection(config)
+    try:
+        channel = connection.channel()
+        while len(delivered) < _RETURN_ROUNDS:
+            method, properties = _poll_for_message(channel, queue)
+            if method is None:
+                break
+            delivered.append(properties.headers or {})
+            if requeue:
+                channel.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+            else:
+                connection.close()
+                connection = _open_connection(config)
+                channel = connection.channel()
+    finally:
+        connection.close()
+    return delivered
+
+
+@pytest.mark.parametrize("requeue", [True, False], ids=["requeued", "connection-lost"])
+def test_quorum_delivery_limit_counts_what_the_queue_type_docs_say(config, topology, requeue):
+    # docs/topology.md, "Queue type": by default, a message delivered 21 times without success is
+    # dead-lettered. RabbitMQ 4.2 counts every return to the queue; 4.3 and newer count only
+    # failed deliveries, and count requeues in x-acquired-count, so a requeue loop never ends
+    names = topology.executor_topology("source", topology.exchange("inject"))
+    source_queue = names["source_queue"]
+    with RecordingTerminator(config, queue_type=QueueType.QUORUM, **names):
+        pass  # declares the queue and its dead-letter route as its Executor does
+    message = IntegrationMessage(message_id="returned", payload="returned")
+    _with_broker_channel(
+        config,
+        lambda channel: channel.basic_publish(
+            exchange="", routing_key=source_queue, body=message.to_bytes()
+        ),
+    )
+
+    delivered = _headers_until_dead_lettered(config, source_queue, requeue=requeue)
+
+    if requeue and _broker_version(config) >= (4, 3):
+        assert len(delivered) == _RETURN_ROUNDS
+        assert delivered[-1]["x-acquired-count"] == _RETURN_ROUNDS - 1
+        assert "x-delivery-count" not in delivered[-1]
+        assert _ready_message_count(config, _dead_letter_queue(names))[0] == 0
+    else:
+        assert len(delivered) == 21
+        assert delivered[-1]["x-delivery-count"] == 20
+        connection = _open_connection(config)
+        try:
+            properties, _body = _get_dead_letter(connection.channel(), _dead_letter_queue(names))
+        finally:
+            connection.close()
+        assert [death["reason"] for death in properties.headers["x-death"]] == ["delivery_limit"]
+
+
+def test_retry_copy_drops_the_counts_rabbitmq_keeps_of_a_returned_message(config, topology):
+    inject_exchange = topology.exchange("inject")
+    names = topology.executor_topology("source", inject_exchange)
+    source_queue = names["source_queue"]
+    message = IntegrationMessage(message_id="returned", payload="unavailable")
+
+    def requeue_once(channel) -> None:
+        method, _properties = _poll_for_message(channel, source_queue)
+        assert method is not None
+        channel.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+
+    with RecordingTerminator(
+        config,
+        queue_type=QueueType.QUORUM,
+        max_processing_attempts=1,
+        retry_delay_seconds=30,
+        **names,
+    ) as executor:
+        with OneShotInjector(config, inject_exchange, message) as injector:
+            injector.publish(message)
+        # RabbitMQ counts the requeue in x-delivery-count on 4.2, in x-acquired-count on 4.3+
+        _with_broker_channel(config, requeue_once)
+        executor.handle_next_delivery(source_queue)  # fails: moved to the retry queue
+        counted = executor.last_properties.headers
+        _wait_for_ready_messages(config, f"{source_queue}.retry")
+        method, properties, _body = executor.channel.basic_get(
+            queue=f"{source_queue}.retry", auto_ack=True
+        )
+
+    rabbitmq_counts = {"x-delivery-count", "x-acquired-count"}
+    assert rabbitmq_counts & set(counted)
+    assert method is not None
+    assert not rabbitmq_counts & set(properties.headers)
+    assert properties.headers["x-kicak-retry-round"] == 1
 
 
 def test_injector_raises_when_no_queue_is_bound(config, topology):
@@ -617,6 +921,29 @@ def test_executor_recreates_a_deleted_downstream_queue_as_its_own_executor_decla
     assert [m.message_id for m in downstream_executor.received] == ["hello"]
 
 
+def _as_topology_class[T: _ExecutorTopology](
+    topology: _ExecutorTopology, topology_class: type[T]
+) -> T:
+    """Return `topology` as an instance of `topology_class`, which changes how it is declared."""
+    fields = {field.name: getattr(topology, field.name) for field in dataclasses.fields(topology)}
+    return topology_class(**fields)
+
+
+class _RacingTopology(_ExecutorTopology):
+    """Loses the downstream bindings right after declaring the output side the second time."""
+
+    output_declarations = 0
+
+    def declare_output_side(self, channel) -> None:
+        super().declare_output_side(channel)
+        # The topology is a frozen dataclass, whose __setattr__ fails for a subclass on Python
+        # 3.12 when it is slotted
+        object.__setattr__(self, "output_declarations", self.output_declarations + 1)
+        if self.output_declarations == 2:  # 1 is on connecting, 2 right before publishing
+            for queue in self.destination_queues:
+                channel.queue_unbind(queue=queue, exchange=self.destination_exchange)
+
+
 class BindingRaceExecutor(RecordingExecutor):
     """Loses its downstream bindings right after verifying the output side the first time.
 
@@ -626,14 +953,12 @@ class BindingRaceExecutor(RecordingExecutor):
 
     def __init__(self, config: KicakConfig, **topology) -> None:
         super().__init__(config, **topology)
-        self.output_verifications = 0
+        self._topology = _as_topology_class(self._topology, _RacingTopology)
 
-    def _declare_output_side(self, channel) -> None:
-        super()._declare_output_side(channel)
-        self.output_verifications += 1
-        if self.output_verifications == 2:  # 1 is on connecting, 2 right before publishing
-            for queue in self._destination_queues:
-                channel.queue_unbind(queue=queue, exchange=self._destination_exchange)
+    @property
+    def output_verifications(self) -> int:
+        """How often it declared its output side."""
+        return cast(_RacingTopology, self._topology).output_declarations
 
 
 def test_executor_holds_unroutable_results_and_publishes_them_without_executing_again(
@@ -729,7 +1054,7 @@ def test_executor_declares_its_dead_letter_exchange_again_before_dead_lettering(
         properties, body = _get_dead_letter(executor.channel, _dead_letter_queue(names))
 
     assert IntegrationMessage.from_bytes(body) == message
-    assert properties.headers["x-death"][0]["reason"] == "rejected"
+    assert properties.headers["x-kicak-dead-letter-reason"] == "malformed"
 
 
 class ResultSizeExecutor(RecordingExecutor):
@@ -780,7 +1105,7 @@ def test_executor_dead_letters_input_whose_result_is_too_large(config, topology)
     finally:
         connection.close()
     assert IntegrationMessage.from_bytes(body).message_id == "huge"
-    assert properties.headers["x-death"][0]["reason"] == "rejected"
+    assert properties.headers["x-kicak-dead-letter-reason"] == "result-too-large"
 
 
 @pytest.mark.parametrize("queue_type", list(QueueType))
@@ -957,6 +1282,18 @@ class _ConsumerTimeoutChannel:
         return self._channel.queue_declare(arguments={**arguments, **timeout}, **parameters)
 
 
+class _TimingOutTopology(_ExecutorTopology):
+    """Declares the source queue with a short `x-consumer-timeout`, and every other one as usual.
+
+    The other queues, e.g. a destination queue, are declared as their own consumers declare them.
+    """
+
+    def declare_input_queue(self, channel, queue_name: str) -> None:
+        if queue_name == self.source_queue:
+            channel = _ConsumerTimeoutChannel(channel)
+        super().declare_input_queue(channel, queue_name)
+
+
 class TimedOutTerminator(RecordingTerminator):
     """Holds its first message until RabbitMQ's consumer timeout takes it back, then stops after
     executing the redelivery.
@@ -969,14 +1306,14 @@ class TimedOutTerminator(RecordingTerminator):
 
     def __init__(self, config: KicakConfig, **topology) -> None:
         super().__init__(config, **topology)
+        self._topology = _as_topology_class(self._topology, _TimingOutTopology)
         self._test_config = config
-
-    def _declare_input_queue(self, channel, queue_name: str) -> None:
-        super()._declare_input_queue(_ConsumerTimeoutChannel(channel), queue_name)
+        self.redelivered: list[bool | None] = []  # as get_info() reports it for each execution
 
     def execute(self, message: IntegrationMessage) -> None:
+        self.redelivered.append(self.get_info().redelivered)
         if not self.received:
-            _wait_until_unconsumed(self._test_config, self._source_queue)
+            _wait_until_unconsumed(self._test_config, self._topology.source_queue)
         else:
             self.stop()
         super().execute(message)
@@ -991,18 +1328,14 @@ class TimedOutExecutor(RecordingExecutor):
 
     def __init__(self, config: KicakConfig, **topology) -> None:
         super().__init__(config, **topology)
+        self._topology = _as_topology_class(self._topology, _TimingOutTopology)
         self._test_config = config
-
-    def _declare_input_queue(self, channel, queue_name: str) -> None:
-        if queue_name == self._source_queue:
-            channel = _ConsumerTimeoutChannel(channel)
-        super()._declare_input_queue(channel, queue_name)
 
     def execute(
         self, message: IntegrationMessage
     ) -> IntegrationMessage | Sequence[IntegrationMessage] | None:
         if not self.received:
-            _wait_until_unconsumed(self._test_config, self._source_queue)
+            _wait_until_unconsumed(self._test_config, self._topology.source_queue)
         else:
             self.stop()
         return super().execute(message)
@@ -1058,7 +1391,10 @@ def test_terminator_reconnects_when_its_delivery_outlasts_the_consumer_timeout(
         assert "cancelled the consumer" in warning.getMessage()
     # ...so the executor reconnected and executed the redelivered message again
     assert executor.received == [message, message]
-    assert executor.get_info().status == "STOPPED"
+    assert executor.redelivered == [False, True]
+    info = executor.get_info()
+    assert info.status == "STOPPED"
+    assert info.counts == ExecutorCounts(completed=1, abandoned=1)
     assert _ready_message_count(config, names["source_queue"]) == (0, 0)
 
 
@@ -1213,6 +1549,28 @@ def test_injector_run_publishes_on_a_short_lived_connection(config, topology):
 
     assert executor.received == [message]
     assert injector._connection is None
+
+
+def test_statistics_lines_of_an_injection_and_its_delivery_agree(config, topology, caplog):
+    caplog.set_level("INFO", logger="pykicak")
+    inject_exchange = topology.exchange("inject")
+    names = topology.executor_topology("source", inject_exchange)
+    message = IntegrationMessage(message_id="measured", payload="measured")
+
+    with RecordingTerminator(config, **names) as executor:
+        OneShotInjector(config, inject_exchange, message).run()
+        executor.handle_next_delivery(names["source_queue"])
+
+    [injected] = [vars(r)["kicak"] for r in caplog.records if r.message.startswith("Message inj")]
+    [handled] = [vars(r)["kicak"] for r in caplog.records if r.message.startswith("Message hand")]
+    assert (injected["outcome"], injected["attempts"]) == ("injected", 1)
+    assert injected["connect_seconds"] > 0  # a real connection, opened for this injection
+    assert injected["publish_seconds"] > 0  # until RabbitMQ confirmed it
+    assert handled["outcome"] == "completed"
+    # The body crossed the broker unchanged, and its publish time came with it
+    assert handled["input_bytes"] == injected["message_bytes"] == len(message.to_bytes())
+    assert handled["queued_seconds"] is not None
+    assert -1 < handled["queued_seconds"] < 60  # both stamps come from this host's clock
 
 
 def test_injector_run_raises_after_closing_when_no_queue_is_bound(config, topology):

@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import dataclasses
+import logging
+import sys
 import time
 from collections.abc import Callable
+from typing import Any
 
 import pika
+import pytest
 from pika.exceptions import ChannelClosedByBroker
 
 from pykicak.abstracts import KicakAbstract
@@ -82,6 +86,7 @@ class NackedDelivery:
 @dataclasses.dataclass
 class ConsumedMethod:
     delivery_tag: int
+    redelivered: bool = False
 
 
 class FakeChannelImpl:
@@ -120,7 +125,7 @@ class FakeChannel:
         self.before_delivery: Callable[[int], None] | None = None
         self.on_idle: Callable[[], None] | None = None
         self._impl = FakeChannelImpl()
-        self._pending_deliveries: list[tuple[bytes | None, pika.BasicProperties]] = []
+        self._pending_deliveries: list[tuple[bytes | None, pika.BasicProperties, bool]] = []
         self._delivered_delivery_tags: set[int] = set()
         self.transactional = False
         self.tx_select_calls = 0
@@ -239,14 +244,18 @@ class FakeChannel:
             callback(object())
 
     def queue_deliveries(
-        self, *bodies: bytes | None, properties: pika.BasicProperties | None = None
+        self,
+        *bodies: bytes | None,
+        properties: pika.BasicProperties | None = None,
+        redelivered: bool = False,
     ) -> None:
         """Test helper: queue up message bodies, with `properties`, for consume() to yield.
 
-        Without `properties`, each delivery has only the `type` property SAMPLE_TYPE.
+        Without `properties`, each delivery has only the `type` property SAMPLE_TYPE. With
+        `redelivered`, RabbitMQ flags them as delivered before.
         """
         delivered = properties if properties is not None else pika.BasicProperties(type=SAMPLE_TYPE)
-        self._pending_deliveries.extend((body, delivered) for body in bodies)
+        self._pending_deliveries.extend((body, delivered, redelivered) for body in bodies)
 
     def consume(self, queue: str, inactivity_timeout: float | None = None):
         """Yield the queued deliveries, then end the test with StopConsuming.
@@ -257,11 +266,11 @@ class FakeChannel:
         """
         self.prefetch_count_when_consuming = self.prefetch_count
         self.inactivity_timeout = inactivity_timeout
-        for index, (body, properties) in enumerate(self._pending_deliveries, start=1):
+        for index, (body, properties, redelivered) in enumerate(self._pending_deliveries, start=1):
             if self.before_delivery is not None:
                 self.before_delivery(index)
             self._delivered_delivery_tags.add(index)
-            yield ConsumedMethod(delivery_tag=index), properties, body
+            yield ConsumedMethod(delivery_tag=index, redelivered=redelivered), properties, body
         if self.on_idle is not None:
             for _ in range(1000):
                 self.on_idle()
@@ -305,3 +314,55 @@ class FakeConnection:
 
     def close(self) -> None:
         self.is_open = False
+
+
+def replace_in_pykicak(monkeypatch: pytest.MonkeyPatch, name: str, replacement: object) -> None:
+    """Replace `name`, e.g. the clock `_now`, in every pykicak module that defines or imported it.
+
+    A module that imported a function holds its own reference to it, so replacing it where it is
+    defined is not enough; this finds every holder, wherever the code using it lives.
+    """
+    for module_name, module in list(sys.modules.items()):
+        in_pykicak = module_name == "pykicak" or module_name.startswith("pykicak.")
+        if in_pykicak and hasattr(module, name):
+            monkeypatch.setattr(module, name, replacement)
+
+
+class FakeStopwatch:
+    """Stands in for `_monotonic()`, the clock of durations; tests move it forward explicitly.
+
+    Its steps are binary fractions, so the durations computed from it are exact.
+    """
+
+    def __init__(self) -> None:
+        self.current = 100.0
+
+    def advance(self, seconds: float) -> None:
+        self.current += seconds
+
+    def __call__(self) -> float:
+        return self.current
+
+
+def kicak_values(record: logging.LogRecord) -> dict[str, Any]:
+    """The values a statistics line carries, typed, as its record's `kicak` attribute."""
+    values: dict[str, Any] = vars(record)["kicak"]
+    return values
+
+
+def logged_pairs(record: logging.LogRecord) -> dict[str, str]:
+    """The key=value pairs of a record's text."""
+    return dict(token.split("=", 1) for token in record.getMessage().split() if "=" in token)
+
+
+def expected_pairs(values: dict[str, Any]) -> dict[str, str]:
+    """The key=value pairs a statistics line's text shows for `values`, its `kicak` attribute.
+
+    Durations to the millisecond, everything else as `str()` shows it; `event` names the line
+    and is not in its text.
+    """
+    return {
+        name: f"{value:.3f}" if name.endswith("_seconds") and value is not None else str(value)
+        for name, value in values.items()
+        if name != "event"
+    }

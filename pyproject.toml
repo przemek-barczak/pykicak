@@ -14,15 +14,15 @@ authors = [
 ]
 keywords = [
     "rabbitmq",
+    "amqp",
     "pika",
-    "messaging",
     "message-queue",
+    "messaging",
     "idempotent",
-    "at-least-once",
-    "dead-letter",
-    "agents",
-    "pipeline",
+    "at-least-once-delivery",
+    "dead-letter-queue",
     "distributed-systems",
+    "event-driven",
 ]
 # No license classifier: with an SPDX `license` expression, PEP 639 forbids one.
 classifiers = [
@@ -34,6 +34,7 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Topic :: System :: Distributed Computing",
     "Typing :: Typed",
@@ -68,6 +69,7 @@ dev = [
 [project.urls]
 Homepage = "https://github.com/przemek-barczak/pykicak"
 Repository = "https://github.com/przemek-barczak/pykicak"
+Documentation = "https://github.com/przemek-barczak/pykicak/blob/main/docs/README.md"
 Issues = "https://github.com/przemek-barczak/pykicak/issues"
 Changelog = "https://github.com/przemek-barczak/pykicak/blob/main/CHANGELOG.md"
 
@@ -75,8 +77,8 @@ Changelog = "https://github.com/przemek-barczak/pykicak/blob/main/CHANGELOG.md"
 version = { attr = "pykicak.__version__" }
 
 [tool.setuptools.packages.find]
-# Only the library is published (wheel and sdist); tests/ and examples/ stay in the repository,
-# and MANIFEST.in prunes them from the sdist.
+# Only the library is published (wheel and sdist); tests/, examples/, and docs/ stay in the
+# repository, and MANIFEST.in prunes them from the sdist.
 include = ["pykicak*"]
 
 [tool.setuptools.package-data]
@@ -102,7 +104,9 @@ show_missing = true
 line-length = 100
 
 [tool.ruff.lint]
-select = ["E4", "E7", "E9", "F", "W", "I", "B", "UP"]
+# C90 and the PLR rules keep functions small: at most a McCabe complexity of 10, 6 returns,
+# 12 branches, and 50 statements
+select = ["E4", "E7", "E9", "F", "W", "I", "B", "UP", "C90", "PLR0911", "PLR0912", "PLR0915"]
 
 [tool.mypy]
 python_version = "3.12"

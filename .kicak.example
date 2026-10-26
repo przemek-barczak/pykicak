@@ -19,3 +19,9 @@ RABBIT_MQ_TLS=false
 # Optional, with RABBIT_MQ_TLS=true only: trust only the CA certificates in this PEM file, e.g. the
 # private CA of a self-hosted broker. Without it, the CAs the operating system trusts are used.
 # RABBIT_MQ_CA_FILE=/etc/ssl/rabbitmq/ca.pem
+
+# Optional, with RABBIT_MQ_TLS=true only, and always together: the client certificate (PEM, may be
+# followed by its intermediate CA certificates) and its unencrypted private key, for a broker that
+# verifies its clients (mutual TLS). Most brokers do not; agents still log in with the password.
+# RABBIT_MQ_CERT_FILE=/etc/ssl/rabbitmq/agent.pem
+# RABBIT_MQ_KEY_FILE=/etc/ssl/rabbitmq/agent.key

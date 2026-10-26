@@ -4,17 +4,21 @@ from __future__ import annotations
 
 import abc
 import logging
+import math
 import os
 import socket
 import ssl
+import time
 import types
 import typing
 from collections.abc import Callable
+from datetime import UTC, datetime
 from types import NoneType, TracebackType
 from typing import Self, TypeVar
 
 import pika
 from pika.adapters.blocking_connection import BlockingChannel
+from pika.adapters.utils.connection_workflow import AMQPConnectorStackTimeout
 from pika.exceptions import (
     AMQPConnectionError,
     ChannelWrongStateError,
@@ -22,8 +26,9 @@ from pika.exceptions import (
     ProbableAuthenticationError,
 )
 
-from pykicak.config import KicakConfig, KicakConfigError
+from pykicak.config import KicakConfig
 from pykicak.messages import KicakMessage
+from pykicak.tls import tls_options
 
 logger = logging.getLogger(__name__)
 
@@ -32,12 +37,62 @@ _RETRYABLE_RABBITMQ_ERRORS = (
     ChannelWrongStateError,
     OSError,
     TimeoutError,
+    # pika's BlockingConnection raises it, not wrapped in AMQPConnectionError, when a server
+    # accepts the TCP connection but does not complete the AMQP handshake in time, e.g. a broker
+    # still starting or overloaded, or a proxy in front of one that is down
+    AMQPConnectorStackTimeout,
 )
 _MAX_HEARTBEAT_SECONDS = 65535  # AMQP 0-9-1 encodes the heartbeat timeout in 16 bits
 _MAX_NAME_BYTES = 255  # AMQP carries queue and exchange names as short strings
 _RESERVED_NAME_PREFIX = "amq."
 _ORIGINAL_PUBLISHER_HEADER = "x-kicak-original-publisher"
 """Header naming the user of the agent that created a message; see `_basic_publish()`."""
+_PUBLISHED_AT_HEADER = "x-kicak-published-at"
+"""Header with the time a message was published, ISO 8601 in UTC; see `_basic_publish()`."""
+
+
+def _now() -> datetime:
+    """The current time, timezone-aware in UTC."""
+    return datetime.now(UTC)
+
+
+def _monotonic() -> float:
+    """Seconds of a clock for durations, which, unlike `_now()`'s, is never set back or forward."""
+    return time.perf_counter()
+
+
+def _logged_text(value: object) -> str:
+    """Return a value of a statistics line as its text shows it: seconds to the millisecond."""
+    return f"{value:.3f}" if isinstance(value, float) else str(value)
+
+
+def _log_values(log: logging.Logger, title: str, event: str, values: dict[str, object]) -> None:
+    """Log a statistics line at INFO: `title`, then `values` as `key=value` pairs.
+
+    The record also carries the values, typed, as its `kicak` attribute, with `event` naming the
+    line, for structured (e.g. JSON) log handlers; built from the same values, the text and the
+    attribute cannot disagree. The record names the caller as where it was logged.
+    """
+    log.info(
+        "%s %s",
+        title,
+        " ".join(f"{name}={_logged_text(value)}" for name, value in values.items()),
+        extra={"kicak": {"event": event, **values}},
+        stacklevel=2,
+    )
+
+
+def _finite_float(value: int | float) -> float | None:
+    """Return `value` as a float, or None if it is NaN or infinite.
+
+    An int too large for a float counts as infinite: `math.isfinite()` and `float()` raise
+    `OverflowError` for it, which an argument check reports as `ValueError` instead.
+    """
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
+    return number if math.isfinite(number) else None
 
 
 def _check_name(argument: str, name: object, *, suffix: str = "") -> None:
@@ -147,57 +202,6 @@ def _unaliased(argument: object) -> object:
         argument = _substituted(origin.__value__, given)
 
 
-def _tls_options(config: KicakConfig) -> pika.SSLOptions | None:
-    """Return pika's TLS options for a connection configured by `config`, or None without TLS.
-
-    Raises `KicakConfigError` for a RABBIT_MQ_CA_FILE given with RABBIT_MQ_TLS=false: the file
-    shows that TLS was intended, so connecting without it would send the credentials and messages
-    unencrypted.
-    """
-    ca_file = config.rabbitmq_ca_file
-    if not config.rabbitmq_tls:
-        if ca_file is not None:
-            logger.error("Invalid Kicak config: RABBIT_MQ_CA_FILE requires RABBIT_MQ_TLS=true")
-            raise KicakConfigError("RABBIT_MQ_CA_FILE requires RABBIT_MQ_TLS=true")
-        return None
-    # The host name is also what the broker's certificate must name
-    return pika.SSLOptions(_tls_context(ca_file), server_hostname=config.rabbitmq_host)
-
-
-def _tls_context(ca_file: str | None) -> ssl.SSLContext:
-    """Return a client TLS context that verifies the broker's certificate and host name.
-
-    `ssl.create_default_context()` applies Python's recommended client settings: the certificate
-    must be valid and issued for the host name, and only secure ciphers are used. Two settings
-    are made explicit, so that a certificate is accepted or refused alike on every supported Python
-    version: TLS 1.2 or newer, because Python's default minimum depends on how it and OpenSSL were
-    built, and the strict certificate checks that Python 3.13 and newer apply by default
-    (`VERIFY_X509_STRICT`, with `VERIFY_X509_PARTIAL_CHAIN`, which lets an intermediate CA be
-    trusted on its own), because Python 3.12 does not.
-
-    Without `ca_file` it trusts the system's CA certificates; with it, only the certificates in
-    the file. A file that cannot be read or holds no PEM certificate raises `KicakConfigError`.
-    """
-    context = ssl.create_default_context() if ca_file is None else _context_trusting(ca_file)
-    if context.minimum_version < ssl.TLSVersion.TLSv1_2:  # e.g. MINIMUM_SUPPORTED, from OpenSSL
-        context.minimum_version = ssl.TLSVersion.TLSv1_2
-    context.verify_flags |= ssl.VERIFY_X509_STRICT | ssl.VERIFY_X509_PARTIAL_CHAIN
-    return context
-
-
-def _context_trusting(ca_file: str) -> ssl.SSLContext:
-    """Return Python's default client TLS context, trusting only the CAs in `ca_file`."""
-    try:
-        return ssl.create_default_context(cafile=ca_file)
-    except ssl.SSLError:  # a subclass of OSError, so it must come first
-        problem = "does not contain any PEM CA certificate"
-    except OSError as error:
-        problem = f"cannot be read: {error.strerror}"
-    # Raised outside the except blocks, so the error carries no context naming the file
-    logger.error("Invalid Kicak config key RABBIT_MQ_CA_FILE: the file %s", problem)
-    raise KicakConfigError(f"RABBIT_MQ_CA_FILE {problem}")
-
-
 class KicakAbstract(abc.ABC):
     """Internal base class of `KicakInjectorAbstract` and `KicakExecutorAbstract`.
 
@@ -257,7 +261,7 @@ class KicakAbstract(abc.ABC):
             port=config.rabbitmq_port,
             virtual_host=config.rabbitmq_virtual_host,
             credentials=credentials,
-            ssl_options=_tls_options(config),
+            ssl_options=tls_options(config),
             heartbeat=self._heartbeat_seconds,
             blocked_connection_timeout=self._blocked_connection_timeout_seconds,
             client_properties={"connection_name": self._connection_name()},
@@ -294,7 +298,14 @@ class KicakAbstract(abc.ABC):
         )
 
     def _establish_connection(self) -> None:
-        """Establish one connection and declare topology without retrying."""
+        """Establish one connection and declare topology without retrying.
+
+        A connection still open, e.g. one whose channel RabbitMQ closed, is closed first, so
+        replacing it never leaves it open and unreferenced. A new connection is closed again if
+        setting it up fails, also on a `BaseException` such as `KeyboardInterrupt`: in a `with`
+        block, `__exit__()` is not called when `__enter__()` raises.
+        """
+        self._discard_connection()
         logger.debug("Connecting to RabbitMQ")
         try:
             self._connection = self._create_connection()
@@ -305,7 +316,7 @@ class KicakAbstract(abc.ABC):
             logger.debug("RabbitMQ publisher confirms enabled")
             self._declare_topology()
             logger.debug("RabbitMQ topology setup completed")
-        except Exception:
+        except BaseException:
             self._discard_connection()
             raise
 
@@ -383,9 +394,11 @@ class KicakAbstract(abc.ABC):
         created the message, an Injector's message or an Executor's result, so it names itself
         twice: in `user_id`, the user its connection authenticated as, which RabbitMQ verifies,
         and in the `x-kicak-original-publisher` header, which a copy moved to a retry queue keeps
-        while its `user_id` changes. What this waits for depends on the channel: in confirm
-        mode, RabbitMQ's confirmation; on a transactional channel, nothing, because RabbitMQ
-        delivers nothing before `tx_commit()`.
+        while its `user_id` changes. The `x-kicak-published-at` header records when it was
+        published, so the Executor that receives it can tell how long it waited in its queue;
+        a copy moved to a retry queue is stamped again. What this waits for depends on the
+        channel: in confirm mode, RabbitMQ's confirmation; on a transactional channel, nothing,
+        because RabbitMQ delivers nothing before `tx_commit()`.
         """
         logger.debug(
             "Publishing message type=%s id=%s exchange=%s routing_key='' body_bytes=%d",
@@ -404,7 +417,10 @@ class KicakAbstract(abc.ABC):
                 message_id=message.message_id,
                 type=type(message).kicak_type,
                 user_id=self._user_id,
-                headers={_ORIGINAL_PUBLISHER_HEADER: self._user_id},
+                headers={
+                    _ORIGINAL_PUBLISHER_HEADER: self._user_id,
+                    _PUBLISHED_AT_HEADER: _now().isoformat(),
+                },
             ),
             mandatory=True,
         )
@@ -420,27 +436,12 @@ class KicakAbstract(abc.ABC):
         )
 
     def close(self) -> None:
-        """
-        Close the RabbitMQ channel and connection if open.
+        """Close the RabbitMQ channel and connection, if they are open.
 
-        The agent forgets both before closing them, so afterwards it is disconnected even if
-        closing fails: `channel` raises `RuntimeError` again, and `connect()` opens a new
-        connection.
-
-        The channel is closed first. Failure to close the channel is logged but
-        does not prevent the connection from being closed and does not propagate
-        the channel exception.
-
-        The connection is closed in a ``finally`` block, regardless of whether
-        closing the channel succeeds. Failure to close the connection is logged
-        and propagated to the caller.
-
-        Therefore:
-            - channel closes, connection closes --> no exception
-            - channel fails, connection closes --> no exception
-            - channel closes, connection fails --> connection exception raised
-            - channel fails, connection fails --> connection exception raised
-            - channel or connection not declared --> skipped
+        The agent forgets both before closing them, so afterwards it is disconnected even if closing
+        fails: `channel` raises `RuntimeError`, and `connect()` opens a new connection. A failure to
+        close the channel is logged only, and the connection is closed anyway; a failure to close
+        the connection is logged and raised.
         """
         logger.debug("Disconnecting from RabbitMQ")
 

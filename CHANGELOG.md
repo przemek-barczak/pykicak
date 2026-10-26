@@ -7,6 +7,82 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-26
+
+Every Executor now needs the keyword-only `max_retry_rounds`. With classic queues, the queue
+arguments are unchanged, so agents can be upgraded one at a time. Quorum input queues are now
+declared with at-least-once dead-lettering, and RabbitMQ refuses to redeclare a quorum queue
+declared by 0.3.0 without it (`406 PRECONDITION_FAILED`): with quorum queues, upgrade with an empty
+system: stop the Injectors, let the Executors process every queue empty, stop them, delete the
+quorum queues they consume from, then start the 0.4.0 agents.
+
+### Added
+
+- Dead-lettering publishes a confirmed copy of the message to `<queue>.dlx` with headers saying why
+  (`x-kicak-dead-letter-reason`: `malformed`, `retries-exhausted`, `result-too-large`, or
+  `unexpected-error`), which exception (`x-kicak-error-type`, `x-kicak-error-message`), when, and
+  from which queue, and acknowledges the original only afterwards. A copy RabbitMQ returns or
+  refuses requeues the message instead of losing it.
+- `max_retry_rounds`, a required argument of the Executor: a message still failing transiently
+  after that many rounds through the retry queue is dead-lettered as `retries-exhausted`. A message
+  sent back from the dead-letter queue gets all its rounds again.
+- `get_info()` reports how deliveries ended, as `counts` (`ExecutorCounts` and `DeadLetterCounts`,
+  new exports, only growing, for Prometheus-style counters), and the delivery in progress:
+  `attempt`, `redelivered`, and `retry_round`.
+- Statistics in the logs: one `Message handled` line per delivery and one `Message injected` line
+  per message an Injector hands to RabbitMQ, whatever the outcome, with durations, body sizes, and
+  `queued_seconds`, the time a message waited in its queue. Every published message carries the
+  time it was published in the `x-kicak-published-at` header. Leaving a recovery status logs
+  `recovery_seconds`, and a graceful stop `stop_seconds`. The records carry the values, typed, as
+  their `kicak` attribute.
+- Client certificates (mutual TLS), through the optional keys `RABBIT_MQ_CERT_FILE` and
+  `RABBIT_MQ_KEY_FILE`. Encrypted keys are refused instead of prompting on the terminal.
+- `tls_options(config)` (new export): pika's TLS options with the policy agents connect with, for
+  an application's own pika connections.
+- `examples/replay_dead_letters.py`, an example tool that sends the dead letters of chosen reasons
+  back to their queue.
+- The user documentation in `docs/`: the README is an overview, and the manual has a page per
+  topic, including "When a message can still be lost".
+- Python 3.15 in the package classifiers.
+
+### Changed
+
+- **Breaking:** `KicakExecutorAbstract` requires `max_retry_rounds`; there is no default.
+- **Breaking:** transient failures no longer go round the retry queue forever: after
+  `max_retry_rounds` rounds the message is dead-lettered.
+- **Breaking:** the Executor's dead-letter copies have no `x-death` header; read
+  `x-kicak-dead-letter-reason` first, and `x-death` for messages RabbitMQ dead-letters itself.
+- **Breaking:** quorum queues an Executor consumes from are declared with `x-dead-letter-strategy`
+  `at-least-once` and `x-overflow` `reject-publish`, so a message RabbitMQ dead-letters itself,
+  e.g. at the delivery limit, is kept until `<queue>.dlq` takes it instead of being dropped. A
+  quorum queue with a length limit now refuses new messages instead of dropping its oldest.
+- **Breaking:** `from_bytes()` refuses a body that lacks a field, also one the class gives a
+  default, and a message class with a `field(init=False)` is refused when an agent declaring it is
+  created.
+- **Breaking:** `ExecutorInfo` has new required fields, for code that constructs it directly.
+- The Executor and the Injector are built of private parts in `pykicak/_executor/` and
+  `pykicak/_injector/`; public import paths and behavior are unchanged.
+- Public docstrings state the contract and refer to `docs/` for how things work.
+
+### Fixed
+
+- Retry and dead-letter copies drop the `CC` and `BCC` routing headers; another publisher's `CC`
+  naming the source queue delivered a retry copy at once and doubled it every round.
+- A connection whose AMQP handshake never completes (`AMQPConnectorStackTimeout`) is retried,
+  instead of stopping an Executor and ending an Injector after one attempt.
+- `InjectionError`'s repr no longer shows the message payload.
+- No connection is left open: after RabbitMQ closed only its channel, when connection setup is
+  interrupted, e.g. by `KeyboardInterrupt`, or by `run()` after `connect()` and `stop()`.
+- An exception whose `str()` fails, raised while decoding a message or serializing a result,
+  dead-letters the message as malformed instead of stopping the Executor.
+- The field names of a malformed body no longer reach the logs and the dead-letter headers.
+- Durations too large for a float raise `ValueError` instead of `OverflowError`, and
+  `retry_delay_seconds` just above its maximum is refused instead of rounded down to it.
+- Invalid UTF-8 in a `.kicak` file that starts with a byte order mark is reported on its own line.
+- The documentation no longer promises that a message is never lost: the cases RabbitMQ can still
+  lose one, e.g. with classic queues, are listed. Its account of the quorum delivery limit covers
+  RabbitMQ 4.3 and newer, where requeues no longer count toward it.
+
 ## [0.3.0] - 2026-10-22
 
 This release changes the messages on the wire and the topology, so 0.2.0 and 0.3.0 agents cannot
@@ -136,7 +212,8 @@ First public release.
   `message_id`, also published as the AMQP `message_id` property.
 - `KicakConfig`, a `.kicak` file parser that keeps values out of reprs, errors, and logs.
 
-[Unreleased]: https://github.com/przemek-barczak/pykicak/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/przemek-barczak/pykicak/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/przemek-barczak/pykicak/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/przemek-barczak/pykicak/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/przemek-barczak/pykicak/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/przemek-barczak/pykicak/releases/tag/v0.1.0

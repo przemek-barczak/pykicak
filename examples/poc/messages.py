@@ -1,7 +1,7 @@
 """Message types shared by the PoC injector and executors: two versions of a heartbeat.
 
 The PoC shows an upgrade of the heartbeat from version 1 to version 2 while the flow keeps
-running (see "A new version of a message" in the README):
+running (see "A new version of a message" in docs/messages.md):
 
 1. The fan-out executor, the consumer of the injector's heartbeats, accepts both versions, so
    version 1 heartbeats still waiting in its queue are processed after the upgrade. It publishes

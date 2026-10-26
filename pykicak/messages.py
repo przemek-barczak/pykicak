@@ -11,6 +11,7 @@ import dataclasses
 import json
 import logging
 import math
+from collections.abc import Mapping
 from typing import Any, ClassVar, NoReturn, Self
 
 logger = logging.getLogger(__name__)
@@ -35,8 +36,9 @@ def _type_name_of(message_class: object) -> str:
 
     Raises `TypeError` unless `message_class` is a subclass of `KicakMessage` that declares its
     own `kicak_type` as a class attribute: an inherited one names its base class's type, so a
-    subclass would be sent as its base. Raises `ValueError` for an empty name, or one longer
-    than 255 UTF-8 bytes, the limit of the AMQP `type` property it is sent as.
+    subclass would be sent as its base. Also for a field declared with `init=False`, which would be
+    sent but could not be decoded again. Raises `ValueError` for an empty name, or one longer than
+    255 UTF-8 bytes, the limit of the AMQP `type` property it is sent as.
     """
     if not (
         isinstance(message_class, type)
@@ -50,6 +52,13 @@ def _type_name_of(message_class: object) -> str:
         raise TypeError(
             f"{name} declares {_TYPE_NAME_ATTRIBUTE} as a field; declare it as a class "
             f"attribute without an annotation, {example}"
+        )
+    not_init = [field.name for field in dataclasses.fields(message_class) if not field.init]
+    if not_init:
+        # to_bytes() sends every field, and from_bytes() passes them to the constructor
+        raise TypeError(
+            f"{name} declares {', '.join(not_init)} with init=False; every field of a message is "
+            f"sent and given to the constructor when it is decoded, so it must be an init field"
         )
     if _TYPE_NAME_ATTRIBUTE not in vars(message_class):
         inherited = getattr(message_class, _TYPE_NAME_ATTRIBUTE, None)
@@ -87,6 +96,27 @@ def _encode_nested(value: object) -> dict[str, Any]:
     raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
 
+def _check_field_names(message_class: type, payload: Mapping[str, object]) -> None:
+    """Raise `TypeError` unless `payload` has exactly the fields of `message_class`.
+
+    A field with a default is required too, so a body without it is refused rather than given the
+    default. The missing fields are named, from the class, but an unexpected one only counted: its
+    name comes from the body, which may hold anything.
+    """
+    expected = {field.name for field in dataclasses.fields(message_class) if field.init}
+    missing = sorted(expected - payload.keys())
+    unexpected = len(payload.keys() - expected)
+    problems = []
+    if missing:
+        problems.append(f"missing field(s) {', '.join(missing)}")
+    if unexpected:
+        problems.append(f"{unexpected} unexpected field(s)")
+    if problems:
+        raise TypeError(
+            f"JSON body does not match {message_class.__name__}: {' and '.join(problems)}"
+        )
+
+
 def _reject_constant(constant: str) -> NoReturn:
     """Refuse `NaN`, `Infinity`, and `-Infinity`, which Python's json module accepts by default."""
     raise ValueError(f"{constant} is not valid JSON")
@@ -105,29 +135,22 @@ def _finite_float(text: str) -> float:
 class KicakMessage:
     """Base class for messages exchanged over RabbitMQ.
 
-    Every message class names its type with `kicak_type`, a class attribute such as
-    `kicak_type = "order.v1"`: a non-empty string of at most 255 UTF-8 bytes, chosen once and
-    never derived from the class's name. It is sent as the AMQP `type` property of every message
-    of the class, and an Executor decodes a message into the class it accepts under that name, so
-    the name is the contract between the agents that publish a type and those that consume it.
-    A change of the fields is a new type, a new class with a new name such as `"order.v2"`. Each
-    class declares its own name: an agent refuses a class that only inherits one, because that
-    one names its base class's type.
-
-    Every message has a `message_id`, a keyword-only field declared here: a non-empty string of
-    at most 255 UTF-8 bytes that identifies the message. Delivery is at-least-once, so a message
-    can be processed more than once, and agents rely on its ID to stay idempotent. Assign the ID
-    once, where the message is first created (e.g. `str(uuid.uuid4())` in an Injector's
-    `generate()`), and derive the IDs of results from their input's ID (e.g. with `uuid.uuid5`),
-    so that executing an input again produces results with the same IDs. There is deliberately
-    no default: a generated default would give the results of a re-executed input new IDs. The
-    ID is also published as the AMQP `message_id` property.
-
-    Subclasses should be frozen dataclasses with JSON-serializable fields
-    (e.g. store timestamps as ISO-8601 strings, not `datetime` objects). Floats must be finite:
-    JSON has no NaN or infinity, so `to_bytes()` refuses them. A subclass that defines
-    `__post_init__` must call `KicakMessage.__post_init__(self)`; on Python 3.12, zero-argument
+    Subclasses are frozen dataclasses with JSON-serializable fields (store timestamps as ISO-8601
+    strings, not `datetime` objects), and floats must be finite. A subclass that defines
+    `__post_init__` must call `KicakMessage.__post_init__(self)`: on Python 3.12, zero-argument
     `super()` does not work in a `slots=True` dataclass.
+
+    Every class names its type with its own class attribute `kicak_type`, e.g.
+    `kicak_type = "order.v1"`: a non-empty string of at most 255 UTF-8 bytes, chosen once and sent
+    as the AMQP `type` property, the contract between the agents that publish and consume the type.
+    A change of the fields is a new class with a new name, e.g. `"order.v2"`.
+
+    Every message has a `message_id`, a required keyword-only field declared here: a non-empty
+    string of at most 255 UTF-8 bytes. Delivery is at-least-once, and agents rely on the ID to stay
+    idempotent: assign it once, where the message is first created, and derive the IDs of results
+    from their input's ID (e.g. with `uuid.uuid5`), so that executing an input again produces
+    results with the same IDs. See "Message types" in the documentation:
+    https://github.com/przemek-barczak/pykicak/blob/main/docs/messages.md
     """
 
     kicak_type: ClassVar[str]
@@ -175,20 +198,15 @@ class KicakMessage:
 
     @classmethod
     def from_bytes(cls, data: bytes) -> Self:
-        """Deserialize an AMQP message body previously produced by to_bytes().
+        """Deserialize an AMQP message body produced by `to_bytes()`.
 
-        Raises `ValueError` for a body that is not UTF-8 JSON (including `NaN`, `Infinity`, and
-        `-Infinity`, which Python's json module would accept), has a number too large for a float,
-        is nested too deeply to decode, or has an empty or too long `message_id`, and `TypeError`
-        for one that is not a JSON object, whose fields do not match this class (a missing
-        `message_id` included), or whose `message_id` is not a string. Other field values are
-        not converted or type-checked: a nested dataclass, for example, comes back as a `dict`.
-
-        A decoded message can be serialized again with `to_bytes()`, as long as its class keeps
-        to the message contract, e.g. its `__post_init__` does not replace a value with one JSON
-        cannot hold, and within the limits of Python's json module: it encodes nesting about as
-        deep as it decodes, though not always exactly as deep. The bytes can differ from `data`,
-        for example in whitespace or escapes, but they hold the same JSON value.
+        Raises `ValueError` for a body that is not UTF-8 JSON (`NaN`, `Infinity`, and `-Infinity`
+        included), has a number too large for a float, is nested too deeply to decode, or has an
+        empty or too long `message_id`, and `TypeError` for one that is not a JSON object, whose
+        fields are not exactly those of this class (a missing `message_id`, and a missing field
+        that has a default, included), or whose `message_id` is not a string. Field values are not converted or type-checked: a nested dataclass, for
+        example, comes back as a `dict`. See "Message types" in the documentation for when a decoded
+        message can be serialized again.
         """
         try:
             try:
@@ -200,6 +218,9 @@ class KicakMessage:
             except RecursionError as error:
                 # Deep nesting exhausts the decoder's recursion limit: the body is at fault
                 raise ValueError("JSON body is nested too deeply to decode") from error
+            if not isinstance(payload, dict):
+                raise TypeError(f"JSON body must be an object, got {type(payload).__name__}")
+            _check_field_names(cls, payload)
             message = cls(**payload)
             _check_message_id(message.message_id)
         except Exception:
